@@ -947,8 +947,6 @@ from kivy.uix.textinput import TextInput
 import os
 import csv
 import itertools
-import subprocess
-import sys
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -972,12 +970,16 @@ Config.set('graphics', 'fullscreen', 'auto')
 
 # --- Konstanten & Assets
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
-from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
+from tabletop.data.config import ROOT
 from tabletop.ui.assets import (
     ASSETS,
     FIX_LIVE_IMAGE,
     FIX_STOP_IMAGE,
     resolve_background_texture,
+)
+from tabletop.overlay.process import (
+    start_overlay as start_overlay_process,
+    stop_overlay as stop_overlay_process,
 )
 
 ui_widgets.ASSETS = ASSETS
@@ -1269,7 +1271,7 @@ class TabletopRoot(FloatLayout):
         self.update_layout()
         self.update_user_displays()
         self.update_intro_overlay()
-        self.start_overlay()
+        self.overlay_process = start_overlay_process(self.overlay_process)
 
     def bring_start_buttons_to_front(self):
         self.remove_widget(self.btn_start_p1)
@@ -2354,33 +2356,6 @@ class TabletopRoot(FloatLayout):
 
 
 
-    def start_overlay(self):
-        if self.overlay_process and self.overlay_process.poll() is None:
-            return
-        overlay_path = ARUCO_OVERLAY_PATH
-        if not overlay_path.exists():
-            return
-        try:
-            self.overlay_process = subprocess.Popen([sys.executable, str(overlay_path)])
-        except Exception as exc:
-            print(f'Warnung: Overlay konnte nicht gestartet werden: {exc}')
-            self.overlay_process = None
-
-    def stop_overlay(self):
-        if not self.overlay_process:
-            return
-        if self.overlay_process.poll() is None:
-            try:
-                self.overlay_process.terminate()
-                self.overlay_process.wait(timeout=5)
-            except Exception:
-                try:
-                    self.overlay_process.kill()
-                except Exception:
-                    pass
-        self.overlay_process = None
-
-
     def describe_level(self, level:str) -> str:
         return self.format_signal_choice(level) or (level or '-')
 
@@ -2594,7 +2569,14 @@ class TabletopApp(App):
     def on_start(self):
         root = self.root
         if root:
-            Clock.schedule_once(lambda *_: root.start_overlay(), 0)
+            Clock.schedule_once(
+                lambda *_: setattr(
+                    root,
+                    "overlay_process",
+                    start_overlay_process(root.overlay_process),
+                ),
+                0,
+            )
 
     def on_stop(self):
         root = self.root
@@ -2602,7 +2584,7 @@ class TabletopApp(App):
             root.logger.close()
         if root:
             close_round_log(root)
-            root.stop_overlay()
+            root.overlay_process = stop_overlay_process(root.overlay_process)
 
 if __name__ == '__main__':
     TabletopApp().run()
