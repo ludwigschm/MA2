@@ -380,15 +380,27 @@ class TabletopRoot(FloatLayout):
         with self.pause_cover.canvas.before:
             Color(0.75, 0.75, 0.75, 1)
             self.pause_bg = Rectangle(pos=(0, 0), size=Window.size)
-        self.pause_label = Label(
-            text='',
-            color=(0, 0, 0, 1),
-            halign='center',
-            valign='middle',
-            size_hint=(1, 1),
-        )
-        self.pause_label.bind(texture_size=lambda *_: None)
-        self.pause_cover.add_widget(self.pause_label)
+        self.pause_labels = {
+            1: RotatableLabel(
+                text='',
+                color=(0, 0, 0, 1),
+                halign='center',
+                valign='middle',
+                size_hint=(None, None),
+            ),
+            2: RotatableLabel(
+                text='',
+                color=(0, 0, 0, 1),
+                halign='center',
+                valign='middle',
+                size_hint=(None, None),
+            ),
+        }
+        self.pause_labels[1].set_rotation(0)
+        self.pause_labels[2].set_rotation(180)
+        for lbl in self.pause_labels.values():
+            lbl.bind(texture_size=lambda *_: None)
+            self.pause_cover.add_widget(lbl)
         self.pause_cover.opacity = 0
         self.pause_cover.disabled = True
         self.add_widget(self.pause_cover)
@@ -588,9 +600,30 @@ class TabletopRoot(FloatLayout):
         if hasattr(self, 'pause_cover'):
             self.pause_cover.size = (W, H)
             self.pause_cover.pos = (0, 0)
-        if hasattr(self, 'pause_label'):
-            self.pause_label.text_size = (W * 0.8, H * 0.6)
-            self.pause_label.font_size = 56 * scale if scale else 56
+        if hasattr(self, 'pause_labels'):
+            label_width = W * 0.8
+            label_height = H * 0.25
+            gap = 40 * scale
+
+            bottom_label = self.pause_labels[1]
+            bottom_label.size = (label_width, label_height)
+            bottom_label.pos = (
+                W / 2 - label_width / 2,
+                H / 2 - gap / 2 - label_height,
+            )
+            bottom_label.text_size = (label_width, label_height)
+            bottom_label.font_size = 56 * scale if scale else 56
+            bottom_label.set_rotation(0)
+
+            top_label = self.pause_labels[2]
+            top_label.size = (label_width, label_height)
+            top_label.pos = (
+                W / 2 - label_width / 2,
+                H / 2 + gap / 2,
+            )
+            top_label.text_size = (label_width, label_height)
+            top_label.font_size = 56 * scale if scale else 56
+            top_label.set_rotation(180)
 
         # Refresh transforms after layout changes
         for buttons in self.signal_buttons.values():
@@ -1450,11 +1483,13 @@ class TabletopRoot(FloatLayout):
                 self.add_widget(self.btn_start_p2)
             self.pause_cover.opacity = 1
             self.pause_cover.disabled = False
-            self.pause_label.text = self.pause_message
+            for lbl in self.pause_labels.values():
+                lbl.text = self.pause_message
         else:
             self.pause_cover.opacity = 0
             self.pause_cover.disabled = True
-            self.pause_label.text = ''
+            for lbl in self.pause_labels.values():
+                lbl.text = ''
             if self.pause_cover.parent is not None:
                 self.remove_widget(self.pause_cover)
                 # Reihenfolge der Buttons erhalten
