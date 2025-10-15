@@ -684,8 +684,8 @@ class TabletopRoot(FloatLayout):
         start_idx = 0
         if rows:
             try:
-                parse_cards(rows[0], 2, 4)
-                parse_cards(rows[0], 7, 9)
+                parse_cards(rows[0], 2, 6)
+                parse_cards(rows[0], 7, 11)
             except Exception:
                 start_idx = 1
 
@@ -693,8 +693,8 @@ class TabletopRoot(FloatLayout):
             if not row or all((cell or '').strip() == '' for cell in row):
                 continue
             try:
-                vp1_cards = parse_cards(row, 2, 4)
-                vp2_cards = parse_cards(row, 7, 9)
+                vp1_cards = parse_cards(row, 2, 6)
+                vp2_cards = parse_cards(row, 7, 11)
             except Exception:
                 continue
 
@@ -1849,6 +1849,11 @@ class TabletopApp(App):
         self.title = 'Masterarbeit – Tabletop UX'
         root = TabletopRoot()
         return root
+
+    def on_start(self):
+        root = self.root
+        if root:
+            Clock.schedule_once(lambda *_: root.start_overlay(), 0)
 
     def on_stop(self):
         root = self.root
