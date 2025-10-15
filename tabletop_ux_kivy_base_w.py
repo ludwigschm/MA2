@@ -27,6 +27,8 @@ from kivy.uix.textinput import TextInput
 import os
 import csv
 import itertools
+import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime
 from kivy.uix.label import Label
@@ -429,6 +431,8 @@ class TabletopRoot(FloatLayout):
         self.outcome_score_applied = False
         self.pending_round_start_log = False
         self.next_block_preview = None
+        self.current_block_total_rounds = 0
+        self.overlay_process = None
 
         self.update_layout()
         self.update_user_displays()
@@ -437,18 +441,19 @@ class TabletopRoot(FloatLayout):
         W, H = Window.size
         base_w, base_h = 3840.0, 2160.0
         scale = min(W / base_w if base_w else 1, H / base_h if base_h else 1)
+        button_scale = 0.8
 
         self.bg.pos = (0, 0)
         self.bg.size = (W, H)
 
-        corner_margin = 120 * scale
+        corner_margin = 180 * scale
         card_width, card_height = 420 * scale, 640 * scale
         card_gap = 70 * scale
-        start_size = (360 * scale, 360 * scale)
+        start_size = (360 * button_scale * scale, 360 * button_scale * scale)
 
         # Start buttons
         self.btn_start_p1.size = start_size
-        start_margin = 60 * scale
+        start_margin = 180 * scale
         self.btn_start_p1.pos = (W - start_margin - start_size[0], start_margin)
         self.btn_start_p1.set_rotation(0)
 
@@ -472,11 +477,11 @@ class TabletopRoot(FloatLayout):
         self.p2_inner.pos = p2_inner_pos
 
         # Button stacks
-        btn_width, btn_height = 260 * scale, 260 * scale
-        vertical_gap = 40 * scale
-        horizontal_gap = 60 * scale
-        cluster_shift = 620 * scale
-        vertical_offset = 140 * scale
+        btn_width, btn_height = 260 * button_scale * scale, 260 * button_scale * scale
+        vertical_gap = 40 * button_scale * scale
+        horizontal_gap = 60 * button_scale * scale
+        cluster_shift = 780 * scale
+        vertical_offset = 220 * scale
 
         # Player 1 (bottom right)
         signal_x = W - corner_margin - btn_width - cluster_shift
@@ -598,22 +603,36 @@ class TabletopRoot(FloatLayout):
 
     # --- Datenquellen & Hilfsfunktionen ---
     def load_blocks(self):
+        blocks = []
+        practice_path = Path(ROOT) / 'Paaretest.csv'
+        practice_rounds = self.load_csv_rounds(practice_path)
+        if practice_rounds:
+            blocks.append({
+                'index': 0,
+                'label': 'Übung',
+                'csv': 'Paaretest.csv',
+                'path': practice_path,
+                'rounds': practice_rounds,
+                'payout': False,
+                'practice': True,
+            })
         order = [
             (1, 'Paare1.csv', False),
             (2, 'Paare2.csv', True),
             (3, 'Paare3.csv', False),
             (4, 'Paare4.csv', True),
         ]
-        blocks = []
         for index, filename, payout in order:
             path = Path(ROOT) / filename
             rounds = self.load_csv_rounds(path)
             blocks.append({
                 'index': index,
+                'label': f'Block {index}',
                 'csv': filename,
                 'path': path,
                 'rounds': rounds,
                 'payout': payout,
+                'practice': False,
             })
         return blocks
 
@@ -664,8 +683,8 @@ class TabletopRoot(FloatLayout):
         start_idx = 0
         if rows:
             try:
-                parse_cards(rows[0], 2, 4)
-                parse_cards(rows[0], 7, 9)
+                parse_cards(rows[0], 2, 6)
+                parse_cards(rows[0], 7, 11)
             except Exception:
                 start_idx = 1
 
@@ -673,8 +692,8 @@ class TabletopRoot(FloatLayout):
             if not row or all((cell or '').strip() == '' for cell in row):
                 continue
             try:
-                vp1_cards = parse_cards(row, 2, 4)
-                vp2_cards = parse_cards(row, 7, 9)
+                vp1_cards = parse_cards(row, 2, 6)
+                vp2_cards = parse_cards(row, 7, 11)
             except Exception:
                 continue
 
@@ -1087,6 +1106,7 @@ class TabletopRoot(FloatLayout):
             self.next_block_preview = None
             self.round_in_block = self.current_round_idx + 1
             self.current_round_has_stake = block['payout']
+            self.current_block_total_rounds = len(block.get('rounds') or [])
             if block['payout'] and self.score_state_block != block['index']:
                 self.score_state = {1: 0, 2: 0}
                 self.score_state_block = block['index']
@@ -1104,6 +1124,7 @@ class TabletopRoot(FloatLayout):
             self.current_block_info = None
             self.round_in_block = 0
             self.current_round_has_stake = False
+            self.current_block_total_rounds = 0
             self.set_cards_from_plan(None)
             self.round = self.compute_global_round()
             self.score_state_round_start = (
@@ -1341,9 +1362,12 @@ class TabletopRoot(FloatLayout):
 
     def format_user_display_text(self, vp:int):
         """Erzeugt den Text fürs Display gemäß Block (1/3 vs. 2/4)."""
-        # Runde im Block / total=16
-        rnd_in_block = self.round_in_block or 0
-        header_round = f'Runde {rnd_in_block}/16'
+        # Runde im Block / total (Blockgröße variabel, Übung ohne Logging)
+        total_rounds = max(1, self.current_block_total_rounds or 16)
+        rnd_in_block = self.round_in_block or 1
+        rnd_display = min(max(1, rnd_in_block), total_rounds)
+        block_suffix = ' (Übung)' if self.is_practice_block_active() else ''
+        header_round = f'Runde {rnd_display}/{total_rounds}{block_suffix}'
 
         # Zuordnung VP -> Spieler
         player = self.physical_by_role.get(vp)
@@ -1440,8 +1464,38 @@ class TabletopRoot(FloatLayout):
 
 
 
+    def start_overlay(self):
+        if self.overlay_process and self.overlay_process.poll() is None:
+            return
+        overlay_path = os.path.join(ROOT, 'aruco_overlay.py')
+        if not os.path.exists(overlay_path):
+            return
+        try:
+            self.overlay_process = subprocess.Popen([sys.executable, overlay_path])
+        except Exception as exc:
+            print(f'Warnung: Overlay konnte nicht gestartet werden: {exc}')
+            self.overlay_process = None
+
+    def stop_overlay(self):
+        if not self.overlay_process:
+            return
+        if self.overlay_process.poll() is None:
+            try:
+                self.overlay_process.terminate()
+                self.overlay_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self.overlay_process.kill()
+                except Exception:
+                    pass
+        self.overlay_process = None
+
+
     def describe_level(self, level:str) -> str:
         return self.format_signal_choice(level) or (level or '-')
+
+    def is_practice_block_active(self) -> bool:
+        return bool(self.current_block_info and self.current_block_info.get('practice'))
 
     def choice_labels_for_vp(self, vp: int):
         physical = self.physical_by_role.get(vp)
@@ -1510,6 +1564,8 @@ class TabletopRoot(FloatLayout):
         return mapping.get(self.phase, EnginePhase.DEALING)
 
     def log_event(self, player: int, action: str, payload=None):
+        if self.is_practice_block_active() and action not in ('session_start',):
+            return
         if not self.logger or not self.session_configured:
             return
         payload = payload or {}
@@ -1793,12 +1849,18 @@ class TabletopApp(App):
         root = TabletopRoot()
         return root
 
+    def on_start(self):
+        root = self.root
+        if root:
+            Clock.schedule_once(lambda *_: root.start_overlay(), 0)
+
     def on_stop(self):
         root = self.root
         if root and root.logger:
             root.logger.close()
         if root:
             root.close_round_log()
+            root.stop_overlay()
 
 if __name__ == '__main__':
     TabletopApp().run()
