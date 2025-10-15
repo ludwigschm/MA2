@@ -956,6 +956,12 @@ import sounddevice as sd
 
 
 from game_engine_w import EventLogger, Phase as EnginePhase
+from tabletop.logging.round_csv import (
+    init_round_log,
+    round_log_action_label,
+    write_round_log,
+    close_round_log,
+)
 from tabletop.ui import widgets as ui_widgets
 from tabletop.ui.widgets import RotatableLabel, CardWidget, IconButton
 
@@ -2470,154 +2476,7 @@ class TabletopRoot(FloatLayout):
             action,
             payload
         )
-        self.write_round_log(actor, action, payload, player)
-
-    def init_round_log(self):
-        if not self.session_id:
-            return
-        if self.round_log_fp:
-            self.close_round_log()
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        path = self.log_dir / f'round_log_{self.session_id}.csv'
-        new_file = not path.exists()
-        self.round_log_path = path
-        self.round_log_fp = open(path, 'a', encoding='utf-8', newline='')
-        self.round_log_writer = csv.writer(self.round_log_fp)
-        if new_file:
-            header = [
-                'Session',
-                'Bedingung',
-                'Block',
-                'Runde im Block',
-                'Spieler 1',
-                'VP',
-                'Karte1 VP1',
-                'Karte2 VP1',
-                'Karte1 VP2',
-                'Karte2 VP2',
-                'Aktion',
-                'Zeit',
-                'Gewinner',
-                'Punktestand VP1',
-                'Punktestand VP2',
-            ]
-            self.round_log_writer.writerow(header)
-            self.round_log_fp.flush()
-
-    def round_log_action_label(self, action: str, payload: dict) -> str:
-        if action in ('start_click', 'round_start'):
-            return 'Start'
-        if action == 'next_round_click':
-            return 'Nächste Runde'
-        if action == 'reveal_inner':
-            return 'Karte 1'
-        if action == 'reveal_outer':
-            return 'Karte 2'
-        if action == 'signal_choice':
-            return self.format_signal_choice(payload.get('level')) or 'Signal'
-        if action == 'call_choice':
-            return self.format_decision_choice(payload.get('decision')) or 'Entscheidung'
-        if action == 'showdown':
-            return 'Showdown'
-        if action == 'session_start':
-            return 'Session'
-        return action
-
-    def write_round_log(self, actor: str, action: str, payload: dict, player: int):
-        if not self.round_log_writer:
-            return
-        is_showdown = (action == 'showdown')
-        if not is_showdown and player not in (1, 2):
-            return
-
-        block_condition = ''
-        block_number = ''
-        round_in_block = ''
-        if self.current_block_info:
-            block_condition = 'pay' if self.current_round_has_stake else 'no_pay'
-            block_number = self.current_block_info['index']
-            round_in_block = self.round_in_block
-        elif self.next_block_preview:
-            block = self.next_block_preview.get('block')
-            if block:
-                block_condition = 'pay' if block.get('payout') else 'no_pay'
-                block_number = block.get('index', '')
-                round_in_block = self.next_block_preview.get('round_in_block', '')
-
-        plan = None
-        plan_info = self.get_current_plan()
-        if plan_info:
-            plan = plan_info[1]
-        vp1_cards = plan['vp1'] if plan else (None, None)
-        vp2_cards = plan['vp2'] if plan else (None, None)
-        if not vp1_cards:
-            vp1_cards = (None, None)
-        if not vp2_cards:
-            vp2_cards = (None, None)
-
-        actor_vp = ''
-        if not is_showdown and player in (1, 2):
-            vp_num = self.role_by_physical.get(player)
-            if vp_num in (1, 2):
-                actor_vp = f'VP{vp_num}'
-
-        spieler1_vp = ''
-        first_player = self.first_player if self.first_player in (1, 2) else None
-        if first_player is not None:
-            vp_player1 = self.role_by_physical.get(first_player)
-            if vp_player1 in (1, 2):
-                spieler1_vp = f'VP{vp_player1}'
-
-        action_label = self.round_log_action_label(action, payload)
-        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-
-        winner_label = ''
-        if is_showdown:
-            winner_player = payload.get('winner')
-            if winner_player in (1, 2):
-                winner_vp = self.role_by_physical.get(winner_player)
-                if winner_vp in (1, 2):
-                    winner_label = f'VP{winner_vp}'
-
-        if self.score_state:
-            score_vp1 = self.score_state.get(1, '')
-            score_vp2 = self.score_state.get(2, '')
-        elif self.score_state_round_start:
-            score_vp1 = self.score_state_round_start.get(1, '')
-            score_vp2 = self.score_state_round_start.get(2, '')
-        else:
-            score_vp1 = ''
-            score_vp2 = ''
-
-        def _card_value(val):
-            return '' if val is None else val
-
-        row = [
-            self.session_id or '',
-            block_condition,
-            block_number,
-            round_in_block,
-            spieler1_vp,
-            actor_vp,
-            _card_value(vp1_cards[0]) if vp1_cards else '',
-            _card_value(vp1_cards[1]) if vp1_cards else '',
-            _card_value(vp2_cards[0]) if vp2_cards else '',
-            _card_value(vp2_cards[1]) if vp2_cards else '',
-            action_label,
-            timestamp,
-            winner_label,
-            score_vp1,
-            score_vp2,
-        ]
-        self.round_log_writer.writerow(row)
-        self.round_log_fp.flush()
-
-    def close_round_log(self):
-        if self.round_log_fp:
-            self.round_log_fp.close()
-            self.round_log_fp = None
-            self.round_log_writer = None
-
+        write_round_log(self, actor, action, payload, player)
 
     def prompt_session_number(self):
         if self.session_popup:
@@ -2685,7 +2544,7 @@ class TabletopRoot(FloatLayout):
         self.log_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.log_dir / f'events_{self.session_id}.sqlite3'
         self.logger = EventLogger(str(db_path))
-        self.init_round_log()
+        init_round_log(self)
         self.update_role_assignments()
         if self.session_popup:
             self.session_popup.dismiss()
@@ -2741,7 +2600,7 @@ class TabletopApp(App):
         if root and root.logger:
             root.logger.close()
         if root:
-            root.close_round_log()
+            close_round_log(root)
             root.stop_overlay()
 
 if __name__ == '__main__':
