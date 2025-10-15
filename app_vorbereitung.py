@@ -942,7 +942,6 @@ from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.textinput import TextInput
-from kivy.core.image import Image as CoreImage
 import os
 import csv
 import itertools
@@ -964,45 +963,15 @@ from tabletop.ui.widgets import RotatableLabel, CardWidget, IconButton
 Config.set('graphics', 'fullscreen', 'auto')
 
 # --- Konstanten & Assets
-ROOT = os.path.dirname(os.path.abspath(__file__))
-UX_DIR = os.path.join(ROOT, 'UX')
-CARD_DIR = os.path.join(ROOT, 'Karten')
-
-BACKGROUND_IMAGE = os.path.join(UX_DIR, 'Hintergrund.png')
-FIX_STOP_IMAGE = os.path.join(UX_DIR, 'fix_stop.png')
-FIX_LIVE_IMAGE = os.path.join(UX_DIR, 'fix_live.png')
-
-
-ASSETS = {
-    'play': {
-        'live':  os.path.join(UX_DIR, 'play_live.png'),
-        'stop':  os.path.join(UX_DIR, 'play_stop.png'),
-    },
-    'signal': {
-        'low':   {'live': os.path.join(UX_DIR, 'tief_live.png'),   'stop': os.path.join(UX_DIR, 'tief_stop.png')},
-        'mid':   {'live': os.path.join(UX_DIR, 'mittel_live.png'), 'stop': os.path.join(UX_DIR, 'mittel_stop.png')},
-        'high':  {'live': os.path.join(UX_DIR, 'hoch_live.png'),   'stop': os.path.join(UX_DIR, 'hoch_stop.png')},
-    },
-    'decide': {
-        'bluff': {'live': os.path.join(UX_DIR, 'bluff_live.png'),  'stop': os.path.join(UX_DIR, 'bluff_stop.png')},
-        'wahr':  {'live': os.path.join(UX_DIR, 'wahr_live.png'),   'stop': os.path.join(UX_DIR, 'wahr_stop.png')},
-    },
-    'cards': {
-        'back':      os.path.join(CARD_DIR, 'back.png'),
-        'back_stop': os.path.join(CARD_DIR, 'back_stop.png'),
-    }
-}
+from tabletop.data.config import CARD_DIR, ARUCO_OVERLAY_PATH, ROOT
+from tabletop.ui.assets import (
+    ASSETS,
+    FIX_LIVE_IMAGE,
+    FIX_STOP_IMAGE,
+    resolve_background_texture,
+)
 
 ui_widgets.ASSETS = ASSETS
-
-
-def resolve_background_texture():
-    if not os.path.exists(BACKGROUND_IMAGE):
-        return None
-    try:
-        return CoreImage(BACKGROUND_IMAGE).texture
-    except Exception:
-        return None
 
 
 # --- Phasen der Runde
@@ -1975,7 +1944,9 @@ class TabletopRoot(FloatLayout):
         self.btn_start_p2.set_live(False)
 
         self.fixation_image.opacity = 1
-        self.fixation_image.source = FIX_STOP_IMAGE if os.path.exists(FIX_STOP_IMAGE) else ''
+        self.fixation_image.source = (
+            str(FIX_STOP_IMAGE) if FIX_STOP_IMAGE.exists() else ''
+        )
 
         def finish(_dt):
             if self.fixation_overlay.parent is not None:
@@ -1990,11 +1961,15 @@ class TabletopRoot(FloatLayout):
                 callback()
 
         def show_stop_again(_dt):
-            self.fixation_image.source = FIX_STOP_IMAGE if os.path.exists(FIX_STOP_IMAGE) else ''
+            self.fixation_image.source = (
+                str(FIX_STOP_IMAGE) if FIX_STOP_IMAGE.exists() else ''
+            )
             Clock.schedule_once(finish, 5)
 
         def show_live(_dt):
-            self.fixation_image.source = FIX_LIVE_IMAGE if os.path.exists(FIX_LIVE_IMAGE) else ''
+            self.fixation_image.source = (
+                str(FIX_LIVE_IMAGE) if FIX_LIVE_IMAGE.exists() else ''
+            )
             self.play_fixation_tone()
             Clock.schedule_once(show_stop_again, 0.2)
 
@@ -2502,11 +2477,11 @@ class TabletopRoot(FloatLayout):
     def start_overlay(self):
         if self.overlay_process and self.overlay_process.poll() is None:
             return
-        overlay_path = os.path.join(ROOT, 'aruco_overlay.py')
-        if not os.path.exists(overlay_path):
+        overlay_path = ARUCO_OVERLAY_PATH
+        if not overlay_path.exists():
             return
         try:
-            self.overlay_process = subprocess.Popen([sys.executable, overlay_path])
+            self.overlay_process = subprocess.Popen([sys.executable, str(overlay_path)])
         except Exception as exc:
             print(f'Warnung: Overlay konnte nicht gestartet werden: {exc}')
             self.overlay_process = None
