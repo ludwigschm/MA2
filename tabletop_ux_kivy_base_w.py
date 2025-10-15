@@ -29,11 +29,14 @@ import csv
 import itertools
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime
 from kivy.uix.label import Label
 from kivy.graphics import Color, Rectangle, PushMatrix, PopMatrix, Rotate
 from kivy.core.image import Image as CoreImage
+import numpy as np
+import sounddevice as sd
 
 
 
@@ -48,6 +51,8 @@ UX_DIR = os.path.join(ROOT, 'UX')
 CARD_DIR = os.path.join(ROOT, 'Karten')
 
 BACKGROUND_IMAGE = os.path.join(UX_DIR, 'Hintergrund.png')
+FIX_STOP_IMAGE = os.path.join(UX_DIR, 'fix_stop.png')
+FIX_LIVE_IMAGE = os.path.join(UX_DIR, 'fix_live.png')
 
 
 ASSETS = {
@@ -360,9 +365,36 @@ class TabletopRoot(FloatLayout):
             lbl.text = ''
             lbl.opacity = 1
             self.add_widget(lbl)
-            
 
-
+        # Intro-Overlay für den Startbildschirm
+        intro_text = "[b]Willkommen![/b]\nUm zu Beginnen drücken Sie bitte auf den Play-Button"
+        self.intro_overlay = FloatLayout(size_hint=(1, 1))
+        with self.intro_overlay.canvas.before:
+            Color(0.75, 0.75, 0.75, 1)
+            self.intro_bg = Rectangle(pos=(0, 0), size=Window.size)
+        self.intro_labels = {
+            1: RotatableLabel(
+                text=intro_text,
+                halign='center',
+                valign='middle',
+                color=(0, 0, 0, 1),
+                markup=True,
+                size_hint=(None, None),
+            ),
+            2: RotatableLabel(
+                text=intro_text,
+                halign='center',
+                valign='middle',
+                color=(0, 0, 0, 1),
+                markup=True,
+                size_hint=(None, None),
+            ),
+        }
+        self.intro_labels[1].set_rotation(0)
+        self.intro_labels[2].set_rotation(180)
+        for lbl in self.intro_labels.values():
+            self.intro_overlay.add_widget(lbl)
+        self.add_widget(self.intro_overlay)
 
         # Rundenbadge unten Mitte
         self.round_badge = Label(
@@ -406,10 +438,14 @@ class TabletopRoot(FloatLayout):
         self.add_widget(self.pause_cover)
 
         # Start-Buttons nach vorn holen (über dem Overlay)
-        self.remove_widget(self.btn_start_p1)
-        self.remove_widget(self.btn_start_p2)
-        self.add_widget(self.btn_start_p1)
-        self.add_widget(self.btn_start_p2)
+        self.bring_start_buttons_to_front()
+
+        # Fixations-Overlay vorbereiten (wird bei Bedarf eingeblendet)
+        self.fixation_overlay = FloatLayout(size_hint=(1, 1))
+        self.fixation_overlay.opacity = 0
+        self.fixation_overlay.disabled = True
+        self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
+        self.fixation_overlay.add_widget(self.fixation_image)
 
         # interne States
         self.p1_pressed = False
@@ -442,13 +478,45 @@ class TabletopRoot(FloatLayout):
         self.score_state_round_start = None
         self.outcome_score_applied = False
         self.pending_round_start_log = False
-        self.next_block_preview = None
         self.current_block_total_rounds = 0
         self.overlay_process = None
+        self.fixation_running = False
+        self.fixation_required = False
+        self.pending_fixation_callback = None
+        self.intro_active = True
+        self.next_block_preview = None
+        self.fixation_tone_fs = 44100
+        fixation_duration = 0.2
+        t = np.linspace(0, fixation_duration, int(self.fixation_tone_fs * fixation_duration), endpoint=False)
+        self.fixation_tone = 0.9 * np.sin(2 * np.pi * 1000 * t)
 
         self.update_layout()
         self.update_user_displays()
+        self.update_intro_overlay()
         self.start_overlay()
+
+    def bring_start_buttons_to_front(self):
+        self.remove_widget(self.btn_start_p1)
+        self.remove_widget(self.btn_start_p2)
+        self.add_widget(self.btn_start_p1)
+        self.add_widget(self.btn_start_p2)
+
+    def update_intro_overlay(self):
+        if not hasattr(self, 'intro_overlay'):
+            return
+        active = bool(self.intro_active)
+        if active:
+            if self.intro_overlay.parent is None:
+                self.add_widget(self.intro_overlay)
+            self.intro_overlay.opacity = 1
+            self.intro_overlay.disabled = False
+            self.bring_start_buttons_to_front()
+        else:
+            self.intro_overlay.opacity = 0
+            self.intro_overlay.disabled = True
+            if self.intro_overlay.parent is not None:
+                self.remove_widget(self.intro_overlay)
+                self.bring_start_buttons_to_front()
 
     def update_layout(self):
         W, H = Window.size
@@ -624,6 +692,41 @@ class TabletopRoot(FloatLayout):
             top_label.text_size = (label_width, label_height)
             top_label.font_size = 56 * scale if scale else 56
             top_label.set_rotation(180)
+
+        if self.fixation_overlay:
+            self.fixation_overlay.size = (W, H)
+            self.fixation_overlay.pos = (0, 0)
+        if self.fixation_image:
+            self.fixation_image.size = (W, H)
+            self.fixation_image.pos = (0, 0)
+        if hasattr(self, 'intro_overlay'):
+            self.intro_overlay.size = (W, H)
+            self.intro_overlay.pos = (0, 0)
+            if hasattr(self, 'intro_bg'):
+                self.intro_bg.size = (W, H)
+                self.intro_bg.pos = (0, 0)
+            label_width = W * 0.6
+            label_height = H * 0.25
+            gap = 120 * scale
+            padding = (40 * scale, 40 * scale)
+            bottom_label = self.intro_labels[1]
+            bottom_label.size = (label_width, label_height)
+            bottom_label.pos = (
+                W / 2 - label_width / 2,
+                H / 2 - gap / 2 - label_height,
+            )
+            bottom_label.text_size = (label_width - 2 * padding[0], label_height - 2 * padding[1])
+            bottom_label.padding = padding
+            bottom_label.font_size = 64 * scale if scale else 64
+            top_label = self.intro_labels[2]
+            top_label.size = (label_width, label_height)
+            top_label.pos = (
+                W / 2 - label_width / 2,
+                H / 2 + gap / 2,
+            )
+            top_label.text_size = (label_width - 2 * padding[0], label_height - 2 * padding[1])
+            top_label.padding = padding
+            top_label.font_size = 64 * scale if scale else 64
 
         # Refresh transforms after layout changes
         for buttons in self.signal_buttons.values():
@@ -964,6 +1067,8 @@ class TabletopRoot(FloatLayout):
 
         # Startbuttons
         start_active = (self.phase in (PH_WAIT_BOTH_START, PH_SHOWDOWN))
+        if self.fixation_running:
+            start_active = False
         ready = self.session_configured and not self.session_finished
         self.btn_start_p1.set_live(start_active and ready)
         self.btn_start_p2.set_live(start_active and ready)
@@ -997,6 +1102,28 @@ class TabletopRoot(FloatLayout):
         self.update_user_displays()
         self.update_pause_overlay()
 
+    def continue_after_start_press(self):
+        if self.session_finished:
+            return
+        if self.intro_active:
+            self.intro_active = False
+            self.update_user_displays()
+            self.update_intro_overlay()
+
+        def proceed():
+            start_phase = self.phase_for_player(self.first_player, 'inner') or PH_P1_INNER
+            self.phase = start_phase
+            self.log_round_start_if_pending()
+            self.apply_phase()
+
+        def proceed_with_fixation():
+            if self.fixation_required and not self.fixation_running:
+                self.run_fixation_sequence(proceed)
+            else:
+                proceed()
+
+        proceed_with_fixation()
+
     def start_pressed(self, who:int):
         if self.session_finished:
             return
@@ -1018,18 +1145,78 @@ class TabletopRoot(FloatLayout):
                 self.in_block_pause = False
                 self.pause_message = ''
                 self.setup_round()
-                if not self.session_finished:
-                    start_phase = self.phase_for_player(self.first_player, 'inner') or PH_P1_INNER
-                    self.phase = start_phase
-                    self.log_round_start_if_pending()
+                if self.session_finished:
                     self.apply_phase()
+                    return
+                self.phase = PH_WAIT_BOTH_START
+                self.apply_phase()
+                self.continue_after_start_press()
             elif self.phase == PH_SHOWDOWN:
                 self.prepare_next_round(start_immediately=True)
             else:
-                start_phase = self.phase_for_player(self.first_player, 'inner') or PH_P1_INNER
-                self.phase = start_phase
-                self.log_round_start_if_pending()
-                self.apply_phase()
+                self.continue_after_start_press()
+
+    def run_fixation_sequence(self, on_complete=None):
+        if self.fixation_running:
+            return
+        if not self.fixation_overlay or not self.fixation_image:
+            self.fixation_required = False
+            if on_complete:
+                on_complete()
+            return
+
+        self.fixation_running = True
+        self.pending_fixation_callback = on_complete
+        self.fixation_overlay.opacity = 1
+        self.fixation_overlay.disabled = False
+        if self.fixation_overlay.parent is not None:
+            self.remove_widget(self.fixation_overlay)
+        self.add_widget(self.fixation_overlay)
+
+        self.btn_start_p1.set_live(False)
+        self.btn_start_p2.set_live(False)
+
+        self.fixation_image.opacity = 1
+        self.fixation_image.source = FIX_STOP_IMAGE if os.path.exists(FIX_STOP_IMAGE) else ''
+
+        def finish(_dt):
+            if self.fixation_overlay.parent is not None:
+                self.remove_widget(self.fixation_overlay)
+            self.fixation_overlay.opacity = 0
+            self.fixation_overlay.disabled = True
+            self.fixation_running = False
+            self.fixation_required = False
+            callback = self.pending_fixation_callback
+            self.pending_fixation_callback = None
+            if callback:
+                callback()
+
+        def show_stop_again(_dt):
+            self.fixation_image.source = FIX_STOP_IMAGE if os.path.exists(FIX_STOP_IMAGE) else ''
+            Clock.schedule_once(finish, 5)
+
+        def show_live(_dt):
+            self.fixation_image.source = FIX_LIVE_IMAGE if os.path.exists(FIX_LIVE_IMAGE) else ''
+            self.play_fixation_tone()
+            Clock.schedule_once(show_stop_again, 0.2)
+
+        Clock.schedule_once(show_live, 5)
+
+    def play_fixation_tone(self):
+        if self.fixation_tone is None:
+            return
+
+        tone_data = self.fixation_tone.copy()
+        sample_rate = self.fixation_tone_fs
+
+        def _play():
+            try:
+                sd.play(tone_data, sample_rate)
+                sd.wait()
+            except Exception as exc:
+                print(f'Warnung: Ton konnte nicht abgespielt werden: {exc}')
+
+        threading.Thread(target=_play, daemon=True).start()
 
     def tap_card(self, who:int, which:str):
         # which in {'inner','outer'}
@@ -1115,14 +1302,26 @@ class TabletopRoot(FloatLayout):
         self.advance_round_pointer()
         self.phase = PH_WAIT_BOTH_START
         self.setup_round()
-        if start_immediately and not self.in_block_pause and not self.session_finished:
+        if self.session_finished:
+            self.apply_phase()
+            self.update_user_displays()
+            return
+
+        self.apply_phase()
+
+        if self.in_block_pause:
+            return
+
+        def proceed():
             start_phase = self.phase_for_player(self.first_player, 'inner') or PH_P1_INNER
             self.phase = start_phase
             self.log_round_start_if_pending()
-        else:
-            self.phase = PH_WAIT_BOTH_START
-        self.apply_phase()
-        self.update_user_displays()
+            self.apply_phase()
+
+        if self.fixation_required and not self.fixation_running:
+            self.run_fixation_sequence(proceed)
+        elif start_immediately:
+            proceed()
 
     def setup_round(self):
         self.outcome_score_applied = False
@@ -1192,6 +1391,12 @@ class TabletopRoot(FloatLayout):
             'payout': self.current_round_has_stake,
         }
         self.refresh_center_cards(reveal=False)
+        if plan_info and (self.round_in_block == 1):
+            self.fixation_required = True
+        elif plan_info:
+            self.fixation_required = False
+        else:
+            self.fixation_required = False
         self.pending_round_start_log = bool(plan_info)
         self.update_user_displays()
 
@@ -1396,6 +1601,8 @@ class TabletopRoot(FloatLayout):
 
     def format_user_display_text(self, vp:int):
         """Erzeugt den Text fürs Display gemäß Block (1/3 vs. 2/4)."""
+        if self.intro_active:
+            return ''
         # Runde im Block / total (Blockgröße variabel, Übung ohne Logging)
         total_rounds = max(1, self.current_block_total_rounds or 16)
         rnd_in_block = self.round_in_block or 1
@@ -1477,10 +1684,7 @@ class TabletopRoot(FloatLayout):
             if self.pause_cover.parent is None:
                 self.add_widget(self.pause_cover)
                 # Start-Buttons über das Overlay legen
-                self.remove_widget(self.btn_start_p1)
-                self.remove_widget(self.btn_start_p2)
-                self.add_widget(self.btn_start_p1)
-                self.add_widget(self.btn_start_p2)
+                self.bring_start_buttons_to_front()
             self.pause_cover.opacity = 1
             self.pause_cover.disabled = False
             for lbl in self.pause_labels.values():
@@ -1493,10 +1697,7 @@ class TabletopRoot(FloatLayout):
             if self.pause_cover.parent is not None:
                 self.remove_widget(self.pause_cover)
                 # Reihenfolge der Buttons erhalten
-                self.remove_widget(self.btn_start_p1)
-                self.remove_widget(self.btn_start_p2)
-                self.add_widget(self.btn_start_p1)
-                self.add_widget(self.btn_start_p2)
+                self.bring_start_buttons_to_front()
 
 
 
