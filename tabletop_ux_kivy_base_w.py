@@ -599,21 +599,25 @@ class TabletopRoot(FloatLayout):
     # --- Datenquellen & Hilfsfunktionen ---
     def load_blocks(self):
         order = [
-            (1, 'Paare1.csv', False),
-            (2, 'Paare2.csv', True),
-            (3, 'Paare3.csv', False),
-            (4, 'Paare4.csv', True),
+            ('Übung', 'Paaretest.csv', False, True),
+            (1, 'Paare1.csv', False, False),
+            (2, 'Paare2.csv', True, False),
+            (3, 'Paare3.csv', False, False),
+            (4, 'Paare4.csv', True, False),
         ]
         blocks = []
-        for index, filename, payout in order:
+        for index, filename, payout, practice in order:
             path = Path(ROOT) / filename
             rounds = self.load_csv_rounds(path)
+            if practice:
+                rounds = rounds[:6]
             blocks.append({
                 'index': index,
                 'csv': filename,
                 'path': path,
                 'rounds': rounds,
                 'payout': payout,
+                'practice': practice,
             })
         return blocks
 
@@ -819,6 +823,21 @@ class TabletopRoot(FloatLayout):
         if self.current_block_idx >= len(self.blocks):
             return max(1, total)
         return total + self.current_round_idx + 1
+
+    def current_block_total_rounds(self):
+        block = self.current_block_info
+        if block and block.get('rounds'):
+            return max(1, len(block['rounds']))
+        if not self.in_block_pause and 0 <= self.current_block_idx < len(self.blocks):
+            rounds = self.blocks[self.current_block_idx].get('rounds') or []
+            if rounds:
+                return max(1, len(rounds))
+        if self.next_block_preview:
+            next_block = self.next_block_preview.get('block')
+            rounds = next_block.get('rounds') if next_block else None
+            if rounds:
+                return max(1, len(rounds))
+        return 16
 
     def score_line_text(self):
         if self.score_state:
@@ -1341,9 +1360,10 @@ class TabletopRoot(FloatLayout):
 
     def format_user_display_text(self, vp:int):
         """Erzeugt den Text fürs Display gemäß Block (1/3 vs. 2/4)."""
-        # Runde im Block / total=16
+        # Runde im Block / Gesamtanzahl (abhängig vom aktuellen Block)
         rnd_in_block = self.round_in_block or 0
-        header_round = f'Runde {rnd_in_block}/16'
+        total_in_block = self.current_block_total_rounds()
+        header_round = f'Runde {rnd_in_block}/{total_in_block}'
 
         # Zuordnung VP -> Spieler
         player = self.physical_by_role.get(vp)
@@ -1512,6 +1532,8 @@ class TabletopRoot(FloatLayout):
     def log_event(self, player: int, action: str, payload=None):
         if not self.logger or not self.session_configured:
             return
+        if self.is_practice_block_active() and action != 'session_start':
+            return
         payload = payload or {}
         if player is None:
             actor = 'SYS'
@@ -1587,6 +1609,8 @@ class TabletopRoot(FloatLayout):
 
     def write_round_log(self, actor: str, action: str, payload: dict, player: int):
         if not self.round_log_writer:
+            return
+        if self.is_practice_block_active():
             return
         is_showdown = (action == 'showdown')
         if not is_showdown and player not in (1, 2):
@@ -1756,6 +1780,9 @@ class TabletopRoot(FloatLayout):
         self.apply_phase()
 
     def log_round_start(self):
+        if self.is_practice_block_active():
+            self.pending_round_start_log = False
+            return
         if not self.session_configured:
             return
         self.log_event(None, 'round_start', {
@@ -1772,7 +1799,10 @@ class TabletopRoot(FloatLayout):
 
     def log_round_start_if_pending(self):
         if self.pending_round_start_log:
-            self.log_round_start()
+            if self.is_practice_block_active():
+                self.pending_round_start_log = False
+            else:
+                self.log_round_start()
 
     def record_action(self, player:int, text:str):
         self.status_lines[player].append(text)
@@ -1786,6 +1816,16 @@ class TabletopRoot(FloatLayout):
         header = [f"Du bist Spieler {player}", f"Rolle: {role}"]
         body = self.status_lines[player]
         self.status_labels[player].text = "\n".join(header + body)
+
+    def is_practice_block(self, block):
+        return bool(block and block.get('practice'))
+
+    def is_practice_block_active(self):
+        if self.is_practice_block(self.current_block_info):
+            return True
+        if not self.in_block_pause and 0 <= self.current_block_idx < len(self.blocks):
+            return self.is_practice_block(self.blocks[self.current_block_idx])
+        return False
 
 class TabletopApp(App):
     def build(self):
