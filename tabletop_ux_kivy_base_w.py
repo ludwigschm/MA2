@@ -423,37 +423,6 @@ class TabletopRoot(FloatLayout):
         self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
         self.fixation_overlay.add_widget(self.fixation_image)
 
-        # Block-Übersichts-Overlay (vor dem ersten Block)
-        self.block_overview_overlay = FloatLayout(size_hint=(1, 1))
-        self.block_overview_overlay.opacity = 0
-        self.block_overview_overlay.disabled = True
-        with self.block_overview_overlay.canvas.before:
-            Color(0, 0, 0, 0.85)
-            self.block_overview_bg = Rectangle(size=(0, 0), pos=(0, 0))
-        self.block_overview_labels = {
-            1: RotatableLabel(
-                size_hint=(None, None),
-                halign='center',
-                valign='middle',
-                color=(1, 1, 1, 1),
-                markup=True,
-                text='',
-            ),
-            2: RotatableLabel(
-                size_hint=(None, None),
-                halign='center',
-                valign='middle',
-                color=(1, 1, 1, 1),
-                markup=True,
-                text='',
-            ),
-        }
-        self.block_overview_labels[1].set_rotation(0)
-        self.block_overview_labels[2].set_rotation(180)
-        for lbl in self.block_overview_labels.values():
-            lbl.bind(texture_size=lambda *_: None)
-            self.block_overview_overlay.add_widget(lbl)
-
         # interne States
         self.p1_pressed = False
         self.p2_pressed = False
@@ -485,17 +454,13 @@ class TabletopRoot(FloatLayout):
         self.score_state_round_start = None
         self.outcome_score_applied = False
         self.pending_round_start_log = False
-        self.next_block_preview = None
         self.current_block_total_rounds = 0
         self.overlay_process = None
         self.fixation_running = False
         self.fixation_required = False
         self.pending_fixation_callback = None
         self.intro_active = True
-        self.block_overview_active = False
-        self.pending_block_overview_callback = None
-        self.block_overview_event = None
-        self.initial_block_overview_shown = False
+        self.next_block_preview = None
         self.fixation_tone_fs = 44100
         fixation_duration = 0.2
         t = np.linspace(0, fixation_duration, int(self.fixation_tone_fs * fixation_duration), endpoint=False)
@@ -679,36 +644,6 @@ class TabletopRoot(FloatLayout):
             top_label.text_size = (label_width, label_height)
             top_label.font_size = 56 * scale if scale else 56
             top_label.set_rotation(180)
-
-        if self.block_overview_overlay:
-            self.block_overview_overlay.size = (W, H)
-            self.block_overview_overlay.pos = (0, 0)
-        if hasattr(self, 'block_overview_bg'):
-            self.block_overview_bg.size = (W, H)
-            self.block_overview_bg.pos = (0, 0)
-        if getattr(self, 'block_overview_labels', None):
-            label_width = W * 0.8
-            label_height = H * 0.35
-            gap = 60 * scale
-            bottom_label = self.block_overview_labels[1]
-            bottom_label.size = (label_width, label_height)
-            bottom_label.pos = (
-                W / 2 - label_width / 2,
-                H / 2 - gap / 2 - label_height,
-            )
-            bottom_label.text_size = (label_width, label_height)
-            bottom_label.font_size = 60 * scale if scale else 60
-            bottom_label.padding = (40 * scale if scale else 40, 40 * scale if scale else 40)
-
-            top_label = self.block_overview_labels[2]
-            top_label.size = (label_width, label_height)
-            top_label.pos = (
-                W / 2 - label_width / 2,
-                H / 2 + gap / 2,
-            )
-            top_label.text_size = (label_width, label_height)
-            top_label.font_size = 60 * scale if scale else 60
-            top_label.padding = (40 * scale if scale else 40, 40 * scale if scale else 40)
 
         if self.fixation_overlay:
             self.fixation_overlay.size = (W, H)
@@ -1110,16 +1045,6 @@ class TabletopRoot(FloatLayout):
             else:
                 proceed()
 
-        if (
-            not self.initial_block_overview_shown
-            and self.blocks
-            and self.current_block_idx < len(self.blocks)
-            and self.round_in_block == 1
-        ):
-            self.initial_block_overview_shown = True
-            if self.show_initial_block_overview(on_complete=proceed_with_fixation):
-                return
-
         proceed_with_fixation()
 
     def start_pressed(self, who:int):
@@ -1215,91 +1140,6 @@ class TabletopRoot(FloatLayout):
                 print(f'Warnung: Ton konnte nicht abgespielt werden: {exc}')
 
         threading.Thread(target=_play, daemon=True).start()
-
-    def show_initial_block_overview(self, on_complete=None):
-        message = self.build_initial_block_overview_text()
-        if not message:
-            if on_complete:
-                on_complete()
-            return False
-        self.show_block_overview(message, duration=5, on_complete=on_complete)
-        return True
-
-    def build_initial_block_overview_text(self) -> str:
-        if not self.blocks:
-            return ''
-        upcoming = self.blocks[self.current_block_idx:]
-        if not upcoming:
-            return ''
-
-        lines = ['[b]Überblick über die verbleibenden Blöcke[/b]', '']
-        for block in upcoming:
-            label = block.get('label') or f'Block {block.get("index", "?")}'
-            if block.get('practice'):
-                label = f'{label} (Übung)'
-            rounds = len(block.get('rounds') or [])
-            if rounds == 1:
-                rounds_text = '1 Runde'
-            else:
-                rounds_text = f'{rounds} Runden'
-            condition = 'mit Auszahlungen' if block.get('payout') else 'ohne Auszahlungen'
-            lines.append(f'• {label}: {rounds_text}, {condition}')
-
-        lines.extend(['', 'Bitte warten – der Fixationspunkt erscheint gleich.'])
-        return "\n".join(lines)
-
-    def show_block_overview(self, message: str, duration: float = 5.0, on_complete=None):
-        if self.block_overview_active:
-            return False
-        if not message:
-            if on_complete:
-                on_complete()
-            return False
-
-        self.block_overview_active = True
-        self.pending_block_overview_callback = on_complete
-        if self.block_overview_event:
-            try:
-                self.block_overview_event.cancel()
-            except Exception:
-                pass
-            self.block_overview_event = None
-
-        self.block_overview_overlay.opacity = 1
-        self.block_overview_overlay.disabled = False
-        for lbl in self.block_overview_labels.values():
-            lbl.text = message
-
-        if self.block_overview_overlay.parent is not None:
-            self.remove_widget(self.block_overview_overlay)
-        self.add_widget(self.block_overview_overlay)
-
-        self.btn_start_p1.set_live(False)
-        self.btn_start_p2.set_live(False)
-
-        self.block_overview_event = Clock.schedule_once(self.hide_block_overview, duration)
-        return True
-
-    def hide_block_overview(self, *_):
-        if self.block_overview_event:
-            try:
-                self.block_overview_event.cancel()
-            except Exception:
-                pass
-            self.block_overview_event = None
-
-        if self.block_overview_overlay.parent is not None:
-            self.remove_widget(self.block_overview_overlay)
-        self.block_overview_overlay.opacity = 0
-        self.block_overview_overlay.disabled = True
-        for lbl in self.block_overview_labels.values():
-            lbl.text = ''
-
-        self.block_overview_active = False
-        callback = self.pending_block_overview_callback
-        self.pending_block_overview_callback = None
-        if callback:
-            callback()
 
     def tap_card(self, who:int, which:str):
         # which in {'inner','outer'}
@@ -1685,7 +1525,7 @@ class TabletopRoot(FloatLayout):
     def format_user_display_text(self, vp:int):
         """Erzeugt den Text fürs Display gemäß Block (1/3 vs. 2/4)."""
         if self.intro_active:
-            return '[b]Zum Beginn des Experiments Start drücken[/b]'
+            return '[b]Drücke Start um zu beginnen[/b]'
         # Runde im Block / total (Blockgröße variabel, Übung ohne Logging)
         total_rounds = max(1, self.current_block_total_rounds or 16)
         rnd_in_block = self.round_in_block or 1
