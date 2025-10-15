@@ -365,9 +365,36 @@ class TabletopRoot(FloatLayout):
             lbl.text = ''
             lbl.opacity = 1
             self.add_widget(lbl)
-            
 
-
+        # Intro-Overlay für den Startbildschirm
+        intro_text = "[b]Willkommen![/b]\nUm zu Beginnen drücken Sie bitte auf den Play-Button"
+        self.intro_overlay = FloatLayout(size_hint=(1, 1))
+        with self.intro_overlay.canvas.before:
+            Color(0.75, 0.75, 0.75, 1)
+            self.intro_bg = Rectangle(pos=(0, 0), size=Window.size)
+        self.intro_labels = {
+            1: RotatableLabel(
+                text=intro_text,
+                halign='center',
+                valign='middle',
+                color=(0, 0, 0, 1),
+                markup=True,
+                size_hint=(None, None),
+            ),
+            2: RotatableLabel(
+                text=intro_text,
+                halign='center',
+                valign='middle',
+                color=(0, 0, 0, 1),
+                markup=True,
+                size_hint=(None, None),
+            ),
+        }
+        self.intro_labels[1].set_rotation(0)
+        self.intro_labels[2].set_rotation(180)
+        for lbl in self.intro_labels.values():
+            self.intro_overlay.add_widget(lbl)
+        self.add_widget(self.intro_overlay)
 
         # Rundenbadge unten Mitte
         self.round_badge = Label(
@@ -411,10 +438,14 @@ class TabletopRoot(FloatLayout):
         self.add_widget(self.pause_cover)
 
         # Start-Buttons nach vorn holen (über dem Overlay)
-        self.remove_widget(self.btn_start_p1)
-        self.remove_widget(self.btn_start_p2)
-        self.add_widget(self.btn_start_p1)
-        self.add_widget(self.btn_start_p2)
+        self.bring_start_buttons_to_front()
+
+        # Fixations-Overlay vorbereiten (wird bei Bedarf eingeblendet)
+        self.fixation_overlay = FloatLayout(size_hint=(1, 1))
+        self.fixation_overlay.opacity = 0
+        self.fixation_overlay.disabled = True
+        self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
+        self.fixation_overlay.add_widget(self.fixation_image)
 
         # Fixations-Overlay vorbereiten (wird bei Bedarf eingeblendet)
         self.fixation_overlay = FloatLayout(size_hint=(1, 1))
@@ -468,7 +499,31 @@ class TabletopRoot(FloatLayout):
 
         self.update_layout()
         self.update_user_displays()
+        self.update_intro_overlay()
         self.start_overlay()
+
+    def bring_start_buttons_to_front(self):
+        self.remove_widget(self.btn_start_p1)
+        self.remove_widget(self.btn_start_p2)
+        self.add_widget(self.btn_start_p1)
+        self.add_widget(self.btn_start_p2)
+
+    def update_intro_overlay(self):
+        if not hasattr(self, 'intro_overlay'):
+            return
+        active = bool(self.intro_active)
+        if active:
+            if self.intro_overlay.parent is None:
+                self.add_widget(self.intro_overlay)
+            self.intro_overlay.opacity = 1
+            self.intro_overlay.disabled = False
+            self.bring_start_buttons_to_front()
+        else:
+            self.intro_overlay.opacity = 0
+            self.intro_overlay.disabled = True
+            if self.intro_overlay.parent is not None:
+                self.remove_widget(self.intro_overlay)
+                self.bring_start_buttons_to_front()
 
     def update_layout(self):
         W, H = Window.size
@@ -651,6 +706,34 @@ class TabletopRoot(FloatLayout):
         if self.fixation_image:
             self.fixation_image.size = (W, H)
             self.fixation_image.pos = (0, 0)
+        if hasattr(self, 'intro_overlay'):
+            self.intro_overlay.size = (W, H)
+            self.intro_overlay.pos = (0, 0)
+            if hasattr(self, 'intro_bg'):
+                self.intro_bg.size = (W, H)
+                self.intro_bg.pos = (0, 0)
+            label_width = W * 0.6
+            label_height = H * 0.25
+            gap = 120 * scale
+            padding = (40 * scale, 40 * scale)
+            bottom_label = self.intro_labels[1]
+            bottom_label.size = (label_width, label_height)
+            bottom_label.pos = (
+                W / 2 - label_width / 2,
+                H / 2 - gap / 2 - label_height,
+            )
+            bottom_label.text_size = (label_width - 2 * padding[0], label_height - 2 * padding[1])
+            bottom_label.padding = padding
+            bottom_label.font_size = 64 * scale if scale else 64
+            top_label = self.intro_labels[2]
+            top_label.size = (label_width, label_height)
+            top_label.pos = (
+                W / 2 - label_width / 2,
+                H / 2 + gap / 2,
+            )
+            top_label.text_size = (label_width - 2 * padding[0], label_height - 2 * padding[1])
+            top_label.padding = padding
+            top_label.font_size = 64 * scale if scale else 64
 
         # Refresh transforms after layout changes
         for buttons in self.signal_buttons.values():
@@ -1032,6 +1115,7 @@ class TabletopRoot(FloatLayout):
         if self.intro_active:
             self.intro_active = False
             self.update_user_displays()
+            self.update_intro_overlay()
 
         def proceed():
             start_phase = self.phase_for_player(self.first_player, 'inner') or PH_P1_INNER
@@ -1525,7 +1609,7 @@ class TabletopRoot(FloatLayout):
     def format_user_display_text(self, vp:int):
         """Erzeugt den Text fürs Display gemäß Block (1/3 vs. 2/4)."""
         if self.intro_active:
-            return '[b]Drücke Start um zu beginnen[/b]'
+            return ''
         # Runde im Block / total (Blockgröße variabel, Übung ohne Logging)
         total_rounds = max(1, self.current_block_total_rounds or 16)
         rnd_in_block = self.round_in_block or 1
@@ -1607,10 +1691,7 @@ class TabletopRoot(FloatLayout):
             if self.pause_cover.parent is None:
                 self.add_widget(self.pause_cover)
                 # Start-Buttons über das Overlay legen
-                self.remove_widget(self.btn_start_p1)
-                self.remove_widget(self.btn_start_p2)
-                self.add_widget(self.btn_start_p1)
-                self.add_widget(self.btn_start_p2)
+                self.bring_start_buttons_to_front()
             self.pause_cover.opacity = 1
             self.pause_cover.disabled = False
             for lbl in self.pause_labels.values():
@@ -1623,10 +1704,7 @@ class TabletopRoot(FloatLayout):
             if self.pause_cover.parent is not None:
                 self.remove_widget(self.pause_cover)
                 # Reihenfolge der Buttons erhalten
-                self.remove_widget(self.btn_start_p1)
-                self.remove_widget(self.btn_start_p2)
-                self.add_widget(self.btn_start_p1)
-                self.add_widget(self.btn_start_p2)
+                self.bring_start_buttons_to_front()
 
 
 
