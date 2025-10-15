@@ -447,6 +447,13 @@ class TabletopRoot(FloatLayout):
         self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
         self.fixation_overlay.add_widget(self.fixation_image)
 
+        # Fixations-Overlay vorbereiten (wird bei Bedarf eingeblendet)
+        self.fixation_overlay = FloatLayout(size_hint=(1, 1))
+        self.fixation_overlay.opacity = 0
+        self.fixation_overlay.disabled = True
+        self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
+        self.fixation_overlay.add_widget(self.fixation_image)
+
         # interne States
         self.p1_pressed = False
         self.p2_pressed = False
