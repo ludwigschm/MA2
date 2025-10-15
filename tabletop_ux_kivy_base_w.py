@@ -18,7 +18,6 @@ from kivy.config import Config
 from kivy.core.window import Window
 from kivy.graphics import Color, Rectangle, PushMatrix, PopMatrix, Rotate
 from kivy.uix.image import Image
-from kivy.uix.widget import Widget
 from kivy.uix.button import Button
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
@@ -26,14 +25,11 @@ from kivy.uix.popup import Popup
 from kivy.uix.textinput import TextInput
 import os
 import csv
-import itertools
 import subprocess
 import sys
 import threading
 from pathlib import Path
 from datetime import datetime
-from kivy.uix.label import Label
-from kivy.graphics import Color, Rectangle, PushMatrix, PopMatrix, Rotate
 from kivy.core.image import Image as CoreImage
 import numpy as np
 import sounddevice as sd
@@ -447,13 +443,6 @@ class TabletopRoot(FloatLayout):
         self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
         self.fixation_overlay.add_widget(self.fixation_image)
 
-        # Fixations-Overlay vorbereiten (wird bei Bedarf eingeblendet)
-        self.fixation_overlay = FloatLayout(size_hint=(1, 1))
-        self.fixation_overlay.opacity = 0
-        self.fixation_overlay.disabled = True
-        self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
-        self.fixation_overlay.add_widget(self.fixation_image)
-
         # interne States
         self.p1_pressed = False
         self.p2_pressed = False
@@ -468,7 +457,6 @@ class TabletopRoot(FloatLayout):
             'signal_choice': None,
             'judge_choice': None
         }
-        self.card_cycle = itertools.cycle(['7.png', '8.png', '9.png', '10.png', '11.png'])
 
         self.blocks = self.load_blocks()
         self.total_rounds_planned = sum(len(block['rounds']) for block in self.blocks)
