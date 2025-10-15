@@ -15,6 +15,8 @@ from typing import List, Optional, Dict, Any, Tuple
 import csv, time, json, sqlite3, pathlib
 from datetime import datetime, timezone
 
+from tabletop.logging.events import Events
+
 # ---------------- Enums ----------------
 
 class Phase(Enum):
@@ -319,7 +321,7 @@ class GameEngine:
     def __init__(self, cfg: GameEngineConfig):
         self.cfg = cfg
         self.schedule = RoundSchedule(cfg.csv_path)
-        self.logger = EventLogger(cfg.db_path, cfg.csv_log_path)
+        self.logger = Events(cfg.session_id, cfg.db_path, cfg.csv_log_path)
         session_identifier = (
             cfg.session_number if cfg.session_number is not None else cfg.session_id
         )
@@ -352,7 +354,7 @@ class GameEngine:
              round_index_override: Optional[int] = None):
         round_idx = self.current.index if round_index_override is None else round_index_override
         data = self.logger.log(
-            self.cfg.session_id, round_idx, self.current.phase, actor, action, payload
+            round_idx, self.current.phase, actor, action, payload
         )
         self.session_csv.log(
             self.cfg, self.current, actor, action, payload, data["t_utc_iso"],
@@ -955,7 +957,7 @@ import sounddevice as sd
 
 
 
-from game_engine_w import EventLogger, Phase as EnginePhase
+from tabletop.logging.events import EnginePhase
 from tabletop.logging.round_csv import (
     init_round_log,
     round_log_action_label,
@@ -2469,7 +2471,6 @@ class TabletopRoot(FloatLayout):
                 actor = 'P1' if player == 1 else 'P2'
         round_idx = max(0, self.round - 1)
         self.logger.log(
-            self.session_id,
             round_idx,
             self.current_engine_phase(),
             actor,
@@ -2543,7 +2544,7 @@ class TabletopRoot(FloatLayout):
         self.session_configured = True
         self.log_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.log_dir / f'events_{self.session_id}.sqlite3'
-        self.logger = EventLogger(str(db_path))
+        self.logger = Events(self.session_id, str(db_path))
         init_round_log(self)
         self.update_role_assignments()
         if self.session_popup:
