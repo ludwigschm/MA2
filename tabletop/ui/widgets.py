@@ -3,7 +3,10 @@
 import os
 
 from kivy.graphics import PopMatrix, PushMatrix, Rotate
+from kivy.properties import ListProperty, StringProperty
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.button import Button
+from kivy.uix.image import Image
 from kivy.uix.label import Label
 
 
@@ -83,28 +86,61 @@ class CardWidget(Button):
         self.opacity = 1.0 if (self.live or self.face_up) else 0.55
 
 
-class IconButton(Button):
+class IconButton(ButtonBehavior, Image):
     """Button, der automatisch live/stop-Grafiken nutzt."""
 
-    def __init__(self, asset_pair: dict, label_text: str = '', **kw):
-        super().__init__(**kw)
-        self.asset_pair = asset_pair
+    source_normal = StringProperty("")
+    source_down = StringProperty("")
+    asset_pair = ListProperty([])
+
+    def __init__(self, **kw):
         self.live = False
         self.selected = False
-        self.border = (0, 0, 0, 0)
-        self.background_normal = asset_pair['stop']
-        self.background_down = asset_pair['stop']
-        self.background_disabled_normal = asset_pair['stop']
-        self.disabled_color = (1, 1, 1, 1)
-        self.text = ''  # wir nutzen die Grafik
         self.rotation_angle = 0
+        super().__init__(**kw)
+        self.allow_stretch = True
+        self.keep_ratio = True
         with self.canvas.before:
             self._push_matrix = PushMatrix()
             self._rotation = Rotate(angle=0, origin=self.center)
         with self.canvas.after:
             self._pop_matrix = PopMatrix()
         self.bind(pos=self._update_transform, size=self._update_transform)
+        self._apply_sources()
         self.update_visual()
+
+    def on_state(self, *args):
+        super().on_state(*args)
+        self.update_visual()
+
+    def on_disabled(self, *args):
+        super().on_disabled(*args)
+        self.update_visual()
+
+    def on_source_normal(self, *args):
+        if not self.source_down:
+            self.source = self.source_normal
+        self.update_visual()
+
+    def on_source_down(self, *args):
+        self.update_visual()
+
+    def on_asset_pair(self, _instance, value):
+        normal = ""
+        down = ""
+        if isinstance(value, dict):
+            normal = value.get("normal") or value.get("stop") or ""
+            down = value.get("down") or value.get("live") or ""
+        else:
+            try:
+                normal = value[0] if len(value) > 0 else ""
+                down = value[1] if len(value) > 1 else ""
+            except TypeError:
+                normal = ""
+                down = ""
+        self.source_normal = normal
+        self.source_down = down
+        self._apply_sources()
 
     def set_live(self, v: bool):
         self.live = v
@@ -133,10 +169,14 @@ class IconButton(Button):
             self._rotation.origin = self.center
             self._rotation.angle = self.rotation_angle
 
+    def _apply_sources(self):
+        if self.live or self.selected:
+            self.source = self.source_down or self.source_normal
+        elif self.state == "down" and self.source_down:
+            self.source = self.source_down
+        else:
+            self.source = self.source_normal
+
     def update_visual(self):
-        img = self.asset_pair['live'] if (self.live or self.selected) else self.asset_pair['stop']
-        self.background_normal = img
-        self.background_down = img
-        self.background_disabled_normal = img
-        self.background_disabled_down = img
+        self._apply_sources()
         self.opacity = 1.0 if (self.live or self.selected) else 0.6

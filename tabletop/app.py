@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import pathlib
+from pathlib import Path
 from typing import Any, Optional, cast
 
 from kivy.app import App
@@ -21,6 +21,9 @@ from tabletop.tabletop_view import TabletopRoot
 Config.set("graphics", "fullscreen", "auto")
 
 
+_KV_LOADED = False
+
+
 class TabletopApp(App):
     """Main Kivy application that wires the UI with infrastructure services."""
 
@@ -30,13 +33,12 @@ class TabletopApp(App):
 
     def build(self) -> TabletopRoot:
         """Create the root widget for the Kivy application."""
-        try:
-            Builder.load_file(
-                str(pathlib.Path(__file__).parent / "ui" / "layout.kv")
-            )
-        except Exception:
-            pass
-
+        global _KV_LOADED
+        if not _KV_LOADED:
+            kv_path = Path(__file__).parent / "ui" / "layout.kv"
+            if kv_path.exists():
+                Builder.load_file(str(kv_path))
+            _KV_LOADED = True
         return TabletopRoot()
 
     def on_start(self) -> None:  # pragma: no cover - framework callback
