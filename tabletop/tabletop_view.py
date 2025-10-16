@@ -57,6 +57,7 @@ Builder.load_file(str(Path(__file__).resolve().parent / 'ui' / 'layout.kv'))
 class TabletopRoot(FloatLayout):
     _STATE_FIELDS = STATE_FIELD_NAMES
 
+    bg_texture = ObjectProperty(None, rebind=True)
     base_width = NumericProperty(3840.0)
     base_height = NumericProperty(2160.0)
     button_scale = NumericProperty(0.8)
