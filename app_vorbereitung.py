@@ -386,11 +386,16 @@ from tabletop.overlay.fixation import (
     play_fixation_tone as overlay_play_fixation_tone,
     run_fixation_sequence as overlay_run_fixation_sequence,
 )
+from tabletop.state.controller import TabletopController, TabletopState
 
 ui_widgets.ASSETS = ASSETS
 
+STATE_FIELD_NAMES = set(TabletopState.__dataclass_fields__)
+
 
 class TabletopRoot(FloatLayout):
+    _STATE_FIELDS = STATE_FIELD_NAMES
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self.bg_texture = resolve_background_texture()
@@ -403,18 +408,14 @@ class TabletopRoot(FloatLayout):
                 self.bg = Rectangle(pos=(0, 0), size=Window.size)
         Window.bind(on_resize=self.on_resize)
 
-        self.round = 1
-        self.signaler = 1
-        self.judge = 2
-        self.first_player = None
-        self.second_player = None
-        self.player_roles = {}
-        self.update_turn_order()
-        self.phase = UXPhase.WAIT_BOTH_START
+        state = TabletopState(blocks=load_blocks())
+        self.controller = TabletopController(state)
         # Versuchsperson 1 sitzt immer unten (Spieler 1), Versuchsperson 2 oben (Spieler 2)
         self._fixed_role_mapping = {1: 1, 2: 2}
         self.role_by_physical = self._fixed_role_mapping.copy()
         self.physical_by_role = {role: player for player, role in self.role_by_physical.items()}
+        self.update_turn_order()
+        self.phase = UXPhase.WAIT_BOTH_START
         self.session_number = None
         self.session_id = None
         self.logger = None
@@ -430,6 +431,17 @@ class TabletopRoot(FloatLayout):
         self.setup_round()
         self.apply_phase()
         Clock.schedule_once(lambda *_: self.prompt_session_number(), 0.1)
+
+    def __setattr__(self, key, value):
+        if key in self._STATE_FIELDS and 'controller' in self.__dict__:
+            setattr(self.controller.state, key, value)
+        else:
+            super().__setattr__(key, value)
+
+    def __getattr__(self, item):
+        if item in self._STATE_FIELDS and 'controller' in self.__dict__:
+            return getattr(self.controller.state, item)
+        raise AttributeError(item)
 
     # --- Layout & Elemente
     def on_resize(self, *_):
@@ -635,22 +647,7 @@ class TabletopRoot(FloatLayout):
         }
         self.card_cycle = itertools.cycle(['7.png', '8.png', '9.png', '10.png', '11.png'])
 
-        self.blocks = load_blocks()
         self.total_rounds_planned = sum(len(block['rounds']) for block in self.blocks)
-        self.current_block_idx = 0
-        self.current_round_idx = 0
-        self.current_block_info = None
-        self.round_in_block = 1
-        self.in_block_pause = False
-        self.pause_message = ''
-        self.session_finished = False
-        self.current_round_has_stake = False
-        self.score_state = None
-        self.score_state_block = None
-        self.score_state_round_start = None
-        self.outcome_score_applied = False
-        self.pending_round_start_log = False
-        self.current_block_total_rounds = 0
         self.overlay_process = None
         self.fixation_running = False
         self.fixation_required = False
@@ -1007,15 +1004,7 @@ class TabletopRoot(FloatLayout):
                 widget.set_front(default)
 
     def compute_global_round(self):
-        if not self.blocks:
-            return self.round
-        total = 0
-        for idx, block in enumerate(self.blocks):
-            if idx < self.current_block_idx:
-                total += len(block['rounds'])
-        if self.current_block_idx >= len(self.blocks):
-            return max(1, total)
-        return total + self.current_round_idx + 1
+        return self.controller.compute_global_round()
 
     def score_line_text(self):
         if self.score_state:
@@ -1023,147 +1012,83 @@ class TabletopRoot(FloatLayout):
         return 'Spielstand – VP1: - | VP2: -'
 
     def get_current_plan(self):
-        if not self.blocks or self.session_finished or self.in_block_pause:
-            return None
-        if self.current_block_idx >= len(self.blocks):
-            return None
-        block = self.blocks[self.current_block_idx]
-        rounds = block['rounds']
-        if not rounds:
-            return None
-        if self.current_round_idx >= len(rounds):
-            return None
-        return block, rounds[self.current_round_idx]
+        return self.controller.get_current_plan()
 
     def peek_next_round_info(self):
         """Ermittelt Metadaten zur nächsten Runde ohne den Status zu verändern."""
-        if not self.blocks:
-            return None
-        if self.current_block_idx >= len(self.blocks):
-            return None
-        block_idx = self.current_block_idx
-        round_idx = self.current_round_idx + 1
-        while block_idx < len(self.blocks):
-            block = self.blocks[block_idx]
-            rounds = block.get('rounds') or []
-            if round_idx < len(rounds):
-                return {
-                    'block': block,
-                    'round_index': round_idx,
-                    'round_in_block': round_idx + 1,
-                }
-            block_idx += 1
-            round_idx = 0
-        return None
+        return self.controller.peek_next_round_info()
 
     def advance_round_pointer(self):
-        if not self.blocks or self.session_finished:
-            self.round += 1
-            return
-        if self.current_block_idx >= len(self.blocks):
-            self.session_finished = True
-            return
-        block = self.blocks[self.current_block_idx]
-        self.current_round_idx += 1
-        if self.current_round_idx >= len(block['rounds']):
-            completed_block = block
-            self.current_block_idx += 1
-            self.current_round_idx = 0
-            if self.current_block_idx >= len(self.blocks):
-                self.session_finished = True
-                self.in_block_pause = False
-                self.pause_message = 'Alle Blöcke abgeschlossen. Vielen Dank!'
-                self.next_block_preview = None
-            else:
-                self.in_block_pause = True
-                next_block = self.blocks[self.current_block_idx]
-                condition = 'Stake' if next_block['payout'] else 'ohne Stake'
-                self.pause_message = (
-                    'Dieser Block ist vorbei. Nehmen Sie sich einen Moment zum durchatmen.\n'
-                    'Wenn Sie bereit sind klicken Sie auf weiter.\n'
-                    f'Als nächstes folgt Block {next_block["index"]} ({condition}).'
-                )
-                self.next_block_preview = {
-                    'block': next_block,
-                    'round_index': 0,
-                    'round_in_block': 1,
-                }
-        self.round = self.compute_global_round()
+        self.controller.advance_round_pointer()
 
     # --- Logik
     def apply_phase(self):
-        # Alles zunächst deaktivieren
+        phase_state = self.controller.apply_phase()
         for c in (self.p1_outer, self.p1_inner, self.p2_outer, self.p2_inner):
             c.set_live(False)
         for buttons in self.signal_buttons.values():
             for b in buttons.values():
                 b.set_live(False)
+                b.disabled = True
         for buttons in self.decision_buttons.values():
             for b in buttons.values():
                 b.set_live(False)
+                b.disabled = True
 
-        # Showdown zurücksetzen
-        if self.phase != UXPhase.SHOWDOWN:
+        if not phase_state.show_showdown:
             self.refresh_center_cards(reveal=False)
 
-        # Startbuttons
-        start_active = (self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN))
+        start_active = phase_state.start_active
         if self.fixation_running:
             start_active = False
-        ready = self.session_configured and not self.session_finished
+        ready = phase_state.ready
         self.btn_start_p1.set_live(start_active and ready)
         self.btn_start_p2.set_live(start_active and ready)
 
-        # Phasen-spezifisch
-        if not ready:
-            pass
-        elif self.phase == UXPhase.P1_INNER:
-            self.p1_inner.set_live(True)
-        elif self.phase == UXPhase.P2_INNER:
-            self.p2_inner.set_live(True)
-        elif self.phase == UXPhase.P1_OUTER:
-            self.p1_outer.set_live(True)
-        elif self.phase == UXPhase.P2_OUTER:
-            self.p2_outer.set_live(True)
-        elif self.phase == UXPhase.SIGNALER:
-            signaler = self.signaler
-            for btn in self.signal_buttons[signaler].values():
-                btn.set_live(True)
-        elif self.phase == UXPhase.JUDGE:
-            judge = self.judge
-            for btn in self.decision_buttons[judge].values():
-                btn.set_live(True)
-        elif self.phase == UXPhase.SHOWDOWN:
+        if ready:
+            for player, cards in phase_state.active_cards.items():
+                for which in cards:
+                    widget = self.card_widget_for_player(player, which)
+                    if widget:
+                        widget.set_live(True)
+            for player, levels in phase_state.active_signal_buttons.items():
+                for level in levels:
+                    btn = self.signal_buttons.get(player, {}).get(level)
+                    if btn:
+                        btn.set_live(True)
+                        btn.disabled = False
+            for player, decisions in phase_state.active_decision_buttons.items():
+                for decision in decisions:
+                    btn = self.decision_buttons.get(player, {}).get(decision)
+                    if btn:
+                        btn.set_live(True)
+                        btn.disabled = False
+
+        if phase_state.show_showdown:
             self.btn_start_p1.set_live(True)
             self.btn_start_p2.set_live(True)
             self.update_showdown()
 
-        # Badge unten ist deaktiviert
         self.round_badge.text = ''
         self.update_user_displays()
         self.update_pause_overlay()
 
     def continue_after_start_press(self):
-        if self.session_finished:
+        result = self.controller.continue_after_start_press()
+        if result.blocked:
             return
-        if self.intro_active:
-            self.intro_active = False
+        if result.intro_deactivated:
             self.update_user_displays()
             self.update_intro_overlay()
 
         def proceed():
-            start_phase = self.phase_for_player(self.first_player, 'inner') or UXPhase.P1_INNER
-            self.phase = start_phase
             self.log_round_start_if_pending()
             self.apply_phase()
 
-        def proceed_with_fixation():
-            if self.fixation_required and not self.fixation_running:
-                self.run_fixation_sequence(proceed)
-            else:
-                proceed()
-
-        proceed_with_fixation()
+        if result.requires_fixation and not self.fixation_running:
+            self.run_fixation_sequence(proceed)
+        else:
+            proceed()
 
     def start_pressed(self, who:int):
         if self.session_finished:
@@ -1210,49 +1135,24 @@ class TabletopRoot(FloatLayout):
         overlay_play_fixation_tone(self)
 
     def tap_card(self, who:int, which:str):
-        # which in {'inner','outer'}
-        if which not in {'inner', 'outer'}:
+        result = self.controller.tap_card(who, which)
+        if not result.allowed:
             return
-
-        expected_phase = self.phase_for_player(who, which)
-        if expected_phase is None or self.phase != expected_phase:
-            return
-
         widget = self.card_widget_for_player(who, which)
         if not widget:
             return
-
         widget.flip()
-
-        if which == 'inner':
-            self.record_action(who, 'Karte innen aufgedeckt')
-            self.log_event(who, 'reveal_inner', {'card': 1})
-        else:
-            self.record_action(who, 'Karte außen aufgedeckt')
-            self.log_event(who, 'reveal_outer', {'card': 2})
-
-        first = self.first_player
-        second = self.second_player
-
-        if which == 'inner':
-            if who == first:
-                next_phase = self.phase_for_player(second, 'inner')
-            else:
-                next_phase = self.phase_for_player(first, 'outer')
-        else:
-            if who == first:
-                next_phase = self.phase_for_player(second, 'outer')
-            else:
-                next_phase = UXPhase.SIGNALER
-
-        if next_phase:
-            Clock.schedule_once(lambda *_: self.goto(next_phase), 0.2)
+        if result.record_text:
+            self.record_action(who, result.record_text)
+        if result.log_action:
+            self.log_event(who, result.log_action, result.log_payload or {})
+        if result.next_phase:
+            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
 
     def pick_signal(self, player:int, level:str):
-        if self.phase != UXPhase.SIGNALER or player != self.signaler:
+        result = self.controller.pick_signal(player, level)
+        if not result.accepted:
             return
-        self.player_signals[player] = level
-        # fixiere Auswahl optisch (Button bleibt live)
         for lvl, btn in self.signal_buttons[player].items():
             if lvl == level:
                 btn.set_pressed_state()
@@ -1260,15 +1160,17 @@ class TabletopRoot(FloatLayout):
                 btn.set_live(False)
                 btn.disabled = True
         self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
-        self.log_event(player, 'signal_choice', {'level': level})
+        if result.log_payload:
+            self.log_event(player, 'signal_choice', result.log_payload)
         self.update_user_displays()
-        Clock.schedule_once(lambda *_: self.goto(UXPhase.JUDGE), 0.2)
-        self.update_user_displays()
+        if result.next_phase:
+            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+            self.update_user_displays()
 
     def pick_decision(self, player:int, decision:str):
-        if self.phase != UXPhase.JUDGE or player != self.judge:
+        result = self.controller.pick_decision(player, decision)
+        if not result.accepted:
             return
-        self.player_decisions[player] = decision
         for choice, btn in self.decision_buttons[player].items():
             if choice == decision:
                 btn.set_pressed_state()
@@ -1276,119 +1178,58 @@ class TabletopRoot(FloatLayout):
                 btn.set_live(False)
                 btn.disabled = True
         self.record_action(player, f'Entscheidung: {decision.upper()}')
-        self.log_event(player, 'call_choice', {'decision': decision})
+        if result.log_payload:
+            self.log_event(player, 'call_choice', result.log_payload)
         self.update_user_displays()
-        Clock.schedule_once(lambda *_: self.goto(UXPhase.SHOWDOWN), 0.2)
-        self.update_user_displays()
+        if result.next_phase:
+            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+            self.update_user_displays()
 
     def goto(self, phase):
         self.phase = phase
         self.apply_phase()
 
     def prepare_next_round(self, start_immediately: bool = False):
-        # Rollen tauschen
-        self.signaler, self.judge = self.judge, self.signaler
-        self.update_turn_order()
+        result = self.controller.prepare_next_round(start_immediately=start_immediately)
         self.update_role_assignments()
-        self.advance_round_pointer()
-        self.phase = UXPhase.WAIT_BOTH_START
-        self.setup_round()
-        if self.session_finished:
-            self.apply_phase()
+        self._apply_round_setup(result.setup)
+        self.apply_phase()
+        if result.session_finished:
             self.update_user_displays()
             return
-
-        self.apply_phase()
-
-        if self.in_block_pause:
+        if result.in_block_pause:
             return
 
         def proceed():
-            start_phase = self.phase_for_player(self.first_player, 'inner') or UXPhase.P1_INNER
-            self.phase = start_phase
+            if result.start_phase:
+                self.phase = result.start_phase
             self.log_round_start_if_pending()
             self.apply_phase()
 
-        if self.fixation_required and not self.fixation_running:
+        if result.requires_fixation and not self.fixation_running:
             self.run_fixation_sequence(proceed)
         elif start_immediately:
             proceed()
 
     def setup_round(self):
-        self.outcome_score_applied = False
-        # ggf. leere Blöcke überspringen
-        if self.blocks and not self.session_finished and not self.in_block_pause:
-            while (
-                self.current_block_idx < len(self.blocks)
-                and not self.blocks[self.current_block_idx]['rounds']
-            ):
-                self.current_block_idx += 1
-        plan_info = self.get_current_plan()
-        if plan_info:
-            block, plan = plan_info
-            self.current_block_info = block
-            self.next_block_preview = None
-            self.round_in_block = self.current_round_idx + 1
-            self.current_round_has_stake = block['payout']
-            self.current_block_total_rounds = len(block.get('rounds') or [])
-            if block['payout'] and self.score_state_block != block['index']:
-                self.score_state = {1: 0, 2: 0}
-                self.score_state_block = block['index']
-            if not block['payout']:
-                self.score_state = None
-                self.score_state_block = None
-            self.score_state_round_start = (
-                self.score_state.copy() if self.score_state else None
-            )
-            self.set_cards_from_plan(plan)
-            self.round = self.compute_global_round()
-        else:
-            if self.current_block_idx >= len(self.blocks):
-                self.session_finished = True
-            self.current_block_info = None
-            self.round_in_block = 0
-            self.current_round_has_stake = False
-            self.current_block_total_rounds = 0
-            self.set_cards_from_plan(None)
-            self.round = self.compute_global_round()
-            self.score_state_round_start = (
-                self.score_state.copy() if self.score_state else None
-            )
+        result = self.controller.setup_round()
+        self._apply_round_setup(result)
 
+    def _apply_round_setup(self, result):
+        plan = result.plan if result else None
+        self.set_cards_from_plan(plan)
         for c in (self.p1_inner, self.p1_outer, self.p2_inner, self.p2_outer):
             c.reset()
-        # Reset Buttons
         for buttons in self.signal_buttons.values():
             for btn in buttons.values():
                 btn.reset()
         for buttons in self.decision_buttons.values():
             for btn in buttons.values():
                 btn.reset()
-        # Reset Status
-        self.player_signals = {1: None, 2: None}
-        self.player_decisions = {1: None, 2: None}
         self.status_lines = {1: [], 2: []}
         self.update_status_label(1)
         self.update_status_label(2)
-        # Showdown Elements
-        self.last_outcome = {
-            'winner': None,
-            'truthful': None,
-            'actual_level': None,
-            'actual_value': None,
-            'judge_value': None,
-            'signal_choice': None,
-            'judge_choice': None,
-            'payout': self.current_round_has_stake,
-        }
         self.refresh_center_cards(reveal=False)
-        if plan_info and (self.round_in_block == 1):
-            self.fixation_required = True
-        elif plan_info:
-            self.fixation_required = False
-        else:
-            self.fixation_required = False
-        self.pending_round_start_log = bool(plan_info)
         self.update_user_displays()
 
     def refresh_center_cards(self, reveal: bool):
@@ -1442,70 +1283,14 @@ class TabletopRoot(FloatLayout):
         return self.signal_level_from_value(value)
 
     def compute_outcome(self):
-        signaler = self.signaler
-        judge = self.judge
-        signal_choice = self.player_signals.get(signaler)
-        judge_choice = self.player_decisions.get(judge)
-        actual_total = self.get_hand_total_for_player(signaler)
-        judge_total = self.get_hand_total_for_player(judge)
-        actual_value = self.get_hand_value_for_player(signaler)
-        judge_value = self.get_hand_value_for_player(judge)
-        actual_level = self.signal_level_from_value(actual_value)
-
-        truthful = None
-        if signal_choice:
-            if actual_level:
-                truthful = (signal_choice == actual_level)
-            elif actual_total in (20, 21, 22):
-                # Werte über 19 können nicht wahrheitsgemäß signalisiert werden
-                truthful = False
-
-        winner = None
-        if judge_choice and truthful is not None:
-            if judge_choice == 'wahr':
-                if truthful:
-                    if (
-                        actual_value is not None
-                        and judge_value is not None
-                    ):
-                        if actual_value > judge_value:
-                            winner = signaler
-                        elif judge_value > actual_value:
-                            winner = judge
-                        else:
-                            winner = None
-                    else:
-                        winner = judge
-                else:
-                    winner = signaler
-            elif judge_choice == 'bluff':
-                winner = judge if not truthful else signaler
-
-        draw = False
-        if (
-            judge_choice == 'wahr'
-            and truthful is True
-            and winner is None
-            and actual_value is not None
-            and judge_value is not None
-            and actual_value == judge_value
-        ):
-            draw = True
-
-        self.last_outcome = {
-            'winner': winner,
-            'truthful': truthful,
-            'actual_level': actual_level,
-            'actual_value': actual_value,
-            'actual_total': actual_total,
-            'judge_total': judge_total,
-            'judge_value': judge_value,
-            'signal_choice': signal_choice,
-            'judge_choice': judge_choice,
-            'payout': self.current_round_has_stake,
-            'draw': draw,
-        }
-        return self.last_outcome
+        outcome = self.controller.compute_outcome(
+            signaler_total=self.get_hand_total_for_player(self.signaler),
+            judge_total=self.get_hand_total_for_player(self.judge),
+            signaler_value=self.get_hand_value_for_player(self.signaler),
+            judge_value=self.get_hand_value_for_player(self.judge),
+            level_from_value=self.signal_level_from_value,
+        )
+        return outcome
 
     def player_descriptor(self, player: int) -> str:
         role = self.role_by_physical.get(player)
@@ -1716,27 +1501,10 @@ class TabletopRoot(FloatLayout):
         self.physical_by_role = {role: player for player, role in self.role_by_physical.items()}
 
     def update_turn_order(self):
-        first = self.signaler if self.signaler in (1, 2) else 1
-        if self.judge in (1, 2) and self.judge != first:
-            second = self.judge
-        else:
-            second = 2 if first == 1 else 1
-
-        self.first_player = first
-        self.second_player = second
-        self.player_roles = {
-            first: 1,
-            second: 2,
-        }
+        self.controller.update_turn_order()
 
     def phase_for_player(self, player: int, which: str):
-        if player not in (1, 2):
-            return None
-        if which == 'inner':
-            return UXPhase.P1_INNER if player == 1 else UXPhase.P2_INNER
-        if which == 'outer':
-            return UXPhase.P1_OUTER if player == 1 else UXPhase.P2_OUTER
-        return None
+        return self.controller.phase_for_player(player, which)
 
     def card_widget_for_player(self, player: int, which: str):
         if player == 1:
