@@ -10,7 +10,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.lang import Builder
 from kivy.properties import DictProperty, NumericProperty, ObjectProperty
 from kivy.uix.button import Button
 from kivy.uix.floatlayout import FloatLayout
@@ -52,7 +51,6 @@ ui_widgets.ASSETS = ASSETS
 
 STATE_FIELD_NAMES = set(TabletopState.__dataclass_fields__)
 
-Builder.load_file(str(Path(__file__).resolve().parent / 'ui' / 'layout.kv'))
 
 class TabletopRoot(FloatLayout):
     _STATE_FIELDS = STATE_FIELD_NAMES
