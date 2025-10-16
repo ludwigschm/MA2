@@ -10,10 +10,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.graphics import Color, Rectangle
+from kivy.lang import Builder
+from kivy.properties import DictProperty, NumericProperty, ObjectProperty
 from kivy.uix.button import Button
 from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.textinput import TextInput
@@ -52,9 +52,34 @@ ui_widgets.ASSETS = ASSETS
 
 STATE_FIELD_NAMES = set(TabletopState.__dataclass_fields__)
 
+Builder.load_file(str(Path(__file__).resolve().parent / 'ui' / 'layout.kv'))
 
 class TabletopRoot(FloatLayout):
     _STATE_FIELDS = STATE_FIELD_NAMES
+
+    base_width = NumericProperty(3840.0)
+    base_height = NumericProperty(2160.0)
+    button_scale = NumericProperty(0.8)
+    scale = NumericProperty(1.0)
+
+    btn_start_p1 = ObjectProperty(None)
+    btn_start_p2 = ObjectProperty(None)
+    p1_outer = ObjectProperty(None)
+    p1_inner = ObjectProperty(None)
+    p2_outer = ObjectProperty(None)
+    p2_inner = ObjectProperty(None)
+    intro_overlay = ObjectProperty(None)
+    pause_cover = ObjectProperty(None)
+    fixation_overlay = ObjectProperty(None)
+    fixation_image = ObjectProperty(None)
+    round_badge = ObjectProperty(None)
+
+    signal_buttons = DictProperty({})
+    decision_buttons = DictProperty({})
+    center_cards = DictProperty({})
+    user_displays = DictProperty({})
+    intro_labels = DictProperty({})
+    pause_labels = DictProperty({})
 
     def __init__(
         self,
@@ -77,14 +102,8 @@ class TabletopRoot(FloatLayout):
         self.fixation_player = fixation_player
         self.fixation_tone_factory = fixation_tone_factory
         self.bg_texture = resolve_background_texture()
-        with self.canvas.before:
-            if self.bg_texture:
-                Color(1, 1, 1, 1)
-                self.bg = Rectangle(pos=(0, 0), size=Window.size, texture=self.bg_texture)
-            else:
-                Color(0.75, 0.75, 0.75, 1)  # #BFBFBF fallback
-                self.bg = Rectangle(pos=(0, 0), size=Window.size)
-        Window.bind(on_resize=self.on_resize)
+        Window.bind(on_resize=self._on_window_resize)
+        self.bind(size=self._update_scale)
 
         if state is None:
             state = TabletopState(blocks=load_blocks())
@@ -107,8 +126,8 @@ class TabletopRoot(FloatLayout):
         self.round_log_fp = None
         self.round_log_writer = None
 
-        # --- UI Elemente platzieren
-        self.make_ui()
+        # --- UI Elemente initialisieren
+        self._configure_widgets()
         self.setup_round()
         self.apply_phase()
         Clock.schedule_once(lambda *_: self.prompt_session_number(), 0.1)
@@ -125,192 +144,91 @@ class TabletopRoot(FloatLayout):
         raise AttributeError(item)
 
     # --- Layout & Elemente
-    def on_resize(self, *_):
-        self.bg.size = Window.size
-        self.update_layout()
-
-    def make_ui(self):
-        # Start-Buttons links/rechts (für beide Spieler)
-        self.btn_start_p1 = IconButton(
-            ASSETS['play'],
-            size_hint=(None, None),
-        )
+    def _configure_widgets(self):
         self.btn_start_p1.bind(on_release=lambda *_: self.start_pressed(1))
-        self.add_widget(self.btn_start_p1)
-
-        self.btn_start_p2 = IconButton(
-            ASSETS['play'],
-            size_hint=(None, None),
-        )
         self.btn_start_p2.bind(on_release=lambda *_: self.start_pressed(2))
-        self.add_widget(self.btn_start_p2)
 
-        # Spielerzonen (je 2 Karten in den Ecken)
-        self.p1_outer = CardWidget(size_hint=(None, None))
         self.p1_outer.bind(on_release=lambda *_: self.tap_card(1, 'outer'))
-        self.add_widget(self.p1_outer)
-
-        self.p1_inner = CardWidget(size_hint=(None, None))
         self.p1_inner.bind(on_release=lambda *_: self.tap_card(1, 'inner'))
-        self.add_widget(self.p1_inner)
-
-        self.p2_outer = CardWidget(size_hint=(None, None))
         self.p2_outer.bind(on_release=lambda *_: self.tap_card(2, 'outer'))
-        self.add_widget(self.p2_outer)
-
-        self.p2_inner = CardWidget(size_hint=(None, None))
         self.p2_inner.bind(on_release=lambda *_: self.tap_card(2, 'inner'))
-        self.add_widget(self.p2_inner)
 
-        # Button-Cluster für Signale & Entscheidungen pro Spieler
-        self.signal_buttons = {1: {}, 2: {}}
-        self.decision_buttons = {1: {}, 2: {}}
-
-        for level in ['low', 'mid', 'high']:
-            btn = IconButton(ASSETS['signal'][level], size_hint=(None, None))
+        self.signal_buttons = {
+            1: {
+                'low': self.ids.signal_p1_low,
+                'mid': self.ids.signal_p1_mid,
+                'high': self.ids.signal_p1_high,
+            },
+            2: {
+                'low': self.ids.signal_p2_low,
+                'mid': self.ids.signal_p2_mid,
+                'high': self.ids.signal_p2_high,
+            },
+        }
+        for level, btn in self.signal_buttons[1].items():
             btn.bind(on_release=lambda _, lvl=level: self.pick_signal(1, lvl))
-            self.signal_buttons[1][level] = btn
-            self.add_widget(btn)
-
-        for choice in ['bluff', 'wahr']:
-            btn = IconButton(ASSETS['decide'][choice], size_hint=(None, None))
-            btn.bind(on_release=lambda _, ch=choice: self.pick_decision(1, ch))
-            self.decision_buttons[1][choice] = btn
-            self.add_widget(btn)
-
-        for level in ['low', 'mid', 'high']:
-            btn = IconButton(ASSETS['signal'][level], size_hint=(None, None))
+            btn.set_rotation(0)
+        for level, btn in self.signal_buttons[2].items():
             btn.bind(on_release=lambda _, lvl=level: self.pick_signal(2, lvl))
-            self.signal_buttons[2][level] = btn
-            self.add_widget(btn)
+            btn.set_rotation(180)
 
-        for choice in ['bluff', 'wahr']:
-            btn = IconButton(ASSETS['decide'][choice], size_hint=(None, None))
+        self.decision_buttons = {
+            1: {
+                'bluff': self.ids.decision_p1_bluff,
+                'wahr': self.ids.decision_p1_wahr,
+            },
+            2: {
+                'bluff': self.ids.decision_p2_bluff,
+                'wahr': self.ids.decision_p2_wahr,
+            },
+        }
+        for choice, btn in self.decision_buttons[1].items():
+            btn.bind(on_release=lambda _, ch=choice: self.pick_decision(1, ch))
+            btn.set_rotation(0)
+        for choice, btn in self.decision_buttons[2].items():
             btn.bind(on_release=lambda _, ch=choice: self.pick_decision(2, ch))
-            self.decision_buttons[2][choice] = btn
-            self.add_widget(btn)
+            btn.set_rotation(180)
 
-        # Showdown-Karten in der Mitte (immer sichtbar, zuerst verdeckt)
         self.center_cards = {
-            1: [Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True),
-                Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)],
-            2: [Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True),
-                Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)],
+            1: [self.ids.center_p1_card_right, self.ids.center_p1_card_left],
+            2: [self.ids.center_p2_card_left, self.ids.center_p2_card_right],
         }
-        for imgs in self.center_cards.values():
-            for img in imgs:
-                self.add_widget(img)
 
-         # --- User-Displays (unter/über den vier Karten in der Mitte)
-        # --- User-Displays: je Seite eines (unten VP1, oben VP2 – oben rotiert)
         self.user_displays = {
-            1: RotatableLabel(
-                size_hint=(None, None),
-                halign='left',
-                valign='top',
-                color=(1, 1, 1, 1),
-                markup=True,
-            ),  # unten
-            2: RotatableLabel(
-                size_hint=(None, None),
-                halign='left',
-                valign='top',
-                color=(1, 1, 1, 1),
-                markup=True,
-            ),  # oben (180°)
+            1: self.ids.user_display_p1,
+            2: self.ids.user_display_p2,
         }
+        self.user_displays[1].set_rotation(0)
+        self.user_displays[2].set_rotation(180)
         for lbl in self.user_displays.values():
             lbl.text = ''
             lbl.opacity = 1
-            self.add_widget(lbl)
 
-        # Intro-Overlay für den Startbildschirm
-        intro_text = "[b]Willkommen![/b]\nUm zu Beginnen drücken Sie bitte auf den Play-Button"
-        self.intro_overlay = FloatLayout(size_hint=(1, 1))
-        with self.intro_overlay.canvas.before:
-            Color(0.75, 0.75, 0.75, 1)
-            self.intro_bg = Rectangle(pos=(0, 0), size=Window.size)
         self.intro_labels = {
-            1: RotatableLabel(
-                text=intro_text,
-                halign='center',
-                valign='middle',
-                color=(0, 0, 0, 1),
-                markup=True,
-                size_hint=(None, None),
-            ),
-            2: RotatableLabel(
-                text=intro_text,
-                halign='center',
-                valign='middle',
-                color=(0, 0, 0, 1),
-                markup=True,
-                size_hint=(None, None),
-            ),
+            1: self.ids.intro_label_p1,
+            2: self.ids.intro_label_p2,
         }
         self.intro_labels[1].set_rotation(0)
         self.intro_labels[2].set_rotation(180)
-        for lbl in self.intro_labels.values():
-            self.intro_overlay.add_widget(lbl)
-        self.add_widget(self.intro_overlay)
 
-        # Rundenbadge unten Mitte
-        self.round_badge = Label(
-            text='',
-            color=(1, 1, 1, 1),
-            size_hint=(None, None),
-            halign='center',
-            valign='middle'
-        )
-        self.round_badge.opacity = 0
-        self.add_widget(self.round_badge)
-
-        # Pause-Overlay (für Blockpausen)
-        self.pause_cover = FloatLayout(size_hint=(1, 1))
-        with self.pause_cover.canvas.before:
-            Color(0.75, 0.75, 0.75, 1)
-            self.pause_bg = Rectangle(pos=(0, 0), size=Window.size)
         self.pause_labels = {
-            1: RotatableLabel(
-                text='',
-                color=(0, 0, 0, 1),
-                halign='center',
-                valign='middle',
-                size_hint=(None, None),
-            ),
-            2: RotatableLabel(
-                text='',
-                color=(0, 0, 0, 1),
-                halign='center',
-                valign='middle',
-                size_hint=(None, None),
-            ),
+            1: self.ids.pause_label_p1,
+            2: self.ids.pause_label_p2,
         }
         self.pause_labels[1].set_rotation(0)
         self.pause_labels[2].set_rotation(180)
         for lbl in self.pause_labels.values():
             lbl.bind(texture_size=lambda *_: None)
-            self.pause_cover.add_widget(lbl)
-        self.pause_cover.opacity = 0
-        self.pause_cover.disabled = True
-        self.add_widget(self.pause_cover)
 
-        # Start-Buttons nach vorn holen (über dem Overlay)
+        self.fixation_overlay.opacity = 0
+        self.fixation_overlay.disabled = True
+        self.fixation_image.opacity = 1
+
+        self.btn_start_p1.set_rotation(0)
+        self.btn_start_p2.set_rotation(180)
         self.bring_start_buttons_to_front()
 
-        # Fixations-Overlay vorbereiten (wird bei Bedarf eingeblendet)
-        self.fixation_overlay = FloatLayout(size_hint=(1, 1))
-        self.fixation_overlay.opacity = 0
-        self.fixation_overlay.disabled = True
-        self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
-        self.fixation_overlay.add_widget(self.fixation_image)
-
-        # Fixations-Overlay vorbereiten (wird bei Bedarf eingeblendet)
-        self.fixation_overlay = FloatLayout(size_hint=(1, 1))
-        self.fixation_overlay.opacity = 0
-        self.fixation_overlay.disabled = True
-        self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
-        self.fixation_overlay.add_widget(self.fixation_image)
+        self._update_scale()
 
         # interne States
         self.p1_pressed = False
@@ -338,7 +256,7 @@ class TabletopRoot(FloatLayout):
         self.fixation_tone_fs = 44100
         self.fixation_tone = self.fixation_tone_factory(self.fixation_tone_fs)
 
-        self.update_layout()
+        self._update_scale()
         self.update_user_displays()
         self.update_intro_overlay()
 
@@ -365,225 +283,19 @@ class TabletopRoot(FloatLayout):
                 self.remove_widget(self.intro_overlay)
                 self.bring_start_buttons_to_front()
 
-    def update_layout(self):
-        W, H = Window.size
-        base_w, base_h = 3840.0, 2160.0
-        scale = min(W / base_w if base_w else 1, H / base_h if base_h else 1)
-        button_scale = 0.8
+    def _on_window_resize(self, *_):
+        self.size = Window.size
+        self._update_scale()
 
-        self.bg.pos = (0, 0)
-        self.bg.size = (W, H)
-
-        corner_margin = 180 * scale
-        card_width, card_height = 420 * scale, 640 * scale
-        card_gap = 70 * scale
-        start_size = (360 * button_scale * scale, 360 * button_scale * scale)
-
-        # Start buttons
-        self.btn_start_p1.size = start_size
-        start_margin = 180 * scale
-        self.btn_start_p1.pos = (W - start_margin - start_size[0], start_margin)
-        self.btn_start_p1.set_rotation(0)
-
-        self.btn_start_p2.size = start_size
-        self.btn_start_p2.pos = (start_margin, H - start_margin - start_size[1])
-        self.btn_start_p2.set_rotation(180)
-
-        # Cards positions
-        p1_outer_pos = (corner_margin, corner_margin)
-        p1_inner_pos = (corner_margin + card_width + card_gap, corner_margin)
-        self.p1_outer.size = (card_width, card_height)
-        self.p1_outer.pos = p1_outer_pos
-        self.p1_inner.size = (card_width, card_height)
-        self.p1_inner.pos = p1_inner_pos
-
-        p2_outer_pos = (W - corner_margin - card_width, H - corner_margin - card_height)
-        p2_inner_pos = (p2_outer_pos[0] - card_width - card_gap, p2_outer_pos[1])
-        self.p2_outer.size = (card_width, card_height)
-        self.p2_outer.pos = p2_outer_pos
-        self.p2_inner.size = (card_width, card_height)
-        self.p2_inner.pos = p2_inner_pos
-
-        # Button stacks
-        btn_width, btn_height = 260 * button_scale * scale, 260 * button_scale * scale
-        vertical_gap = 40 * button_scale * scale
-        horizontal_gap = 60 * button_scale * scale
-        cluster_shift = 780 * scale
-        vertical_offset = 220 * scale
-
-        # Player 1 (bottom right)
-        signal_x = W - corner_margin - btn_width - cluster_shift
-        base_y = corner_margin + vertical_offset
-        for idx, level in enumerate(['low', 'mid', 'high']):
-            btn = self.signal_buttons[1][level]
-            btn.size = (btn_width, btn_height)
-            btn.pos = (signal_x, base_y + idx * (btn_height + vertical_gap))
-            btn.set_rotation(0)
-
-        decision_x = signal_x - horizontal_gap - btn_width
-        for idx, choice in enumerate(['bluff', 'wahr']):
-            btn = self.decision_buttons[1][choice]
-            btn.size = (btn_width, btn_height)
-            btn.pos = (decision_x, base_y + idx * (btn_height + vertical_gap))
-            btn.set_rotation(0)
-
-        # Player 2 (top left)
-        signal2_x = corner_margin + cluster_shift
-        top_y = H - corner_margin - vertical_offset
-        for idx, level in enumerate(['low', 'mid', 'high']):
-            btn = self.signal_buttons[2][level]
-            btn.size = (btn_width, btn_height)
-            btn.pos = (signal2_x, top_y - btn_height - idx * (btn_height + vertical_gap))
-            btn.set_rotation(180)
-
-        decision2_x = signal2_x + btn_width + horizontal_gap
-        for idx, choice in enumerate(['bluff', 'wahr']):
-            btn = self.decision_buttons[2][choice]
-            btn.size = (btn_width, btn_height)
-            btn.pos = (decision2_x, top_y - btn_height - idx * (btn_height + vertical_gap))
-            btn.set_rotation(180)
-
-        # Center cards
-        center_card_width, center_card_height = 380 * scale, 560 * scale
-        center_gap_x = 90 * scale
-        center_gap_y = 60 * scale
-        left_x = W / 2 - center_card_width - center_gap_x / 2
-        right_x = W / 2 + center_gap_x / 2
-        bottom_y = H / 2 - center_card_height - center_gap_y / 2
-        top_y_center = H / 2 + center_gap_y / 2
-
-        for idx, img in enumerate(self.center_cards[1]):
-            img.size = (center_card_width, center_card_height)
-        self.center_cards[1][0].pos = (right_x, bottom_y)
-        self.center_cards[1][1].pos = (left_x, bottom_y)
-
-        for idx, img in enumerate(self.center_cards[2]):
-            img.size = (center_card_width, center_card_height)
-        self.center_cards[2][0].pos = (left_x, top_y_center)
-        self.center_cards[2][1].pos = (right_x, top_y_center)
-
-        # --- User-Displays positionieren & drehen (2 Labels: unten/oben)
-        display_gap = 40 * scale
-        span_width = 2 * center_card_width + center_gap_x   # über beide Karten spannen
-        display_width = span_width
-        display_height = 660 * scale
-        padding_x = 60 * scale
-        padding_y = 40 * scale
-
-        # Unteres Display (VP1): unter beiden unteren Karten, keine Drehung
-        bottom_span_x = left_x
-        bottom_span_y = bottom_y
-        self.user_displays[1].size = (display_width, display_height)
-        self.user_displays[1].pos = (
-            bottom_span_x,
-            bottom_span_y - display_gap - display_height
-        )
-        self.user_displays[1].text_size = (
-            display_width - 2 * padding_x,
-            display_height - 2 * padding_y,
-        )
-        self.user_displays[1].padding = (padding_x, padding_y)
-        self.user_displays[1].font_size = 32 * scale if scale else 32
-        self.user_displays[1].set_rotation(0)
-
-        # Oberes Display (VP2): über beiden oberen Karten, 180° gedreht
-        top_cards_top = top_y_center + center_card_height
-        self.user_displays[2].size = (display_width, display_height)
-        self.user_displays[2].pos = (
-            left_x,
-            top_cards_top + display_gap
-        )
-        self.user_displays[2].text_size = (
-            display_width - 2 * padding_x,
-            display_height - 2 * padding_y,
-        )
-        self.user_displays[2].padding = (padding_x, padding_y)
-        self.user_displays[2].font_size = 32 * scale if scale else 32
-        self.user_displays[2].set_rotation(180)
-
-        # Round badge
-        badge_width, badge_height = 1400 * scale, 70 * scale
-        self.round_badge.size = (badge_width, badge_height)
-        self.round_badge.font_size = 40 * scale if scale else 40
-        self.round_badge.pos = (W / 2 - badge_width / 2, corner_margin / 2)
-        self.round_badge.text_size = (badge_width, badge_height)
-
-        # Pause-Overlay
-        if hasattr(self, 'pause_bg'):
-            self.pause_bg.size = (W, H)
-            self.pause_bg.pos = (0, 0)
-        if hasattr(self, 'pause_cover'):
-            self.pause_cover.size = (W, H)
-            self.pause_cover.pos = (0, 0)
-        if hasattr(self, 'pause_labels'):
-            label_width = W * 0.8
-            label_height = H * 0.25
-            gap = 40 * scale
-
-            bottom_label = self.pause_labels[1]
-            bottom_label.size = (label_width, label_height)
-            bottom_label.pos = (
-                W / 2 - label_width / 2,
-                H / 2 - gap / 2 - label_height,
-            )
-            bottom_label.text_size = (label_width, label_height)
-            bottom_label.font_size = 56 * scale if scale else 56
-            bottom_label.set_rotation(0)
-
-            top_label = self.pause_labels[2]
-            top_label.size = (label_width, label_height)
-            top_label.pos = (
-                W / 2 - label_width / 2,
-                H / 2 + gap / 2,
-            )
-            top_label.text_size = (label_width, label_height)
-            top_label.font_size = 56 * scale if scale else 56
-            top_label.set_rotation(180)
-
-        if self.fixation_overlay:
-            self.fixation_overlay.size = (W, H)
-            self.fixation_overlay.pos = (0, 0)
-        if self.fixation_image:
-            self.fixation_image.size = (W, H)
-            self.fixation_image.pos = (0, 0)
-        if hasattr(self, 'intro_overlay'):
-            self.intro_overlay.size = (W, H)
-            self.intro_overlay.pos = (0, 0)
-            if hasattr(self, 'intro_bg'):
-                self.intro_bg.size = (W, H)
-                self.intro_bg.pos = (0, 0)
-            label_width = W * 0.6
-            label_height = H * 0.25
-            gap = 120 * scale
-            padding = (40 * scale, 40 * scale)
-            bottom_label = self.intro_labels[1]
-            bottom_label.size = (label_width, label_height)
-            bottom_label.pos = (
-                W / 2 - label_width / 2,
-                H / 2 - gap / 2 - label_height,
-            )
-            bottom_label.text_size = (label_width - 2 * padding[0], label_height - 2 * padding[1])
-            bottom_label.padding = padding
-            bottom_label.font_size = 64 * scale if scale else 64
-            top_label = self.intro_labels[2]
-            top_label.size = (label_width, label_height)
-            top_label.pos = (
-                W / 2 - label_width / 2,
-                H / 2 + gap / 2,
-            )
-            top_label.text_size = (label_width - 2 * padding[0], label_height - 2 * padding[1])
-            top_label.padding = padding
-            top_label.font_size = 64 * scale if scale else 64
-
-        # Refresh transforms after layout changes
-        for buttons in self.signal_buttons.values():
-            for btn in buttons.values():
-                btn._update_transform()
-        for buttons in self.decision_buttons.values():
-            for btn in buttons.values():
-                btn._update_transform()
-        self.btn_start_p1._update_transform()
-        self.btn_start_p2._update_transform()
+    def _update_scale(self, *_):
+        base_w = self.base_width or 0
+        base_h = self.base_height or 0
+        if not base_w or not base_h:
+            self.scale = 1.0
+            return
+        width = self.width or Window.width
+        height = self.height or Window.height
+        self.scale = min(width / base_w, height / base_h)
 
     @staticmethod
     def _parse_value(value):
