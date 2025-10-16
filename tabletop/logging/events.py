@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from game_engine_w import EventLogger, Phase as EnginePhase
+from tabletop.engine import EventLogger, Phase as EnginePhase
 
 __all__ = ["Events", "EnginePhase"]
 
 
 class Events:
-    """Thin wrapper around :class:`game_engine_w.EventLogger`."""
+    """Thin wrapper around :class:`tabletop.engine.EventLogger`."""
 
     def __init__(self, session_id: str, db_path: str, csv_path: Optional[str] = None):
         self._session_id = session_id
