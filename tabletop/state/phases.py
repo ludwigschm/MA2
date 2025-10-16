@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Dict, Union
 
-from game_engine_w import Phase as EnginePhase
+from tabletop.engine import Phase as EnginePhase
 
 
 class UXPhase(Enum):
