@@ -341,7 +341,6 @@ class TabletopRoot(FloatLayout):
         self.update_layout()
         self.update_user_displays()
         self.update_intro_overlay()
-        self.overlay_process = self.start_overlay(self.overlay_process)
 
     def bring_start_buttons_to_front(self):
         self.remove_widget(self.btn_start_p1)

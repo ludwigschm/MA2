@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, cast
+from typing import Any, Optional, cast
 
 from kivy.app import App
 from kivy.config import Config
 
 from tabletop.logging.round_csv import close_round_log
-from tabletop.overlay import process as overlay_process
+from tabletop.overlay.process import (
+    OverlayProcess,
+    start_overlay,
+    stop_overlay,
+)
 from tabletop.tabletop_view import TabletopRoot
 
 # Ensure the application starts in fullscreen mode like the legacy scripts.
 Config.set("graphics", "fullscreen", "auto")
-
-OverlayProcess = overlay_process.OverlayProcess
-StartOverlayFn = Callable[[Optional[OverlayProcess]], Optional[OverlayProcess]]
-StopOverlayFn = Callable[[Optional[OverlayProcess]], Optional[OverlayProcess]]
 
 
 class TabletopApp(App):
@@ -29,54 +29,44 @@ class TabletopApp(App):
     def build(self) -> TabletopRoot:
         """Create the root widget for the Kivy application."""
 
-        root = TabletopRoot()
-        return root
+        return TabletopRoot()
 
     def on_start(self) -> None:  # pragma: no cover - framework callback
         super().on_start()
-        root = self.root
-        if root and hasattr(root, "start_overlay"):
-            start_overlay = cast(StartOverlayFn, getattr(root, "start_overlay"))
-        else:
-            start_overlay = overlay_process.start_overlay
+        root = cast(Optional[TabletopRoot], self.root)
 
         process_handle: Optional[OverlayProcess]
-        if root and hasattr(root, "overlay_process"):
-            process_handle = getattr(root, "overlay_process")
+        if root and getattr(root, "overlay_process", None):
+            process_handle = cast(Optional[OverlayProcess], root.overlay_process)
         else:
             process_handle = self._overlay_process
 
         process_handle = start_overlay(process_handle)
         self._overlay_process = process_handle
-        if root and hasattr(root, "overlay_process"):
-            setattr(root, "overlay_process", process_handle)
+        if root is not None:
+            root.overlay_process = process_handle
 
     def on_stop(self) -> None:  # pragma: no cover - framework callback
-        root = self.root
-
-        if root and hasattr(root, "stop_overlay"):
-            stop_overlay = cast(StopOverlayFn, getattr(root, "stop_overlay"))
-        else:
-            stop_overlay = overlay_process.stop_overlay
+        root = cast(Optional[TabletopRoot], self.root)
 
         process_handle: Optional[OverlayProcess]
-        if root and hasattr(root, "overlay_process"):
-            process_handle = getattr(root, "overlay_process")
+        if root and getattr(root, "overlay_process", None):
+            process_handle = cast(Optional[OverlayProcess], root.overlay_process)
         else:
             process_handle = self._overlay_process
 
         process_handle = stop_overlay(process_handle)
         self._overlay_process = process_handle
-        if root and hasattr(root, "overlay_process"):
-            setattr(root, "overlay_process", process_handle)
+        if root is not None:
+            root.overlay_process = process_handle
 
-        if root:
+        if root is not None:
             logger = getattr(root, "logger", None)
             if logger is not None:
                 close_fn = getattr(logger, "close", None)
                 if callable(close_fn):
                     close_fn()
-                setattr(root, "logger", None)
+                root.logger = None
             close_round_log(root)
 
         super().on_stop()
