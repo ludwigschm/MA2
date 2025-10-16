@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import pathlib
 from typing import Any, Optional, cast
 
 from kivy.app import App
 from kivy.config import Config
+from kivy.lang import Builder
 
 from tabletop.logging.round_csv import close_round_log
 from tabletop.overlay.process import (
@@ -28,6 +30,12 @@ class TabletopApp(App):
 
     def build(self) -> TabletopRoot:
         """Create the root widget for the Kivy application."""
+        try:
+            Builder.load_file(
+                str(pathlib.Path(__file__).parent / "ui" / "layout.kv")
+            )
+        except Exception:
+            pass
 
         return TabletopRoot()
 
