@@ -354,7 +354,8 @@ import numpy as np
 
 
 
-from tabletop.logging.events import EnginePhase
+# --- Phasenlogik
+from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.logging.round_csv import (
     init_round_log,
     round_log_action_label,
@@ -389,17 +390,6 @@ from tabletop.overlay.fixation import (
 ui_widgets.ASSETS = ASSETS
 
 
-# --- Phasen der Runde
-PH_WAIT_BOTH_START = 'WAIT_BOTH_START'
-PH_P1_INNER = 'P1_INNER'
-PH_P2_INNER = 'P2_INNER'
-PH_P1_OUTER = 'P1_OUTER'
-PH_P2_OUTER = 'P2_OUTER'
-PH_SIGNALER = 'SIGNALER'
-PH_JUDGE = 'JUDGE'
-PH_SHOWDOWN = 'SHOWDOWN'
-
-
 class TabletopRoot(FloatLayout):
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -420,7 +410,7 @@ class TabletopRoot(FloatLayout):
         self.second_player = None
         self.player_roles = {}
         self.update_turn_order()
-        self.phase = PH_WAIT_BOTH_START
+        self.phase = UXPhase.WAIT_BOTH_START
         # Versuchsperson 1 sitzt immer unten (Spieler 1), Versuchsperson 2 oben (Spieler 2)
         self._fixed_role_mapping = {1: 1, 2: 2}
         self.role_by_physical = self._fixed_role_mapping.copy()
@@ -1113,11 +1103,11 @@ class TabletopRoot(FloatLayout):
                 b.set_live(False)
 
         # Showdown zurücksetzen
-        if self.phase != PH_SHOWDOWN:
+        if self.phase != UXPhase.SHOWDOWN:
             self.refresh_center_cards(reveal=False)
 
         # Startbuttons
-        start_active = (self.phase in (PH_WAIT_BOTH_START, PH_SHOWDOWN))
+        start_active = (self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN))
         if self.fixation_running:
             start_active = False
         ready = self.session_configured and not self.session_finished
@@ -1127,23 +1117,23 @@ class TabletopRoot(FloatLayout):
         # Phasen-spezifisch
         if not ready:
             pass
-        elif self.phase == PH_P1_INNER:
+        elif self.phase == UXPhase.P1_INNER:
             self.p1_inner.set_live(True)
-        elif self.phase == PH_P2_INNER:
+        elif self.phase == UXPhase.P2_INNER:
             self.p2_inner.set_live(True)
-        elif self.phase == PH_P1_OUTER:
+        elif self.phase == UXPhase.P1_OUTER:
             self.p1_outer.set_live(True)
-        elif self.phase == PH_P2_OUTER:
+        elif self.phase == UXPhase.P2_OUTER:
             self.p2_outer.set_live(True)
-        elif self.phase == PH_SIGNALER:
+        elif self.phase == UXPhase.SIGNALER:
             signaler = self.signaler
             for btn in self.signal_buttons[signaler].values():
                 btn.set_live(True)
-        elif self.phase == PH_JUDGE:
+        elif self.phase == UXPhase.JUDGE:
             judge = self.judge
             for btn in self.decision_buttons[judge].values():
                 btn.set_live(True)
-        elif self.phase == PH_SHOWDOWN:
+        elif self.phase == UXPhase.SHOWDOWN:
             self.btn_start_p1.set_live(True)
             self.btn_start_p2.set_live(True)
             self.update_showdown()
@@ -1162,7 +1152,7 @@ class TabletopRoot(FloatLayout):
             self.update_intro_overlay()
 
         def proceed():
-            start_phase = self.phase_for_player(self.first_player, 'inner') or PH_P1_INNER
+            start_phase = self.phase_for_player(self.first_player, 'inner') or UXPhase.P1_INNER
             self.phase = start_phase
             self.log_round_start_if_pending()
             self.apply_phase()
@@ -1178,7 +1168,7 @@ class TabletopRoot(FloatLayout):
     def start_pressed(self, who:int):
         if self.session_finished:
             return
-        if self.phase not in (PH_WAIT_BOTH_START, PH_SHOWDOWN):
+        if self.phase not in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN):
             return
         if who == 1:
             self.p1_pressed = True
@@ -1186,7 +1176,7 @@ class TabletopRoot(FloatLayout):
             self.p2_pressed = True
         self.record_action(who, 'Play gedrückt')
         if self.session_configured:
-            action = 'start_click' if self.phase == PH_WAIT_BOTH_START else 'next_round_click'
+            action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
             self.log_event(who, action)
         if self.p1_pressed and self.p2_pressed:
             # in nächste Phase
@@ -1199,10 +1189,10 @@ class TabletopRoot(FloatLayout):
                 if self.session_finished:
                     self.apply_phase()
                     return
-                self.phase = PH_WAIT_BOTH_START
+                self.phase = UXPhase.WAIT_BOTH_START
                 self.apply_phase()
                 self.continue_after_start_press()
-            elif self.phase == PH_SHOWDOWN:
+            elif self.phase == UXPhase.SHOWDOWN:
                 self.prepare_next_round(start_immediately=True)
             else:
                 self.continue_after_start_press()
@@ -1253,13 +1243,13 @@ class TabletopRoot(FloatLayout):
             if who == first:
                 next_phase = self.phase_for_player(second, 'outer')
             else:
-                next_phase = PH_SIGNALER
+                next_phase = UXPhase.SIGNALER
 
         if next_phase:
             Clock.schedule_once(lambda *_: self.goto(next_phase), 0.2)
 
     def pick_signal(self, player:int, level:str):
-        if self.phase != PH_SIGNALER or player != self.signaler:
+        if self.phase != UXPhase.SIGNALER or player != self.signaler:
             return
         self.player_signals[player] = level
         # fixiere Auswahl optisch (Button bleibt live)
@@ -1272,11 +1262,11 @@ class TabletopRoot(FloatLayout):
         self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
         self.log_event(player, 'signal_choice', {'level': level})
         self.update_user_displays()
-        Clock.schedule_once(lambda *_: self.goto(PH_JUDGE), 0.2)
+        Clock.schedule_once(lambda *_: self.goto(UXPhase.JUDGE), 0.2)
         self.update_user_displays()
 
     def pick_decision(self, player:int, decision:str):
-        if self.phase != PH_JUDGE or player != self.judge:
+        if self.phase != UXPhase.JUDGE or player != self.judge:
             return
         self.player_decisions[player] = decision
         for choice, btn in self.decision_buttons[player].items():
@@ -1288,7 +1278,7 @@ class TabletopRoot(FloatLayout):
         self.record_action(player, f'Entscheidung: {decision.upper()}')
         self.log_event(player, 'call_choice', {'decision': decision})
         self.update_user_displays()
-        Clock.schedule_once(lambda *_: self.goto(PH_SHOWDOWN), 0.2)
+        Clock.schedule_once(lambda *_: self.goto(UXPhase.SHOWDOWN), 0.2)
         self.update_user_displays()
 
     def goto(self, phase):
@@ -1301,7 +1291,7 @@ class TabletopRoot(FloatLayout):
         self.update_turn_order()
         self.update_role_assignments()
         self.advance_round_pointer()
-        self.phase = PH_WAIT_BOTH_START
+        self.phase = UXPhase.WAIT_BOTH_START
         self.setup_round()
         if self.session_finished:
             self.apply_phase()
@@ -1314,7 +1304,7 @@ class TabletopRoot(FloatLayout):
             return
 
         def proceed():
-            start_phase = self.phase_for_player(self.first_player, 'inner') or PH_P1_INNER
+            start_phase = self.phase_for_player(self.first_player, 'inner') or UXPhase.P1_INNER
             self.phase = start_phase
             self.log_round_start_if_pending()
             self.apply_phase()
@@ -1743,9 +1733,9 @@ class TabletopRoot(FloatLayout):
         if player not in (1, 2):
             return None
         if which == 'inner':
-            return PH_P1_INNER if player == 1 else PH_P2_INNER
+            return UXPhase.P1_INNER if player == 1 else UXPhase.P2_INNER
         if which == 'outer':
-            return PH_P1_OUTER if player == 1 else PH_P2_OUTER
+            return UXPhase.P1_OUTER if player == 1 else UXPhase.P2_OUTER
         return None
 
     def card_widget_for_player(self, player: int, which: str):
@@ -1762,17 +1752,7 @@ class TabletopRoot(FloatLayout):
         return None
 
     def current_engine_phase(self):
-        mapping = {
-            PH_WAIT_BOTH_START: EnginePhase.WAITING_START,
-            PH_P1_INNER: EnginePhase.DEALING,
-            PH_P2_INNER: EnginePhase.DEALING,
-            PH_P1_OUTER: EnginePhase.DEALING,
-            PH_P2_OUTER: EnginePhase.DEALING,
-            PH_SIGNALER: EnginePhase.SIGNAL_WAIT,
-            PH_JUDGE: EnginePhase.CALL_WAIT,
-            PH_SHOWDOWN: EnginePhase.REVEAL_SCORE,
-        }
-        return mapping.get(self.phase, EnginePhase.DEALING)
+        return to_engine_phase(self.phase)
 
     def log_event(self, player: int, action: str, payload=None):
         if self.is_practice_block_active() and action not in ('session_start',):
