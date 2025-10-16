@@ -40,7 +40,7 @@ import sounddevice as sd
 
 
 
-from game_engine_w import EventLogger, Phase as EnginePhase
+from tabletop.engine import EventLogger, Phase as EnginePhase
 
 # --- Display fest auf 3840x2160, Vollbild aktivierbar (kommentiere die nächste Zeile, falls du Fenster willst)
 Config.set('graphics', 'fullscreen', 'auto')
