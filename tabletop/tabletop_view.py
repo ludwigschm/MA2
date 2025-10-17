@@ -80,6 +80,9 @@ class TabletopRoot(FloatLayout):
     intro_labels = DictProperty({})
     pause_labels = DictProperty({})
 
+    def wid(self, name: str):
+        return self.ids.get(name)
+
     def __init__(
         self,
         *,
@@ -144,87 +147,115 @@ class TabletopRoot(FloatLayout):
 
     # --- Layout & Elemente
     def _configure_widgets(self):
-        self.btn_start_p1.bind(on_release=lambda *_: self.start_pressed(1))
-        self.btn_start_p2.bind(on_release=lambda *_: self.start_pressed(2))
+        btn_start_p1 = self.wid('btn_start_p1')
+        if btn_start_p1:
+            btn_start_p1.bind(on_release=lambda *_: self.start_pressed(1))
+            btn_start_p1.set_rotation(0)
+        btn_start_p2 = self.wid('btn_start_p2')
+        if btn_start_p2:
+            btn_start_p2.bind(on_release=lambda *_: self.start_pressed(2))
+            btn_start_p2.set_rotation(180)
 
-        self.p1_outer.bind(on_release=lambda *_: self.tap_card(1, 'outer'))
-        self.p1_inner.bind(on_release=lambda *_: self.tap_card(1, 'inner'))
-        self.p2_outer.bind(on_release=lambda *_: self.tap_card(2, 'outer'))
-        self.p2_inner.bind(on_release=lambda *_: self.tap_card(2, 'inner'))
+        p1_outer = self.wid('p1_outer')
+        if p1_outer:
+            p1_outer.bind(on_release=lambda *_: self.tap_card(1, 'outer'))
+        p1_inner = self.wid('p1_inner')
+        if p1_inner:
+            p1_inner.bind(on_release=lambda *_: self.tap_card(1, 'inner'))
+        p2_outer = self.wid('p2_outer')
+        if p2_outer:
+            p2_outer.bind(on_release=lambda *_: self.tap_card(2, 'outer'))
+        p2_inner = self.wid('p2_inner')
+        if p2_inner:
+            p2_inner.bind(on_release=lambda *_: self.tap_card(2, 'inner'))
 
         self.signal_buttons = {
             1: {
-                'low': self.ids.signal_p1_low,
-                'mid': self.ids.signal_p1_mid,
-                'high': self.ids.signal_p1_high,
+                'low': 'signal_p1_low',
+                'mid': 'signal_p1_mid',
+                'high': 'signal_p1_high',
             },
             2: {
-                'low': self.ids.signal_p2_low,
-                'mid': self.ids.signal_p2_mid,
-                'high': self.ids.signal_p2_high,
+                'low': 'signal_p2_low',
+                'mid': 'signal_p2_mid',
+                'high': 'signal_p2_high',
             },
         }
-        for level, btn in self.signal_buttons[1].items():
-            btn.bind(on_release=lambda _, lvl=level: self.pick_signal(1, lvl))
-            btn.set_rotation(0)
-        for level, btn in self.signal_buttons[2].items():
-            btn.bind(on_release=lambda _, lvl=level: self.pick_signal(2, lvl))
-            btn.set_rotation(180)
+        for level, btn_id in self.signal_buttons.get(1, {}).items():
+            btn = self.wid(btn_id)
+            if btn:
+                btn.bind(on_release=lambda _, lvl=level: self.pick_signal(1, lvl))
+                btn.set_rotation(0)
+        for level, btn_id in self.signal_buttons.get(2, {}).items():
+            btn = self.wid(btn_id)
+            if btn:
+                btn.bind(on_release=lambda _, lvl=level: self.pick_signal(2, lvl))
+                btn.set_rotation(180)
 
         self.decision_buttons = {
             1: {
-                'bluff': self.ids.decision_p1_bluff,
-                'wahr': self.ids.decision_p1_wahr,
+                'bluff': 'decision_p1_bluff',
+                'wahr': 'decision_p1_wahr',
             },
             2: {
-                'bluff': self.ids.decision_p2_bluff,
-                'wahr': self.ids.decision_p2_wahr,
+                'bluff': 'decision_p2_bluff',
+                'wahr': 'decision_p2_wahr',
             },
         }
-        for choice, btn in self.decision_buttons[1].items():
-            btn.bind(on_release=lambda _, ch=choice: self.pick_decision(1, ch))
-            btn.set_rotation(0)
-        for choice, btn in self.decision_buttons[2].items():
-            btn.bind(on_release=lambda _, ch=choice: self.pick_decision(2, ch))
-            btn.set_rotation(180)
+        for choice, btn_id in self.decision_buttons.get(1, {}).items():
+            btn = self.wid(btn_id)
+            if btn:
+                btn.bind(on_release=lambda _, ch=choice: self.pick_decision(1, ch))
+                btn.set_rotation(0)
+        for choice, btn_id in self.decision_buttons.get(2, {}).items():
+            btn = self.wid(btn_id)
+            if btn:
+                btn.bind(on_release=lambda _, ch=choice: self.pick_decision(2, ch))
+                btn.set_rotation(180)
 
         self.center_cards = {
-            1: [self.ids.center_p1_card_right, self.ids.center_p1_card_left],
-            2: [self.ids.center_p2_card_left, self.ids.center_p2_card_right],
+            1: ['center_p1_card_right', 'center_p1_card_left'],
+            2: ['center_p2_card_left', 'center_p2_card_right'],
         }
 
         self.user_displays = {
-            1: self.ids.user_display_p1,
-            2: self.ids.user_display_p2,
+            1: 'user_display_p1',
+            2: 'user_display_p2',
         }
-        self.user_displays[1].set_rotation(0)
-        self.user_displays[2].set_rotation(180)
-        for lbl in self.user_displays.values():
-            lbl.text = ''
-            lbl.opacity = 1
+        for player, display_id in self.user_displays.items():
+            display = self.wid(display_id)
+            if display:
+                display.set_rotation(0 if player == 1 else 180)
+                display.text = ''
+                display.opacity = 1
 
         self.intro_labels = {
-            1: self.ids.intro_label_p1,
-            2: self.ids.intro_label_p2,
+            1: 'intro_label_p1',
+            2: 'intro_label_p2',
         }
-        self.intro_labels[1].set_rotation(0)
-        self.intro_labels[2].set_rotation(180)
+        for player, label_id in self.intro_labels.items():
+            label = self.wid(label_id)
+            if label:
+                label.set_rotation(0 if player == 1 else 180)
 
         self.pause_labels = {
-            1: self.ids.pause_label_p1,
-            2: self.ids.pause_label_p2,
+            1: 'pause_label_p1',
+            2: 'pause_label_p2',
         }
-        self.pause_labels[1].set_rotation(0)
-        self.pause_labels[2].set_rotation(180)
-        for lbl in self.pause_labels.values():
-            lbl.bind(texture_size=lambda *_: None)
+        for player, label_id in self.pause_labels.items():
+            label = self.wid(label_id)
+            if label:
+                label.set_rotation(0 if player == 1 else 180)
+                label.bind(texture_size=lambda *_: None)
 
-        self.fixation_overlay.opacity = 0
-        self.fixation_overlay.disabled = True
-        self.fixation_image.opacity = 1
+        fixation_overlay = self.wid('fixation_overlay')
+        if fixation_overlay:
+            fixation_overlay.opacity = 0
+            fixation_overlay.disabled = True
+        fixation_image = self.wid('fixation_image')
+        if fixation_image:
+            fixation_image.opacity = 1
 
-        self.btn_start_p1.set_rotation(0)
-        self.btn_start_p2.set_rotation(180)
         self.bring_start_buttons_to_front()
 
         self._update_scale()
@@ -260,26 +291,31 @@ class TabletopRoot(FloatLayout):
         self.update_intro_overlay()
 
     def bring_start_buttons_to_front(self):
-        self.remove_widget(self.btn_start_p1)
-        self.remove_widget(self.btn_start_p2)
-        self.add_widget(self.btn_start_p1)
-        self.add_widget(self.btn_start_p2)
+        btn_start_p1 = self.wid('btn_start_p1')
+        btn_start_p2 = self.wid('btn_start_p2')
+        if btn_start_p1 and btn_start_p1.parent is self:
+            self.remove_widget(btn_start_p1)
+            self.add_widget(btn_start_p1)
+        if btn_start_p2 and btn_start_p2.parent is self:
+            self.remove_widget(btn_start_p2)
+            self.add_widget(btn_start_p2)
 
     def update_intro_overlay(self):
-        if not hasattr(self, 'intro_overlay'):
+        intro_overlay = self.wid('intro_overlay')
+        if not intro_overlay:
             return
         active = bool(self.intro_active)
         if active:
-            if self.intro_overlay.parent is None:
-                self.add_widget(self.intro_overlay)
-            self.intro_overlay.opacity = 1
-            self.intro_overlay.disabled = False
+            if intro_overlay.parent is None:
+                self.add_widget(intro_overlay)
+            intro_overlay.opacity = 1
+            intro_overlay.disabled = False
             self.bring_start_buttons_to_front()
         else:
-            self.intro_overlay.opacity = 0
-            self.intro_overlay.disabled = True
-            if self.intro_overlay.parent is not None:
-                self.remove_widget(self.intro_overlay)
+            intro_overlay.opacity = 0
+            intro_overlay.disabled = True
+            if intro_overlay.parent is not None:
+                self.remove_widget(intro_overlay)
                 self.bring_start_buttons_to_front()
 
     def _on_window_resize(self, *_):
@@ -322,10 +358,14 @@ class TabletopRoot(FloatLayout):
         # Fallback über die sichtbaren Karten
         player = self.physical_by_role.get(role)
         if player == 1:
-            inner_widget, outer_widget = self.p1_inner, self.p1_outer
+            inner_widget = self.wid('p1_inner')
+            outer_widget = self.wid('p1_outer')
         elif player == 2:
-            inner_widget, outer_widget = self.p2_inner, self.p2_outer
+            inner_widget = self.wid('p2_inner')
+            outer_widget = self.wid('p2_outer')
         else:
+            return None
+        if not inner_widget or not outer_widget:
             return None
         inner_val = self.card_value_from_path(inner_widget.front_image)
         outer_val = self.card_value_from_path(outer_widget.front_image)
@@ -385,14 +425,24 @@ class TabletopRoot(FloatLayout):
             vp2_cards = plan['vp2']
             first_vp1, second_vp1 = vp1_cards[0], vp1_cards[1]
             first_vp2, second_vp2 = vp2_cards[0], vp2_cards[1]
-            self.p1_inner.set_front(value_to_card_path(first_vp1))
-            self.p1_outer.set_front(value_to_card_path(second_vp1))
-            self.p2_inner.set_front(value_to_card_path(first_vp2))
-            self.p2_outer.set_front(value_to_card_path(second_vp2))
+            p1_inner = self.wid('p1_inner')
+            if p1_inner:
+                p1_inner.set_front(value_to_card_path(first_vp1))
+            p1_outer = self.wid('p1_outer')
+            if p1_outer:
+                p1_outer.set_front(value_to_card_path(second_vp1))
+            p2_inner = self.wid('p2_inner')
+            if p2_inner:
+                p2_inner.set_front(value_to_card_path(first_vp2))
+            p2_outer = self.wid('p2_outer')
+            if p2_outer:
+                p2_outer.set_front(value_to_card_path(second_vp2))
         else:
             default = ASSETS['cards']['back']
-            for widget in (self.p1_inner, self.p1_outer, self.p2_inner, self.p2_outer):
-                widget.set_front(default)
+            for card_id in ('p1_inner', 'p1_outer', 'p2_inner', 'p2_outer'):
+                widget = self.wid(card_id)
+                if widget:
+                    widget.set_front(default)
 
     def compute_global_round(self):
         return self.controller.compute_global_round()
@@ -415,16 +465,22 @@ class TabletopRoot(FloatLayout):
     # --- Logik
     def apply_phase(self):
         phase_state = self.controller.apply_phase()
-        for c in (self.p1_outer, self.p1_inner, self.p2_outer, self.p2_inner):
-            c.set_live(False)
+        for card_id in ('p1_outer', 'p1_inner', 'p2_outer', 'p2_inner'):
+            widget = self.wid(card_id)
+            if widget:
+                widget.set_live(False)
         for buttons in self.signal_buttons.values():
-            for b in buttons.values():
-                b.set_live(False)
-                b.disabled = True
+            for btn_id in buttons.values():
+                btn = self.wid(btn_id)
+                if btn:
+                    btn.set_live(False)
+                    btn.disabled = True
         for buttons in self.decision_buttons.values():
-            for b in buttons.values():
-                b.set_live(False)
-                b.disabled = True
+            for btn_id in buttons.values():
+                btn = self.wid(btn_id)
+                if btn:
+                    btn.set_live(False)
+                    btn.disabled = True
 
         if not phase_state.show_showdown:
             self.refresh_center_cards(reveal=False)
@@ -433,8 +489,12 @@ class TabletopRoot(FloatLayout):
         if self.fixation_running:
             start_active = False
         ready = phase_state.ready
-        self.btn_start_p1.set_live(start_active and ready)
-        self.btn_start_p2.set_live(start_active and ready)
+        btn_start_p1 = self.wid('btn_start_p1')
+        btn_start_p2 = self.wid('btn_start_p2')
+        if btn_start_p1:
+            btn_start_p1.set_live(start_active and ready)
+        if btn_start_p2:
+            btn_start_p2.set_live(start_active and ready)
 
         if ready:
             for player, cards in phase_state.active_cards.items():
@@ -444,23 +504,29 @@ class TabletopRoot(FloatLayout):
                         widget.set_live(True)
             for player, levels in phase_state.active_signal_buttons.items():
                 for level in levels:
-                    btn = self.signal_buttons.get(player, {}).get(level)
+                    btn_id = self.signal_buttons.get(player, {}).get(level)
+                    btn = self.wid(btn_id) if btn_id else None
                     if btn:
                         btn.set_live(True)
                         btn.disabled = False
             for player, decisions in phase_state.active_decision_buttons.items():
                 for decision in decisions:
-                    btn = self.decision_buttons.get(player, {}).get(decision)
+                    btn_id = self.decision_buttons.get(player, {}).get(decision)
+                    btn = self.wid(btn_id) if btn_id else None
                     if btn:
                         btn.set_live(True)
                         btn.disabled = False
 
         if phase_state.show_showdown:
-            self.btn_start_p1.set_live(True)
-            self.btn_start_p2.set_live(True)
+            if btn_start_p1:
+                btn_start_p1.set_live(True)
+            if btn_start_p2:
+                btn_start_p2.set_live(True)
             self.update_showdown()
 
-        self.round_badge.text = ''
+        round_badge = self.wid('round_badge')
+        if round_badge:
+            round_badge.text = ''
         self.update_user_displays()
         self.update_pause_overlay()
 
@@ -544,7 +610,10 @@ class TabletopRoot(FloatLayout):
         result = self.controller.pick_signal(player, level)
         if not result.accepted:
             return
-        for lvl, btn in self.signal_buttons[player].items():
+        for lvl, btn_id in self.signal_buttons.get(player, {}).items():
+            btn = self.wid(btn_id)
+            if not btn:
+                continue
             if lvl == level:
                 btn.set_pressed_state()
             else:
@@ -562,7 +631,10 @@ class TabletopRoot(FloatLayout):
         result = self.controller.pick_decision(player, decision)
         if not result.accepted:
             return
-        for choice, btn in self.decision_buttons[player].items():
+        for choice, btn_id in self.decision_buttons.get(player, {}).items():
+            btn = self.wid(btn_id)
+            if not btn:
+                continue
             if choice == decision:
                 btn.set_pressed_state()
             else:
@@ -609,14 +681,20 @@ class TabletopRoot(FloatLayout):
     def _apply_round_setup(self, result):
         plan = result.plan if result else None
         self.set_cards_from_plan(plan)
-        for c in (self.p1_inner, self.p1_outer, self.p2_inner, self.p2_outer):
-            c.reset()
+        for card_id in ('p1_inner', 'p1_outer', 'p2_inner', 'p2_outer'):
+            widget = self.wid(card_id)
+            if widget:
+                widget.reset()
         for buttons in self.signal_buttons.values():
-            for btn in buttons.values():
-                btn.reset()
+            for btn_id in buttons.values():
+                btn = self.wid(btn_id)
+                if btn:
+                    btn.reset()
         for buttons in self.decision_buttons.values():
-            for btn in buttons.values():
-                btn.reset()
+            for btn_id in buttons.values():
+                btn = self.wid(btn_id)
+                if btn:
+                    btn.reset()
         self.status_lines = {1: [], 2: []}
         self.update_status_label(1)
         self.update_status_label(2)
@@ -625,18 +703,24 @@ class TabletopRoot(FloatLayout):
 
     def refresh_center_cards(self, reveal: bool):
         if reveal:
+            p1_inner = self.wid('p1_inner')
+            p1_outer = self.wid('p1_outer')
+            p2_inner = self.wid('p2_inner')
+            p2_outer = self.wid('p2_outer')
             sources = {
-                1: [self.p1_inner.front_image, self.p1_outer.front_image],
-                2: [self.p2_inner.front_image, self.p2_outer.front_image],
+                1: [p1_inner.front_image if p1_inner else None, p1_outer.front_image if p1_outer else None],
+                2: [p2_inner.front_image if p2_inner else None, p2_outer.front_image if p2_outer else None],
             }
         else:
             back = ASSETS['cards']['back']
             sources = {1: [back, back], 2: [back, back]}
 
         for player, imgs in self.center_cards.items():
-            for idx, img in enumerate(imgs):
-                img.source = sources[player][idx]
-                img.opacity = 1
+            for idx, img_id in enumerate(imgs):
+                img_widget = self.wid(img_id)
+                if img_widget:
+                    img_widget.source = sources[player][idx]
+                    img_widget.opacity = 1
 
     def update_showdown(self):
         # Karten in der Mitte anzeigen
@@ -840,29 +924,36 @@ class TabletopRoot(FloatLayout):
 
     def update_user_displays(self):
         """Setzt die Texte in den beiden Displays (unten=VP1, oben=VP2)."""
-        self.user_displays[1].text = self.format_user_display_text(1)  # unten
-        self.user_displays[2].text = self.format_user_display_text(2)  # oben (rotiert)
+        for vp, display_id in self.user_displays.items():
+            display = self.wid(display_id)
+            if display:
+                display.text = self.format_user_display_text(vp)
 
     def update_pause_overlay(self):
-        if not hasattr(self, 'pause_cover'):
+        pause_cover = self.wid('pause_cover')
+        if not pause_cover:
             return
         active = (self.in_block_pause or self.session_finished) and bool(self.pause_message)
         if active:
-            if self.pause_cover.parent is None:
-                self.add_widget(self.pause_cover)
+            if pause_cover.parent is None:
+                self.add_widget(pause_cover)
                 # Start-Buttons über das Overlay legen
                 self.bring_start_buttons_to_front()
-            self.pause_cover.opacity = 1
-            self.pause_cover.disabled = False
-            for lbl in self.pause_labels.values():
-                lbl.text = self.pause_message
+            pause_cover.opacity = 1
+            pause_cover.disabled = False
+            for label_id in self.pause_labels.values():
+                lbl = self.wid(label_id)
+                if lbl:
+                    lbl.text = self.pause_message
         else:
-            self.pause_cover.opacity = 0
-            self.pause_cover.disabled = True
-            for lbl in self.pause_labels.values():
-                lbl.text = ''
-            if self.pause_cover.parent is not None:
-                self.remove_widget(self.pause_cover)
+            pause_cover.opacity = 0
+            pause_cover.disabled = True
+            for label_id in self.pause_labels.values():
+                lbl = self.wid(label_id)
+                if lbl:
+                    lbl.text = ''
+            if pause_cover.parent is not None:
+                self.remove_widget(pause_cover)
                 # Reihenfolge der Buttons erhalten
                 self.bring_start_buttons_to_front()
 
@@ -900,14 +991,14 @@ class TabletopRoot(FloatLayout):
     def card_widget_for_player(self, player: int, which: str):
         if player == 1:
             if which == 'inner':
-                return self.p1_inner
+                return self.wid('p1_inner')
             if which == 'outer':
-                return self.p1_outer
+                return self.wid('p1_outer')
         elif player == 2:
             if which == 'inner':
-                return self.p2_inner
+                return self.wid('p2_inner')
             if which == 'outer':
-                return self.p2_outer
+                return self.wid('p2_outer')
         return None
 
     def current_engine_phase(self):
