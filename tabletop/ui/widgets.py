@@ -98,8 +98,8 @@ class IconButton(ButtonBehavior, Image):
         self.selected = False
         self.rotation_angle = 0
         super().__init__(**kw)
-        self.allow_stretch = True
-        self.keep_ratio = True
+        if not getattr(self, "fit_mode", None):
+            self.fit_mode = "contain"
         with self.canvas.before:
             self._push_matrix = PushMatrix()
             self._rotation = Rotate(angle=0, origin=self.center)
@@ -114,8 +114,8 @@ class IconButton(ButtonBehavior, Image):
         self.update_visual()
 
     def on_disabled(self, *args):
-        super().on_disabled(*args)
-        self.update_visual()
+        # Kein super()-Aufruf; Basisklassen implementieren das nicht stabil.
+        self.opacity = 0.5 if self.disabled else 1.0
 
     def on_source_normal(self, *args):
         if not self.source_down:
@@ -179,4 +179,7 @@ class IconButton(ButtonBehavior, Image):
 
     def update_visual(self):
         self._apply_sources()
-        self.opacity = 1.0 if (self.live or self.selected) else 0.6
+        if self.disabled:
+            self.opacity = 0.5
+        else:
+            self.opacity = 1.0 if (self.live or self.selected) else 0.6

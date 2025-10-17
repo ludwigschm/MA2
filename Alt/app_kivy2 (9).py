@@ -208,9 +208,9 @@ class CardWidget(ButtonBehavior, Image):
 
     def __init__(self, ui: "TwoPlayerUI", owner: VP, index: int, angle: float = 0, **kwargs):
         kwargs.setdefault("size_hint", (None, None))
-        kwargs.setdefault("allow_stretch", True)
-        kwargs.setdefault("keep_ratio", True)
         super().__init__(**kwargs)
+        if not getattr(self, "fit_mode", None):
+            self.fit_mode = "contain"
         self.ui = ui
         self.owner = owner
         self.index = index

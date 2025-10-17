@@ -334,13 +334,12 @@ class TabletopRoot(FloatLayout):
 
         # Showdown-Karten in der Mitte (immer sichtbar, zuerst verdeckt)
         self.center_cards = {
-            1: [Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True),
-                Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)],
-            2: [Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True),
-                Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)],
+            1: [Image(size_hint=(None, None)), Image(size_hint=(None, None))],
+            2: [Image(size_hint=(None, None)), Image(size_hint=(None, None))],
         }
         for imgs in self.center_cards.values():
             for img in imgs:
+                img.fit_mode = "contain"
                 self.add_widget(img)
 
          # --- User-Displays (unter/über den vier Karten in der Mitte)
@@ -444,14 +443,16 @@ class TabletopRoot(FloatLayout):
         self.fixation_overlay = FloatLayout(size_hint=(1, 1))
         self.fixation_overlay.opacity = 0
         self.fixation_overlay.disabled = True
-        self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
+        self.fixation_image = Image(size_hint=(None, None))
+        self.fixation_image.fit_mode = "contain"
         self.fixation_overlay.add_widget(self.fixation_image)
 
         # Fixations-Overlay vorbereiten (wird bei Bedarf eingeblendet)
         self.fixation_overlay = FloatLayout(size_hint=(1, 1))
         self.fixation_overlay.opacity = 0
         self.fixation_overlay.disabled = True
-        self.fixation_image = Image(size_hint=(None, None), allow_stretch=True, keep_ratio=True)
+        self.fixation_image = Image(size_hint=(None, None))
+        self.fixation_image.fit_mode = "contain"
         self.fixation_overlay.add_widget(self.fixation_image)
 
         # interne States
