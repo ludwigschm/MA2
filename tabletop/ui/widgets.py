@@ -106,12 +106,22 @@ class IconButton(ButtonBehavior, Image):
         with self.canvas.after:
             self._pop_matrix = PopMatrix()
         self.bind(pos=self._update_transform, size=self._update_transform)
-        self._apply_sources()
+        if getattr(self, "state", "normal") == "down" and getattr(self, "source_down", ""):
+            self.source = self.source_down
+        else:
+            if getattr(self, "source_normal", ""):
+                self.source = self.source_normal
         self.update_visual()
 
-    def on_state(self, *args):
-        super().on_state(*args)
-        self.update_visual()
+    def on_state(self, instance, value):
+        # Kein super().on_state(...) aufrufen!
+        # Umschalten der Icon-Quelle je nach Zustand
+        if getattr(self, "source_down", ""):
+            self.source = self.source_down if value == "down" else self.source_normal
+        else:
+            # Falls nur source_normal gesetzt ist, bleib bei dieser
+            if getattr(self, "source_normal", ""):
+                self.source = self.source_normal
 
     def on_disabled(self, *args):
         # Kein super()-Aufruf; Basisklassen implementieren das nicht stabil.
