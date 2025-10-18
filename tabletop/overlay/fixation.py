@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
 import sounddevice as sd
 import threading
+
+
+_FIXATION_CROSS_ATTR = "_fixation_cross_overlay"
+
+_GRAPHICS_SPEC = importlib.util.find_spec("kivy.graphics")
+if _GRAPHICS_SPEC is not None:
+    _graphics = importlib.import_module("kivy.graphics")
+    _Color = getattr(_graphics, "Color", None)
+    _Line = getattr(_graphics, "Line", None)
+else:  # pragma: no cover - executed only when Kivy is unavailable
+    _Color = None
+    _Line = None
 
 
 def generate_fixation_tone(
@@ -79,13 +93,14 @@ def run_fixation_sequence(
             btn.set_live(False)
 
     image.opacity = 1
-    image.source = _path_to_source(stop_image)
+    _set_image_source(image, stop_image, fallback="blank")
 
     def finish(_dt: float) -> None:
         if getattr(overlay, "parent", None) is not None:
             controller.remove_widget(overlay)
         overlay.opacity = 0
         overlay.disabled = True
+        _remove_cross_overlay(image)
         controller.fixation_running = False
         if hasattr(controller, "fixation_required"):
             controller.fixation_required = False
@@ -95,11 +110,11 @@ def run_fixation_sequence(
             callback()
 
     def show_stop_again(_dt: float) -> None:
-        image.source = _path_to_source(stop_image)
+        _set_image_source(image, stop_image, fallback="blank")
         schedule_once(finish, 5)
 
     def show_live(_dt: float) -> None:
-        image.source = _path_to_source(live_image)
+        _set_image_source(image, live_image, fallback="cross")
         play_fixation_tone(controller)
         schedule_once(show_stop_again, 0.2)
 
@@ -110,8 +125,73 @@ def _path_to_source(image_path: Optional[Path | str]) -> str:
     if image_path is None:
         return ""
     if isinstance(image_path, Path):
-        return str(image_path) if image_path.exists() else ""
-    return str(image_path)
+        candidate = image_path
+    else:
+        candidate = Path(image_path)
+    return str(candidate) if candidate.exists() else ""
+
+
+def _set_image_source(image: Any, image_path: Optional[Path | str], *, fallback: str) -> None:
+    source = _path_to_source(image_path)
+    if source:
+        image.source = source
+        _remove_cross_overlay(image)
+        return
+
+    image.source = ""
+    if fallback == "cross":
+        _ensure_cross_overlay(image)
+    else:
+        _remove_cross_overlay(image)
+
+
+def _ensure_cross_overlay(image: Any) -> None:
+    if _Color is None or _Line is None:
+        return
+    if getattr(image, _FIXATION_CROSS_ATTR, None) is None:
+        with image.canvas.after:
+            color = _Color(1, 1, 1, 1)
+            line1 = _Line(points=[], width=2, cap="square")
+            line2 = _Line(points=[], width=2, cap="square")
+        image.bind(size=_update_cross_overlay, pos=_update_cross_overlay)
+        setattr(image, _FIXATION_CROSS_ATTR, (color, line1, line2))
+    _update_cross_overlay(image)
+
+
+def _remove_cross_overlay(image: Any) -> None:
+    cross = getattr(image, _FIXATION_CROSS_ATTR, None)
+    if not cross:
+        return
+    image.unbind(size=_update_cross_overlay, pos=_update_cross_overlay)
+    color, line1, line2 = cross
+    canvas = image.canvas.after
+    for instruction in (line2, line1, color):
+        if instruction in canvas.children:
+            canvas.remove(instruction)
+    delattr(image, _FIXATION_CROSS_ATTR)
+
+
+def _update_cross_overlay(image: Any, *_: Any) -> None:
+    cross = getattr(image, _FIXATION_CROSS_ATTR, None)
+    if not cross:
+        return
+    _, line1, line2 = cross
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        line1.points = []
+        line2.points = []
+        return
+
+    margin = min(width, height) * 0.2
+    x1 = image.x + margin
+    x2 = image.x + width - margin
+    y1 = image.y + margin
+    y2 = image.y + height - margin
+    line1.points = [x1, y1, x2, y2]
+    line2.points = [x1, y2, x2, y1]
+    stroke = max(min(width, height) * 0.05, 2.0)
+    line1.width = stroke
+    line2.width = stroke
 
 
 __all__ = [
