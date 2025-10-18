@@ -29,14 +29,14 @@ import csv
 import itertools
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from datetime import datetime
 from kivy.uix.label import Label
 from kivy.graphics import Color, Rectangle, PushMatrix, PopMatrix, Rotate
 from kivy.core.image import Image as CoreImage
 import numpy as np
-import sounddevice as sd
+
+from tabletop.overlay.fixation import run_fixation_sequence as overlay_run_fixation_sequence
 
 
 
@@ -1165,66 +1165,13 @@ class TabletopRoot(FloatLayout):
                 self.continue_after_start_press()
 
     def run_fixation_sequence(self, on_complete=None):
-        if self.fixation_running:
-            return
-        if not self.fixation_overlay or not self.fixation_image:
-            self.fixation_required = False
-            if on_complete:
-                on_complete()
-            return
-
-        self.fixation_running = True
-        self.pending_fixation_callback = on_complete
-        self.fixation_overlay.opacity = 1
-        self.fixation_overlay.disabled = False
-        if self.fixation_overlay.parent is not None:
-            self.remove_widget(self.fixation_overlay)
-        self.add_widget(self.fixation_overlay)
-
-        self.btn_start_p1.set_live(False)
-        self.btn_start_p2.set_live(False)
-
-        self.fixation_image.opacity = 1
-        self.fixation_image.source = FIX_STOP_IMAGE if os.path.exists(FIX_STOP_IMAGE) else ''
-
-        def finish(_dt):
-            if self.fixation_overlay.parent is not None:
-                self.remove_widget(self.fixation_overlay)
-            self.fixation_overlay.opacity = 0
-            self.fixation_overlay.disabled = True
-            self.fixation_running = False
-            self.fixation_required = False
-            callback = self.pending_fixation_callback
-            self.pending_fixation_callback = None
-            if callback:
-                callback()
-
-        def show_stop_again(_dt):
-            self.fixation_image.source = FIX_STOP_IMAGE if os.path.exists(FIX_STOP_IMAGE) else ''
-            Clock.schedule_once(finish, 5)
-
-        def show_live(_dt):
-            self.fixation_image.source = FIX_LIVE_IMAGE if os.path.exists(FIX_LIVE_IMAGE) else ''
-            self.play_fixation_tone()
-            Clock.schedule_once(show_stop_again, 0.2)
-
-        Clock.schedule_once(show_live, 5)
-
-    def play_fixation_tone(self):
-        if self.fixation_tone is None:
-            return
-
-        tone_data = self.fixation_tone.copy()
-        sample_rate = self.fixation_tone_fs
-
-        def _play():
-            try:
-                sd.play(tone_data, sample_rate)
-                sd.wait()
-            except Exception as exc:
-                print(f'Warnung: Ton konnte nicht abgespielt werden: {exc}')
-
-        threading.Thread(target=_play, daemon=True).start()
+        overlay_run_fixation_sequence(
+            self,
+            schedule_once=Clock.schedule_once,
+            stop_image=FIX_STOP_IMAGE,
+            live_image=FIX_LIVE_IMAGE,
+            on_complete=on_complete,
+        )
 
     def tap_card(self, who:int, which:str):
         # which in {'inner','outer'}
