@@ -598,7 +598,7 @@ class TabletopRoot(FloatLayout):
             schedule_once=Clock.schedule_once,
             stop_image=FIX_STOP_IMAGE,
             live_image=FIX_LIVE_IMAGE,
-            on_complete=on_complete,
+            on_finish=on_complete,
         )
 
     def play_fixation_tone(self):

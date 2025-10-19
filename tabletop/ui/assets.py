@@ -20,6 +20,10 @@ FIX_LIVE_IMAGE: Path = UX_DIR / "fix_live.png"
 # --- Asset catalogue ------------------------------------------------------
 
 ASSETS: Dict[str, Any] = {
+    "fixation": {
+        "stop": str(FIX_STOP_IMAGE),
+        "live": str(FIX_LIVE_IMAGE),
+    },
     "play": {
         "live": str(UX_DIR / "play_live.png"),
         "stop": str(UX_DIR / "play_stop.png"),

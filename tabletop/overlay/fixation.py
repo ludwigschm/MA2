@@ -11,6 +11,9 @@ import numpy as np
 import sounddevice as sd
 import threading
 
+from kivy.clock import Clock
+from kivy.logger import Logger
+
 
 _FIXATION_CROSS_ATTR = "_fixation_cross_overlay"
 
@@ -59,10 +62,10 @@ def play_fixation_tone(controller: Any) -> None:
 def run_fixation_sequence(
     controller: Any,
     *,
-    schedule_once: Callable[[Callable[[float], None], float], Any],
+    schedule_once: Callable[[Callable[[float], None], float], Any] = Clock.schedule_once,
     stop_image: Optional[Path | str],
     live_image: Optional[Path | str],
-    on_complete: Optional[Callable[[], None]] = None,
+    on_finish: Optional[Callable[[], None]] = None,
 ) -> None:
     """Execute the fixation sequence using the provided controller state."""
 
@@ -74,32 +77,40 @@ def run_fixation_sequence(
     if overlay is None or image is None:
         if hasattr(controller, "fixation_required"):
             controller.fixation_required = False
-        if on_complete:
-            on_complete()
+        if on_finish:
+            on_finish()
         return
 
     controller.fixation_running = True
-    controller.pending_fixation_callback = on_complete
-    overlay.opacity = 1
-    overlay.disabled = False
+    controller.pending_fixation_callback = on_finish
+
+    parent = getattr(image, "parent", None)
+
+    image.opacity = 1
+    if parent is not None:
+        parent.opacity = 1
+        parent.disabled = False
 
     if getattr(overlay, "parent", None) is not None:
         controller.remove_widget(overlay)
     controller.add_widget(overlay)
+
+    for path_candidate in (stop_image, live_image):
+        if path_candidate:
+            candidate = Path(path_candidate)
+            if not candidate.exists():
+                Logger.warning(f"Fixation: image not found -> {path_candidate}")
 
     for attr in ("btn_start_p1", "btn_start_p2"):
         btn = getattr(controller, attr, None)
         if btn is not None and hasattr(btn, "set_live"):
             btn.set_live(False)
 
-    image.opacity = 1
-    _set_image_source(image, stop_image, fallback="blank")
-
     def finish(_dt: float) -> None:
-        if getattr(overlay, "parent", None) is not None:
-            controller.remove_widget(overlay)
-        overlay.opacity = 0
-        overlay.disabled = True
+        if parent is not None:
+            parent.opacity = 0
+            parent.disabled = True
+        image.source = ""
         _remove_cross_overlay(image)
         controller.fixation_running = False
         if hasattr(controller, "fixation_required"):
@@ -109,32 +120,39 @@ def run_fixation_sequence(
         if callback:
             callback()
 
-    def show_stop_again(_dt: float) -> None:
-        _set_image_source(image, stop_image, fallback="blank")
-        schedule_once(finish, 5)
-
     def show_live(_dt: float) -> None:
         _set_image_source(image, live_image, fallback="cross")
         play_fixation_tone(controller)
-        schedule_once(show_stop_again, 0.2)
+        schedule_once(finish, 0.2)
 
-    schedule_once(show_live, 5)
+    def show_stop(_dt: float) -> None:
+        _set_image_source(image, stop_image, fallback="cross")
+        schedule_once(show_live, 0.2)
+
+    schedule_once(show_stop, 0)
 
 
 def _path_to_source(image_path: Optional[Path | str]) -> str:
-    if image_path is None:
+    if not image_path:
         return ""
-    if isinstance(image_path, Path):
-        candidate = image_path
-    else:
-        candidate = Path(image_path)
-    return str(candidate) if candidate.exists() else ""
+    candidate = Path(image_path)
+    return str(candidate.resolve()) if candidate.exists() else ""
 
 
-def _set_image_source(image: Any, image_path: Optional[Path | str], *, fallback: str) -> None:
+def _set_image_source(
+    image: Any,
+    image_path: Optional[Path | str],
+    fallback: str = "cross",
+) -> None:
     source = _path_to_source(image_path)
     if source:
         image.source = source
+        try:
+            image.reload()
+        except Exception as exc:  # pragma: no cover - UI dependent
+            Logger.warning(f"Fixation: reload failed for {source}: {exc}")
+            source = ""
+    if source:
         _remove_cross_overlay(image)
         return
 
