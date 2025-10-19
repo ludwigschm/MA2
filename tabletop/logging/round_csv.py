@@ -13,7 +13,8 @@ def init_round_log(app: Any) -> None:
     if getattr(app, "round_log_fp", None):
         close_round_log(app)
     app.log_dir.mkdir(parents=True, exist_ok=True)
-    path = app.log_dir / f"round_log_{app.session_id}.csv"
+    session_fs_id = getattr(app, "session_storage_id", None) or app.session_id
+    path = app.log_dir / f"round_log_{session_fs_id}.csv"
     new_file = not path.exists()
     app.round_log_path = path
     app.round_log_fp = open(path, "a", encoding="utf-8", newline="")
