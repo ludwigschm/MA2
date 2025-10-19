@@ -74,3 +74,27 @@ def stop_overlay(process: OverlayProcess) -> OverlayProcess:
                 pass
 
     return None
+
+
+def start_overlay_process(
+    process: OverlayProcess = None,
+    overlay_path: Optional[PathLike] = None,
+) -> OverlayProcess:
+    """Compatibility wrapper returning :func:`start_overlay`."""
+
+    return start_overlay(process, overlay_path)
+
+
+def stop_overlay_process(process: OverlayProcess) -> OverlayProcess:
+    """Compatibility wrapper returning :func:`stop_overlay`."""
+
+    return stop_overlay(process)
+
+
+__all__ = [
+    "OverlayProcess",
+    "start_overlay",
+    "stop_overlay",
+    "start_overlay_process",
+    "stop_overlay_process",
+]

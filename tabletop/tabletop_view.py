@@ -11,10 +11,13 @@ import numpy as np
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.properties import DictProperty, NumericProperty, ObjectProperty
+from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
+from kivy.uix.spinner import Spinner
+from kivy.uix.switch import Switch
 from kivy.uix.textinput import TextInput
 
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
@@ -31,10 +34,7 @@ from tabletop.overlay.fixation import (
     play_fixation_tone as overlay_play_fixation_tone,
     run_fixation_sequence as overlay_run_fixation_sequence,
 )
-from tabletop.overlay.process import (
-    start_overlay as start_overlay_process,
-    stop_overlay as stop_overlay_process,
-)
+from tabletop.overlay.process import start_overlay_process, stop_overlay_process
 from tabletop.state.controller import TabletopController, TabletopState
 from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
@@ -125,6 +125,10 @@ class TabletopRoot(FloatLayout):
         elif not state.blocks:
             state.blocks = load_blocks()
         self.controller = controller or TabletopController(state)
+        self._blocks = state.blocks if state.blocks else load_blocks()
+        self.aruco_enabled = False
+        self._aruco_proc = None
+        self.start_block = 1
         # Versuchsperson 1 sitzt immer unten (Spieler 1), Versuchsperson 2 oben (Spieler 2)
         self._fixed_role_mapping = {1: 1, 2: 2}
         self.role_by_physical = self._fixed_role_mapping.copy()
@@ -133,6 +137,7 @@ class TabletopRoot(FloatLayout):
         self.phase = UXPhase.WAIT_BOTH_START
         self.session_number = None
         self.session_id = None
+        self.session_storage_id = None
         self.logger = None
         self.log_dir = Path(ROOT) / 'logs'
         self.session_popup = None
@@ -150,8 +155,12 @@ class TabletopRoot(FloatLayout):
     def __setattr__(self, key, value):
         if key in self._STATE_FIELDS and 'controller' in self.__dict__:
             setattr(self.controller.state, key, value)
-        else:
+            return
+        if key == 'overlay_process':
             super().__setattr__(key, value)
+            object.__setattr__(self, '_aruco_proc', value)
+            return
+        super().__setattr__(key, value)
 
     def __getattr__(self, item):
         if item in self._STATE_FIELDS and 'controller' in self.__dict__:
@@ -290,7 +299,7 @@ class TabletopRoot(FloatLayout):
         self.card_cycle = itertools.cycle(['7.png', '8.png', '9.png', '10.png', '11.png'])
 
         self.total_rounds_planned = sum(len(block['rounds']) for block in self.blocks)
-        self.overlay_process = None
+        self.overlay_process = self._aruco_proc
         self.fixation_running = False
         self.fixation_required = False
         self.pending_fixation_callback = None
@@ -1053,75 +1062,163 @@ class TabletopRoot(FloatLayout):
         if self.session_popup:
             return
 
-        layout = FloatLayout()
-        popup_width = 800
-        popup_height = 500
+        content = BoxLayout(orientation='vertical', spacing=12, padding=12)
 
-        lbl = Label(
-            text='Bitte Sessionnummer eingeben:',
-            size_hint=(0.8, 0.2),
-            pos_hint={'center_x': 0.5, 'top': 0.95}
-        )
-        layout.add_widget(lbl)
-
-        self.session_input = TextInput(
+        header = Label(text='Bitte Session ID eingeben:', size_hint_y=None, height='32dp')
+        session_input = TextInput(
+            hint_text='Session ID',
             multiline=False,
-            input_filter='int',
-            size_hint=(0.6, 0.2),
-            pos_hint={'center_x': 0.5, 'center_y': 0.6}
+            size_hint_y=None,
+            height='40dp'
         )
-        layout.add_widget(self.session_input)
 
-        self.session_error = Label(
-            text='',
-            color=(1, 0, 0, 1),
-            size_hint=(0.8, 0.15),
-            pos_hint={'center_x': 0.5, 'center_y': 0.4}
-        )
-        layout.add_widget(self.session_error)
+        row1 = BoxLayout(size_hint_y=None, height='40dp', spacing=8)
+        row1.add_widget(Label(text='Aruco-Overlay aktivieren'))
+        overlay_switch = Switch(active=self.aruco_enabled)
+        row1.add_widget(overlay_switch)
 
-        btn = Button(
-            text='Start',
-            size_hint=(0.3, 0.18),
-            pos_hint={'center_x': 0.5, 'y': 0.05}
+        row2 = BoxLayout(size_hint_y=None, height='40dp', spacing=8)
+        row2.add_widget(Label(text='Startblock (1=Übung, 2–5=Experimental)'))
+        block_spinner = Spinner(
+            text=str(self.start_block),
+            values=[str(i) for i in range(1, 6)],
+            size_hint=(None, None),
+            size=('120dp', '40dp')
         )
-        btn.bind(on_release=self.confirm_session_number)
-        layout.add_widget(btn)
+        row2.add_widget(block_spinner)
+
+        error_label = Label(text='', color=(1, 0, 0, 1), size_hint_y=None, height='24dp')
+
+        buttons = BoxLayout(size_hint_y=None, height='44dp', spacing=8)
+        ok_button = Button(text='OK')
+        cancel_button = Button(text='Abbrechen')
+        buttons.add_widget(ok_button)
+        buttons.add_widget(cancel_button)
+
+        content.add_widget(header)
+        content.add_widget(session_input)
+        content.add_widget(row1)
+        content.add_widget(row2)
+        content.add_widget(error_label)
+        content.add_widget(buttons)
 
         popup = Popup(
-            title='Sessionnummer',
-            content=layout,
-            size_hint=(None, None),
-            size=(popup_width, popup_height),
+            title='Session starten',
+            content=content,
+            size_hint=(0.6, 0.6),
             auto_dismiss=False
         )
         self.session_popup = popup
+
+        def _on_ok(_btn):
+            session_text = session_input.text.strip()
+            if not session_text:
+                error_label.text = 'Bitte Session ID eingeben.'
+                return
+
+            self.session_id = session_text
+            digits = ''.join(ch for ch in session_text if ch.isdigit())
+            self.session_number = int(digits) if digits else None
+            self.aruco_enabled = bool(overlay_switch.active)
+            try:
+                self.start_block = int(block_spinner.text)
+            except Exception:
+                self.start_block = 1
+
+            safe_session_id = ''.join(
+                ch if ch.isalnum() or ch in ('-', '_') else '_'
+                for ch in self.session_id
+            ) or 'session'
+
+            self.session_configured = True
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
+            self.session_storage_id = safe_session_id
+            self.logger = self.events_factory(self.session_id, str(db_path))
+            init_round_log(self)
+            self.update_role_assignments()
+
+            popup.dismiss()
+            self.session_popup = None
+
+            self.log_event(
+                None,
+                'session_start',
+                {
+                    'session_number': self.session_number,
+                    'session_id': self.session_id,
+                    'aruco_enabled': self.aruco_enabled,
+                    'start_block': self.start_block,
+                },
+            )
+            self._apply_session_options_and_start()
+
+        def _on_cancel(_btn):
+            popup.dismiss()
+            self.session_popup = None
+
+        ok_button.bind(on_release=_on_ok)
+        cancel_button.bind(on_release=_on_cancel)
         popup.open()
 
-    def confirm_session_number(self, *_):
-        text = self.session_input.text.strip() if hasattr(self, 'session_input') else ''
-        try:
-            number = int(text)
-            if number <= 0:
-                raise ValueError
-        except ValueError:
-            if hasattr(self, 'session_error'):
-                self.session_error.text = 'Bitte eine positive Zahl eingeben.'
+    def _apply_session_options_and_start(self):
+        if self._aruco_proc is None and getattr(self, 'overlay_process', None):
+            self._aruco_proc = self.overlay_process
+
+        if self.aruco_enabled:
+            self._aruco_proc = self.start_overlay(self._aruco_proc)
+        else:
+            self._aruco_proc = self.stop_overlay(self._aruco_proc)
+        self.overlay_process = self._aruco_proc
+
+        if not self._blocks:
+            self._blocks = load_blocks()
+
+        available_blocks = list(self._blocks) if self._blocks else []
+        self._blocks = available_blocks
+        if not available_blocks:
+            self.blocks = []
+            self.apply_phase()
             return
 
-        self.session_number = number
-        self.session_id = f'S{number:03d}'
-        self.session_configured = True
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self.log_dir / f'events_{self.session_id}.sqlite3'
-        self.logger = self.events_factory(self.session_id, str(db_path))
-        init_round_log(self)
-        self.update_role_assignments()
-        if self.session_popup:
-            self.session_popup.dismiss()
-            self.session_popup = None
-        self.log_event(None, 'session_start', {'session_number': number})
+        start_index = max(0, min(len(available_blocks) - 1, self.start_block - 1))
+        selected_blocks = available_blocks[start_index:]
+        if not selected_blocks:
+            selected_blocks = available_blocks[-1:]
+
+        self.blocks = selected_blocks
+        self.current_block_idx = 0
+        self.current_round_idx = 0
+        self.current_block_info = None
+        self.round_in_block = 0
+        self.current_block_total_rounds = 0
+        self.session_finished = False
+        self.in_block_pause = False
+        self.pause_message = ''
+        self.next_block_preview = None
+        self.fixation_required = False
+        self.pending_round_start_log = False
+        self.round = 1
+        self.outcome_score_applied = False
+        self.score_state = None
+        self.score_state_block = None
+        self.score_state_round_start = None
+        self.phase = UXPhase.WAIT_BOTH_START
+        self.intro_active = True
+        self.p1_pressed = False
+        self.p2_pressed = False
+
+        self.total_rounds_planned = sum(
+            len(block.get('rounds') or []) for block in self.blocks
+        )
+
+        self.reset_ui_for_new_block()
+
+    def reset_ui_for_new_block(self):
+        self.setup_round()
         self.apply_phase()
+        self.update_user_displays()
+        self.update_intro_overlay()
 
     def log_round_start(self):
         if not self.session_configured:
