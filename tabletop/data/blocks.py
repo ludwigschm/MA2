@@ -6,7 +6,7 @@ import csv
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from tabletop.data.config import CARD_DIR, ROOT
+from tabletop.data.config import CARD_COMBINATIONS_DIR, CARD_DIR
 
 
 def load_blocks() -> List[Dict[str, Any]]:
@@ -14,7 +14,7 @@ def load_blocks() -> List[Dict[str, Any]]:
 
     blocks: List[Dict[str, Any]] = []
 
-    practice_path = ROOT / "Paaretest.csv"
+    practice_path = CARD_COMBINATIONS_DIR / "Paaretest.csv"
     practice_rounds = load_csv_rounds(practice_path)
     if practice_rounds:
         blocks.append(
@@ -37,7 +37,7 @@ def load_blocks() -> List[Dict[str, Any]]:
     ]
 
     for index, filename, payout in order:
-        path = ROOT / filename
+        path = CARD_COMBINATIONS_DIR / filename
         rounds = load_csv_rounds(path)
         blocks.append(
             {
