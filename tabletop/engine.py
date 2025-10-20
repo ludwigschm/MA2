@@ -40,7 +40,12 @@ __all__ = [
     "SessionCsvLogger",
     "GameEngineConfig",
     "GameEngine",
+    "POINTS_PER_WIN",
 ]
+
+
+# Points awarded for a win when stakes/payouts are active.
+POINTS_PER_WIN = 3
 
 
 # ---------------- Enums ----------------
@@ -477,7 +482,7 @@ class GameEngine:
             winner_vp = self.current.roles.p1_is
         else:
             winner_vp = self.current.roles.p2_is
-        self.scores[winner_vp] += 1
+        self.scores[winner_vp] += POINTS_PER_WIN
 
     # --- Öffentliche API (UI) ---
 
