@@ -855,11 +855,13 @@ class TabletopRoot(FloatLayout):
 
     def _result_for_vp(self, vp:int):
         """Gewonnen/Verloren/Unentschieden relativ zu VP1/VP2."""
-        if not self.last_outcome:
-            return 'Unentschieden'
-        winner_player = self.last_outcome.get('winner')
+        if not isinstance(self.last_outcome, dict):
+            return ''
+        winner_player = self.last_outcome.get('winner') if self.last_outcome else None
         if winner_player not in (1,2):
-            return ' '
+            if self.last_outcome.get('draw'):
+                return 'Unentschieden'
+            return ''
         winner_vp = self.role_by_physical.get(winner_player)
         if winner_vp == vp:
             return 'Gewonnen'
@@ -867,6 +869,8 @@ class TabletopRoot(FloatLayout):
 
     def _result_with_score_for_vp(self, vp:int):
         base = self._result_for_vp(vp)
+        if not base:
+            return ''
         if base == 'Unentschieden':
             return 'Unentschieden 0'
         if base == 'Gewonnen':
@@ -945,7 +949,8 @@ class TabletopRoot(FloatLayout):
         ]
         if outcome_statement:
             lines.extend(['', outcome_statement])
-        lines.extend([ f"[b]{result_line}[/b]"])
+        if result_line and result_line.strip():
+            lines.append(f"[b]{result_line}[/b]")
 
         # Mehrzeilig – leichte Abstände über \n
         return "\n".join(lines)
