@@ -9,6 +9,7 @@ from kivy.app import App
 from kivy.config import Config
 from kivy.lang import Builder
 
+from tabletop.data.config import ARUCO_OVERLAY_PATH
 from tabletop.logging.round_csv import close_round_log
 from tabletop.overlay.process import (
     OverlayProcess,
@@ -51,7 +52,9 @@ class TabletopApp(App):
         else:
             process_handle = self._overlay_process
 
-        process_handle = start_overlay(process_handle)
+        process_handle = start_overlay(
+            process_handle, overlay_path=ARUCO_OVERLAY_PATH
+        )
         self._overlay_process = process_handle
         if root is not None:
             root.overlay_process = process_handle
