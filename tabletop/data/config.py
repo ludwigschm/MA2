@@ -22,14 +22,18 @@ UX_DIR: Path = ROOT / "UX"
 #: Directory containing all card face textures.
 CARD_DIR: Path = ROOT / "Karten"
 
+#: Directory holding CSV round definitions for card combinations.
+CARD_COMBINATIONS_DIR: Path = ROOT / "Kartenkombinationen"
+
 #: Location of the optional ArUco overlay helper script.
-ARUCO_OVERLAY_PATH: Path = ROOT / "aruco_overlay.py"
+ARUCO_OVERLAY_PATH: Path = ROOT / "tabletop" / "aruco_overlay.py"
 
 
 __all__ = [
     "ROOT",
     "UX_DIR",
     "CARD_DIR",
+    "CARD_COMBINATIONS_DIR",
     "ARUCO_OVERLAY_PATH",
 ]
 
