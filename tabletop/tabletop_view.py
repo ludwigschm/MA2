@@ -21,7 +21,7 @@ from kivy.uix.switch import Switch
 from kivy.uix.textinput import TextInput
 
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
-from tabletop.data.config import ROOT
+from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from tabletop.logging.events import Events
 from tabletop.logging.round_csv import (
     close_round_log,
@@ -103,7 +103,7 @@ class TabletopRoot(FloatLayout):
         controller: Optional[TabletopController] = None,
         state: Optional[TabletopState] = None,
         events_factory: Callable[[str, str], Events] = Events,
-        start_overlay: Callable[[Optional[Any]], Optional[Any]] = start_overlay_process,
+        start_overlay: Callable[..., Optional[Any]] = start_overlay_process,
         stop_overlay: Callable[[Optional[Any]], Optional[Any]] = stop_overlay_process,
         fixation_runner: Callable[..., Any] = overlay_run_fixation_sequence,
         fixation_player: Callable[[Any], None] = overlay_play_fixation_tone,
@@ -1167,12 +1167,20 @@ class TabletopRoot(FloatLayout):
         cancel_button.bind(on_release=_on_cancel)
         popup.open()
 
+    def _start_overlay_with_path(self, process: Optional[Any]) -> Optional[Any]:
+        """Start the ArUco overlay process with the relocated script path."""
+
+        try:
+            return self.start_overlay(process, overlay_path=ARUCO_OVERLAY_PATH)
+        except TypeError:
+            return self.start_overlay(process)
+
     def _apply_session_options_and_start(self):
         if self._aruco_proc is None and getattr(self, 'overlay_process', None):
             self._aruco_proc = self.overlay_process
 
         if self.aruco_enabled:
-            self._aruco_proc = self.start_overlay(self._aruco_proc)
+            self._aruco_proc = self._start_overlay_with_path(self._aruco_proc)
         else:
             self._aruco_proc = self.stop_overlay(self._aruco_proc)
         self.overlay_process = self._aruco_proc

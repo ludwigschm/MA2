@@ -6,22 +6,29 @@ import csv
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from tabletop.data.config import CARD_DIR, ROOT
+from tabletop.data.config import CARD_COMBINATIONS_DIR, CARD_DIR
 
 
 def load_blocks() -> List[Dict[str, Any]]:
-    """Load all experiment blocks and their associated round plans."""
+    """Load all experiment blocks and their associated round plans.
+
+    Each returned block dictionary exposes a ``csv_path`` entry that
+    references the CSV inside the relocated ``Kartenkombinationen`` directory.
+    Callers that need the on-disk file can therefore rely on the stored path
+    without rebuilding it manually.
+    """
 
     blocks: List[Dict[str, Any]] = []
 
-    practice_path = ROOT / "Paaretest.csv"
+    practice_path = CARD_COMBINATIONS_DIR / "Paaretest.csv"
     practice_rounds = load_csv_rounds(practice_path)
     if practice_rounds:
         blocks.append(
             {
                 "index": 0,
                 "label": "Übung",
-                "csv": "Paaretest.csv",
+                "csv": practice_path.name,
+                "csv_path": practice_path,
                 "path": practice_path,
                 "rounds": practice_rounds,
                 "payout": False,
@@ -37,13 +44,14 @@ def load_blocks() -> List[Dict[str, Any]]:
     ]
 
     for index, filename, payout in order:
-        path = ROOT / filename
+        path = CARD_COMBINATIONS_DIR / filename
         rounds = load_csv_rounds(path)
         blocks.append(
             {
                 "index": index,
                 "label": f"Block {index}",
                 "csv": filename,
+                "csv_path": path,
                 "path": path,
                 "rounds": rounds,
                 "payout": payout,
