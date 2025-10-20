@@ -40,7 +40,7 @@ from tabletop.overlay.fixation import run_fixation_sequence as overlay_run_fixat
 
 
 
-from tabletop.engine import EventLogger, Phase as EnginePhase
+from tabletop.engine import EventLogger, Phase as EnginePhase, POINTS_PER_WIN
 
 # --- Display fest auf 3840x2160, Vollbild aktivierbar (kommentiere die nächste Zeile, falls du Fenster willst)
 Config.set('graphics', 'fullscreen', 'auto')
@@ -1383,7 +1383,7 @@ class TabletopRoot(FloatLayout):
             if winner in (1, 2):
                 winner_role = self.role_by_physical.get(winner)
                 if winner_role in (1, 2):
-                    self.score_state[winner_role] += 1
+                    self.score_state[winner_role] += POINTS_PER_WIN
                     self.outcome_score_applied = True
         if self.session_configured:
             self.log_event(None, 'showdown', outcome or {})
@@ -1546,7 +1546,7 @@ class TabletopRoot(FloatLayout):
         if base == 'Unentschieden':
             return 'Unentschieden 0'
         if base == 'Gewonnen':
-            return 'Gewonnen +1'
+            return f'Gewonnen +{POINTS_PER_WIN}'
         return 'Verloren 0'
 
     def _points_for_vp(self, vp:int):

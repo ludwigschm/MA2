@@ -6,6 +6,10 @@ from typing import List, Optional, Dict, Any, Tuple
 import csv, time, json, sqlite3, pathlib
 from datetime import datetime, timezone
 
+# Points awarded for each win when stakes/payouts are used.
+POINTS_PER_WIN = 3
+
+
 # ---------------- Enums ----------------
 
 class Phase(Enum):
@@ -380,7 +384,7 @@ class GameEngine:
             winner_vp = self.current.roles.p1_is
         else:
             winner_vp = self.current.roles.p2_is
-        self.scores[winner_vp] += 1
+        self.scores[winner_vp] += POINTS_PER_WIN
 
     # --- Öffentliche API (UI) ---
 
