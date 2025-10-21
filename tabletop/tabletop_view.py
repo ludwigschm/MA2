@@ -64,6 +64,9 @@ class TabletopRoot(FloatLayout):
     button_scale = NumericProperty(0.8)
     scale = NumericProperty(1.0)
     horizontal_offset = NumericProperty(0.08)
+    # Einheitlicher Seitenrand: 12% der Breite, aber min. 220px (skaliert)
+    side_margin_frac = NumericProperty(0.12)
+    side_margin_min = NumericProperty(220.0)
 
     btn_start_p1 = ObjectProperty(None)
     btn_start_p2 = ObjectProperty(None)
