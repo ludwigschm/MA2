@@ -64,9 +64,14 @@ class TabletopRoot(FloatLayout):
     button_scale = NumericProperty(0.8)
     scale = NumericProperty(1.0)
     horizontal_offset = NumericProperty(0.08)
-    # Einheitlicher Seitenrand: 12% der Breite, aber min. 220px (skaliert)
-    side_margin_frac = NumericProperty(0.12)
-    side_margin_min = NumericProperty(220.0)
+    # Responsive Seitenränder (Prozent + physische Untergrenze)
+    side_margin_frac = NumericProperty(0.14)
+    side_margin_min_px = NumericProperty(280.0)
+    side_margin_max_frac = NumericProperty(0.22)
+    side_margin_target_cm = NumericProperty(3.2)
+
+    # Ergebniswert (in Pixeln)
+    horizontal_margin_px = NumericProperty(0.0)
 
     btn_start_p1 = ObjectProperty(None)
     btn_start_p2 = ObjectProperty(None)
@@ -353,16 +358,29 @@ class TabletopRoot(FloatLayout):
         self._update_scale()
 
     def _update_scale(self, *_):
-        base_w = self.base_width or 0
-        base_h = self.base_height or 0
+        base_w = self.base_width or 3840.0
+        base_h = self.base_height or 2160.0
         width = self.width or Window.width
         height = self.height or Window.height
-        if not base_w or not base_h:
-            self.scale = self.SCALE_FACTOR
-        else:
-            base_scale = min(width / base_w, height / base_h)
-            self.scale = self.SCALE_FACTOR * base_scale
+
+        base_scale = min(width / base_w, height / base_h)
+        self.scale = self.SCALE_FACTOR * base_scale
         self.horizontal_offset = 0.05 if width < 2500 else 0.08
+
+        # --- Responsive Margin berechnen ---
+        frac_px = float(width) * float(self.side_margin_frac)
+
+        # physikalischer Zielwert → px
+        dpi = getattr(Window, "dpi", 96.0) or 96.0
+        px_per_cm = dpi / 2.54
+        cm_px = float(self.side_margin_target_cm) * px_per_cm
+
+        # harte Klammern: mindestens min_px bzw. cm, maximal Anteil der Breite
+        min_px = max(float(self.side_margin_min_px), cm_px)
+        max_px = float(width) * float(self.side_margin_max_frac)
+
+        # finale Margin
+        self.horizontal_margin_px = max(min(frac_px, max_px), min_px)
 
     @staticmethod
     def _parse_value(value):
