@@ -146,6 +146,7 @@ class TabletopRoot(FloatLayout):
         self.round_log_path = None
         self.round_log_fp = None
         self.round_log_writer = None
+        self.round_log_buffer = []
 
         # --- UI Elemente initialisieren
         self._configure_widgets()

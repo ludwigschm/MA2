@@ -4,41 +4,49 @@ from __future__ import annotations
 
 import csv
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
+
+try:  # Optional dependency used when available.
+    import pandas as _pd  # type: ignore
+except Exception:  # pragma: no cover - pandas is optional at runtime
+    _pd = None
+
+
+ROUND_LOG_HEADER: List[str] = [
+    "Session",
+    "Bedingung",
+    "Block",
+    "Runde im Block",
+    "Spieler 1",
+    "VP",
+    "Karte1 VP1",
+    "Karte2 VP1",
+    "Karte1 VP2",
+    "Karte2 VP2",
+    "Aktion",
+    "Zeit",
+    "Gewinner",
+    "Punktestand VP1",
+    "Punktestand VP2",
+]
 
 
 def init_round_log(app: Any) -> None:
     if not getattr(app, "session_id", None):
         return
-    if getattr(app, "round_log_fp", None):
+    if getattr(app, "round_log_path", None):
         close_round_log(app)
     app.log_dir.mkdir(parents=True, exist_ok=True)
     session_fs_id = getattr(app, "session_storage_id", None) or app.session_id
     path = app.log_dir / f"round_log_{session_fs_id}.csv"
-    new_file = not path.exists()
     app.round_log_path = path
-    app.round_log_fp = open(path, "a", encoding="utf-8", newline="")
-    app.round_log_writer = csv.writer(app.round_log_fp)
-    if new_file:
-        header = [
-            "Session",
-            "Bedingung",
-            "Block",
-            "Runde im Block",
-            "Spieler 1",
-            "VP",
-            "Karte1 VP1",
-            "Karte2 VP1",
-            "Karte1 VP2",
-            "Karte2 VP2",
-            "Aktion",
-            "Zeit",
-            "Gewinner",
-            "Punktestand VP1",
-            "Punktestand VP2",
-        ]
-        app.round_log_writer.writerow(header)
-        app.round_log_fp.flush()
+    app.round_log_fp = None
+    app.round_log_writer = None
+    buffer: Optional[List[List[Any]]] = getattr(app, "round_log_buffer", None)
+    if buffer is None:
+        app.round_log_buffer = []
+    else:
+        buffer.clear()
 
 
 def round_log_action_label(app: Any, action: str, payload: Dict[str, Any]) -> str:
@@ -62,7 +70,7 @@ def round_log_action_label(app: Any, action: str, payload: Dict[str, Any]) -> st
 
 
 def write_round_log(app: Any, actor: str, action: str, payload: Dict[str, Any], player: int) -> None:
-    if not getattr(app, "round_log_writer", None):
+    if not getattr(app, "round_log_path", None):
         return
     is_showdown = action == "showdown"
     if not is_showdown and player not in (1, 2):
@@ -147,12 +155,42 @@ def write_round_log(app: Any, actor: str, action: str, payload: Dict[str, Any], 
         score_vp1,
         score_vp2,
     ]
-    app.round_log_writer.writerow(row)
-    app.round_log_fp.flush()
+    buffer = getattr(app, "round_log_buffer", None)
+    if buffer is None:
+        buffer = []
+        app.round_log_buffer = buffer
+    buffer.append(row)
+
+
+def flush_round_log(app: Any, pandas_module: Any | None = None) -> None:
+    if not getattr(app, "round_log_path", None):
+        return
+    buffer: Optional[List[List[Any]]] = getattr(app, "round_log_buffer", None)
+    if not buffer:
+        return
+    path = app.round_log_path
+    app.log_dir.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists() and path.stat().st_size > 0
+    rows = list(buffer)
+    pd = pandas_module if pandas_module is not None else _pd
+    if pd is not None:
+        df = pd.DataFrame(rows, columns=ROUND_LOG_HEADER)
+        df.to_csv(path, mode="a", header=not file_exists, index=False)
+    else:
+        write_header = not file_exists
+        with open(path, "a", encoding="utf-8", newline="") as fp:
+            writer = csv.writer(fp)
+            if write_header:
+                writer.writerow(ROUND_LOG_HEADER)
+            writer.writerows(rows)
+    buffer.clear()
 
 
 def close_round_log(app: Any) -> None:
+    flush_round_log(app)
     if getattr(app, "round_log_fp", None):
         app.round_log_fp.close()
-        app.round_log_fp = None
-        app.round_log_writer = None
+    app.round_log_fp = None
+    app.round_log_writer = None
+    if getattr(app, "round_log_path", None):
+        app.round_log_path = None
