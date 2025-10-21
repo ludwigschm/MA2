@@ -56,6 +56,8 @@ STATE_FIELD_NAMES = set(TabletopState.__dataclass_fields__)
 class TabletopRoot(FloatLayout):
     _STATE_FIELDS = STATE_FIELD_NAMES
 
+    SCALE_FACTOR = NumericProperty(0.7)
+
     bg_texture = ObjectProperty(None, rebind=True)
     base_width = NumericProperty(3840.0)
     base_height = NumericProperty(2160.0)
@@ -350,11 +352,12 @@ class TabletopRoot(FloatLayout):
         base_w = self.base_width or 0
         base_h = self.base_height or 0
         if not base_w or not base_h:
-            self.scale = 1.0
+            self.scale = self.SCALE_FACTOR
             return
         width = self.width or Window.width
         height = self.height or Window.height
-        self.scale = min(width / base_w, height / base_h)
+        base_scale = min(width / base_w, height / base_h)
+        self.scale = self.SCALE_FACTOR * base_scale
 
     @staticmethod
     def _parse_value(value):
