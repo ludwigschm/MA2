@@ -16,7 +16,7 @@
 import sys, os, json
 from typing import List, Dict, Tuple, Optional
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
-from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
+from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QGuiApplication
 from PyQt6.QtCore import Qt, QRect
 import cv2
 import numpy as np
@@ -49,10 +49,46 @@ LABEL_CSS   = "background: transparent; color: black; font: 12pt 'Segoe UI';"
 
 # Markergröße: entweder FIX (deterministisch) ODER prozentual
 USE_FIXED_SIZE = True
-FIXED_SIZE_PX  = 280                              # z. B. 280 px inkl. Quiet-Zone
+TARGET_CM      = 6.0
+FIXED_SIZE_PX  = 240                              # wird dynamisch angepasst (~6 cm @ ~100 PPI)
 SIZE_PERCENT   = 0.16                              # falls USE_FIXED_SIZE=False
 MIN_SIZE_PX    = 160
 MAX_SIZE_PX    = 560
+
+_FIXED_SIZE_INITIALIZED = False
+
+
+def _initialize_fixed_size() -> None:
+    """Compute the fixed marker size in pixels based on primary screen metrics."""
+    global FIXED_SIZE_PX, _FIXED_SIZE_INITIALIZED
+
+    if _FIXED_SIZE_INITIALIZED:
+        return
+
+    screen = QGuiApplication.primaryScreen()
+    fallback_reason = "no primary screen"
+    ppi = None
+
+    if screen is not None:
+        p_width_px = screen.geometry().width()
+        p_width_mm = screen.physicalSize().width()
+        fallback_reason = "physical size unavailable"
+
+        if p_width_mm > 0:
+            ppi = p_width_px / (p_width_mm / 25.4)
+            FIXED_SIZE_PX = int(round(ppi * (TARGET_CM / 2.54)))
+
+    if ppi is not None:
+        print(
+            f"ArUco overlay: primary screen ≈ {ppi:.1f} PPI, target size {FIXED_SIZE_PX}px for {TARGET_CM:.1f} cm"
+        )
+    else:
+        print(
+            "ArUco overlay: PPI unavailable"
+            f" ({fallback_reason}), using fallback size {FIXED_SIZE_PX}px (~{TARGET_CM:.1f} cm)"
+        )
+
+    _FIXED_SIZE_INITIALIZED = True
 
 # -------------------- TAG-RENDERING ------------------------------------------
 def generate_apriltag_qpixmap(tag_id: int, size: int, quiet_zone_ratio: float = QUIET_ZONE_RATIO) -> QPixmap:
@@ -94,6 +130,8 @@ class MarkerOverlay(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(BG_WHITE_CSS)
         self.setGeometry(screen_geometry)
+
+        _initialize_fixed_size()
 
         # --- Eingabe normalisieren ---
         if layout is not None:
@@ -168,13 +206,17 @@ class MarkerOverlay(QMainWindow):
         if event.key() == Qt.Key.Key_M:
             self.toggle_markers()
         elif event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
-            if not self.use_fixed:
-                self.size_percent *= 1.05
-                self._layout_and_render_markers()
+            if self.use_fixed:
+                event.accept()
+                return
+            self.size_percent *= 1.05
+            self._layout_and_render_markers()
         elif event.key() == Qt.Key.Key_Minus:
-            if not self.use_fixed:
-                self.size_percent /= 1.05
-                self._layout_and_render_markers()
+            if self.use_fixed:
+                event.accept()
+                return
+            self.size_percent /= 1.05
+            self._layout_and_render_markers()
         elif event.key() == Qt.Key.Key_Escape:
             QApplication.instance().quit()
 
