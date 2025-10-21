@@ -63,6 +63,7 @@ class TabletopRoot(FloatLayout):
     base_height = NumericProperty(2160.0)
     button_scale = NumericProperty(0.8)
     scale = NumericProperty(1.0)
+    horizontal_offset = NumericProperty(0.08)
 
     btn_start_p1 = ObjectProperty(None)
     btn_start_p2 = ObjectProperty(None)
@@ -351,13 +352,14 @@ class TabletopRoot(FloatLayout):
     def _update_scale(self, *_):
         base_w = self.base_width or 0
         base_h = self.base_height or 0
-        if not base_w or not base_h:
-            self.scale = self.SCALE_FACTOR
-            return
         width = self.width or Window.width
         height = self.height or Window.height
-        base_scale = min(width / base_w, height / base_h)
-        self.scale = self.SCALE_FACTOR * base_scale
+        if not base_w or not base_h:
+            self.scale = self.SCALE_FACTOR
+        else:
+            base_scale = min(width / base_w, height / base_h)
+            self.scale = self.SCALE_FACTOR * base_scale
+        self.horizontal_offset = 0.05 if width < 2500 else 0.08
 
     @staticmethod
     def _parse_value(value):
