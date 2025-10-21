@@ -10,7 +10,7 @@ from kivy.config import Config
 from kivy.lang import Builder
 
 from tabletop.data.config import ARUCO_OVERLAY_PATH
-from tabletop.logging.round_csv import close_round_log
+from tabletop.logging.round_csv import close_round_log, flush_round_log
 from tabletop.overlay.process import (
     OverlayProcess,
     start_overlay,
@@ -80,6 +80,7 @@ class TabletopApp(App):
                 if callable(close_fn):
                     close_fn()
                 root.logger = None
+            flush_round_log(root)
             close_round_log(root)
 
         super().on_stop()

@@ -221,7 +221,6 @@ class EventLogger:
         self.conn.commit()
         if self.csv_fp:
             csv.writer(self.csv_fp).writerow(row)
-            self.csv_fp.flush()
         return {
             "session_id": session_id,
             "round_idx": round_idx,
@@ -300,7 +299,6 @@ class SessionCsvLogger:
         self._writer = csv.writer(self._fp)
         if new_file:
             self._writer.writerow(self.HEADER)
-            self._fp.flush()
 
     def _action_label(self, actor: str, action: str, payload: Dict[str, Any]) -> str:
         if action == "start_click":
@@ -379,7 +377,6 @@ class SessionCsvLogger:
             score_vp2,
         ]
         self._writer.writerow(row)
-        self._fp.flush()
 
     def close(self) -> None:
         self._fp.close()
