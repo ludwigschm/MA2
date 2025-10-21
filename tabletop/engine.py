@@ -190,10 +190,12 @@ class EventLogger:
         )"""
         )
         self.conn.commit()
-        self.csv_fp = None
+        self._csv_path: Optional[pathlib.Path] = None
+        self._csv_buffer: List[Tuple[str, int, str, str, str, str, int, str]] = []
         if csv_path:
-            pathlib.Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
-            self.csv_fp = open(csv_path, "a", encoding="utf-8", newline="")
+            path = pathlib.Path(csv_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._csv_path = path
 
     def log(
         self,
@@ -219,8 +221,8 @@ class EventLogger:
         cur = self.conn.cursor()
         cur.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)", row)
         self.conn.commit()
-        if self.csv_fp:
-            csv.writer(self.csv_fp).writerow(row)
+        if self._csv_path is not None:
+            self._csv_buffer.append(row)
         return {
             "session_id": session_id,
             "round_idx": round_idx,
@@ -232,8 +234,11 @@ class EventLogger:
         }
 
     def close(self) -> None:
-        if self.csv_fp:
-            self.csv_fp.close()
+        if self._csv_path is not None and self._csv_buffer:
+            with open(self._csv_path, "a", encoding="utf-8", newline="") as fp:
+                writer = csv.writer(fp)
+                writer.writerows(self._csv_buffer)
+            self._csv_buffer.clear()
         self.conn.close()
 
 
@@ -294,11 +299,11 @@ class SessionCsvLogger:
 
     def __init__(self, path: pathlib.Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        new_file = not path.exists()
-        self._fp = open(path, "a", encoding="utf-8", newline="")
-        self._writer = csv.writer(self._fp)
-        if new_file:
-            self._writer.writerow(self.HEADER)
+        self._path = path
+        file_exists = path.exists()
+        file_has_content = file_exists and path.stat().st_size > 0 if file_exists else False
+        self._write_header = not file_has_content
+        self._buffer: List[List[Any]] = []
 
     def _action_label(self, actor: str, action: str, payload: Dict[str, Any]) -> str:
         if action == "start_click":
@@ -376,10 +381,23 @@ class SessionCsvLogger:
             score_vp1,
             score_vp2,
         ]
-        self._writer.writerow(row)
+        self._buffer.append(row)
 
     def close(self) -> None:
-        self._fp.close()
+        self.flush()
+
+    def flush(self) -> None:
+        if not self._buffer and not self._write_header:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._path, "a", encoding="utf-8", newline="") as fp:
+            writer = csv.writer(fp)
+            if self._write_header:
+                writer.writerow(self.HEADER)
+                self._write_header = False
+            if self._buffer:
+                writer.writerows(self._buffer)
+        self._buffer.clear()
 
 
 @dataclass
