@@ -13,13 +13,19 @@
 #   -   -> Marker um -5% kleiner (nur wenn USE_FIXED_SIZE=False)
 #   Esc -> Programm beenden
 
-import sys, os, json
-from typing import List, Dict, Tuple, Optional
-from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
-from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QGuiApplication
-from PyQt6.QtCore import Qt, QRect
+import json
+import logging
+import os
+import sys
+from typing import Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
+from PyQt6.QtCore import QRect, Qt
+from PyQt6.QtGui import QImage, QKeyEvent, QPixmap
+from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
+
+from tabletop.utils.phys_units import mm_to_px
 
 # -------------------- EMPFOHLENE IDs & Positionen ----------------------------
 # Robuste, weit auseinanderliegende AprilTag-IDs (tag36h11)
@@ -49,46 +55,49 @@ LABEL_CSS   = "background: transparent; color: black; font: 12pt 'Segoe UI';"
 
 # Markergröße: entweder FIX (deterministisch) ODER prozentual
 USE_FIXED_SIZE = True
-TARGET_CM      = 6.0
-FIXED_SIZE_PX  = 240                              # wird dynamisch angepasst (~6 cm @ ~100 PPI)
+MARKER_MM      = 60.0
 SIZE_PERCENT   = 0.16                              # falls USE_FIXED_SIZE=False
 MIN_SIZE_PX    = 160
 MAX_SIZE_PX    = 560
 
-_FIXED_SIZE_INITIALIZED = False
+log = logging.getLogger(__name__)
 
 
-def _initialize_fixed_size() -> None:
-    """Compute the fixed marker size in pixels based on primary screen metrics."""
-    global FIXED_SIZE_PX, _FIXED_SIZE_INITIALIZED
+def _parse_display_override() -> Optional[int]:
+    value = os.environ.get("TABLETOP_DISPLAY_INDEX")
+    if value is not None:
+        try:
+            return int(value.strip())
+        except (TypeError, ValueError):
+            log.warning("Invalid TABLETOP_DISPLAY_INDEX value %r ignored.", value)
 
-    if _FIXED_SIZE_INITIALIZED:
-        return
+    for argument in sys.argv[1:]:
+        if argument.startswith("--display="):
+            _, raw = argument.split("=", 1)
+            try:
+                return int(raw.strip())
+            except ValueError:
+                log.warning("Invalid --display argument %r ignored.", argument)
+                break
+    return None
 
-    screen = QGuiApplication.primaryScreen()
-    fallback_reason = "no primary screen"
-    ppi = None
 
-    if screen is not None:
-        p_width_px = screen.geometry().width()
-        p_width_mm = screen.physicalSize().width()
-        fallback_reason = "physical size unavailable"
+def _effective_display_index(total_screens: int) -> int:
+    override = _parse_display_override()
+    if override is not None:
+        return max(0, min(override, max(0, total_screens - 1)))
 
-        if p_width_mm > 0:
-            ppi = p_width_px / (p_width_mm / 25.4)
-            FIXED_SIZE_PX = int(round(ppi * (TARGET_CM / 2.54)))
+    inherited = os.environ.get("TABLETOP_EFFECTIVE_DISPLAY_INDEX")
+    if inherited is not None:
+        try:
+            idx = int(inherited.strip())
+            return max(0, min(idx, max(0, total_screens - 1)))
+        except ValueError:
+            log.warning("Invalid TABLETOP_EFFECTIVE_DISPLAY_INDEX value %r ignored.", inherited)
 
-    if ppi is not None:
-        print(
-            f"ArUco overlay: primary screen ≈ {ppi:.1f} PPI, target size {FIXED_SIZE_PX}px for {TARGET_CM:.1f} cm"
-        )
-    else:
-        print(
-            "ArUco overlay: PPI unavailable"
-            f" ({fallback_reason}), using fallback size {FIXED_SIZE_PX}px (~{TARGET_CM:.1f} cm)"
-        )
-
-    _FIXED_SIZE_INITIALIZED = True
+    if total_screens > 1:
+        return 1
+    return 0
 
 # -------------------- TAG-RENDERING ------------------------------------------
 def generate_apriltag_qpixmap(tag_id: int, size: int, quiet_zone_ratio: float = QUIET_ZONE_RATIO) -> QPixmap:
@@ -117,6 +126,7 @@ class MarkerOverlay(QMainWindow):
         screen_geometry: QRect,
         layout: Optional[Dict[str, int]] = None,
         marker_ids: Optional[List[int]] = None,   # Abwärtskompatibel
+        screen_index: int = 0,
     ):
         """
         Entweder 'layout' übergeben (empfohlen) ODER 'marker_ids' (werden in POSITION_ORDER gemappt).
@@ -131,7 +141,7 @@ class MarkerOverlay(QMainWindow):
         self.setStyleSheet(BG_WHITE_CSS)
         self.setGeometry(screen_geometry)
 
-        _initialize_fixed_size()
+        self.screen_index = screen_index
 
         # --- Eingabe normalisieren ---
         if layout is not None:
@@ -154,7 +164,10 @@ class MarkerOverlay(QMainWindow):
         self.min_size = MIN_SIZE_PX
         self.max_size = MAX_SIZE_PX
         self.use_fixed = USE_FIXED_SIZE
-        self.fixed_size = FIXED_SIZE_PX
+        if self.use_fixed:
+            self.fixed_size = mm_to_px(MARKER_MM, self.screen_index)
+        else:
+            self.fixed_size = 0
 
         # UI-Objekte
         for _ in self.pos_order:
@@ -171,16 +184,16 @@ class MarkerOverlay(QMainWindow):
             self.text_labels.append(txt)
 
         # Zuordnung ausgeben & speichern
-        print("Feste Marker-Zuordnung (Position → ID):")
+        log.info("Feste Marker-Zuordnung (Position → ID):")
         for name in self.pos_order:
-            print(f"  {name:12s} -> {self.layout[name]}")
+            log.info("  %-12s -> %s", name, self.layout[name])
         try:
             mapping_path = os.path.join(os.getcwd(), "marker_layout.json")
             with open(mapping_path, "w", encoding="utf-8") as f:
                 json.dump({name: int(self.layout[name]) for name in self.pos_order}, f, ensure_ascii=False, indent=2)
-            print(f"(Gespeichert als {mapping_path})")
+            log.info("Marker-Zuordnung gespeichert als %s", mapping_path)
         except Exception as e:
-            print(f"Warnung: Konnte marker_layout.json nicht schreiben: {e}")
+            log.warning("Konnte marker_layout.json nicht schreiben: %s", e)
 
         self._layout_and_render_markers()
 
@@ -231,6 +244,9 @@ class MarkerOverlay(QMainWindow):
         # Markergröße
         if self.use_fixed:
             msize = int(self.fixed_size)
+            if msize <= 0:
+                self.fixed_size = mm_to_px(MARKER_MM, self.screen_index)
+                msize = int(self.fixed_size)
         else:
             base = int(min(w, h) * self.size_percent)
             msize = max(self.min_size, min(base, self.max_size))
@@ -263,44 +279,41 @@ def main():
     layout = MARKER_LAYOUT
 
     overlays: List[MarkerOverlay] = []
-    geometry = _preferred_screen_geometry(app)
-    if geometry is None:
+    geometry_info = _preferred_screen_geometry(app)
+    if geometry_info is None:
         geometry = QRect(100, 100, 1280, 720)
-        print("Keine Bildschirminformation gefunden, verwende Fallback-Geometrie.")
-        win = MarkerOverlay(geometry, layout=layout)
+        log.warning("Keine Bildschirminformation gefunden, verwende Fallback-Geometrie.")
+        win = MarkerOverlay(geometry, layout=layout, screen_index=0)
         win.show()
     else:
-        print(
-            "Starte Overlay auf Bildschirm bei"
-            f" ({geometry.x()}, {geometry.y()}) mit Größe {geometry.width()}x{geometry.height()}"
+        geometry, screen_index = geometry_info
+        log.info(
+            "Starte Overlay auf Bildschirm %d bei (%d, %d) mit Größe %dx%d",
+            screen_index,
+            geometry.x(),
+            geometry.y(),
+            geometry.width(),
+            geometry.height(),
         )
-        win = MarkerOverlay(geometry, layout=layout)
+        win = MarkerOverlay(geometry, layout=layout, screen_index=screen_index)
         win.showFullScreen()
     overlays.append(win)
 
     sys.exit(app.exec())
 
 
-def _preferred_screen_geometry(app: QApplication) -> Optional[QRect]:
-    """Select the secondary screen when present, else fall back to primary."""
+def _preferred_screen_geometry(app: QApplication) -> Optional[Tuple[QRect, int]]:
+    """Select the screen index based on overrides or defaults."""
 
     screens = list(app.screens())
     if not screens:
         return None
 
-    primary = app.primaryScreen()
-    target = None
-    if len(screens) > 1:
-        for screen in screens:
-            if primary is None or screen != primary:
-                target = screen
-                break
-
-    if target is None:
-        target = primary or screens[0]
-
-    return target.geometry()
+    index = _effective_display_index(len(screens))
+    index = max(0, min(index, len(screens) - 1))
+    return screens[index].geometry(), index
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     main()
