@@ -2,13 +2,60 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional, Tuple, cast
 
 import logging
 
+from PyQt6.QtGui import QGuiApplication
+
 from kivy.app import App
 from kivy.config import Config
+
+
+@lru_cache(maxsize=1)
+def _preferred_screen_geometry() -> Optional[Tuple[int, int, int, int]]:
+    """Return geometry for the secondary screen, falling back to primary."""
+
+    app = QGuiApplication.instance()
+    owns_app = False
+    if app is None:
+        app = QGuiApplication([])
+        owns_app = True
+
+    try:
+        screens = list(app.screens())
+        if not screens:
+            return None
+
+        primary = app.primaryScreen()
+        target = None
+        if len(screens) > 1:
+            for screen in screens:
+                if primary is None or screen != primary:
+                    target = screen
+                    break
+
+        if target is None:
+            target = primary or screens[0]
+
+        geometry = target.geometry()
+        return geometry.x(), geometry.y(), geometry.width(), geometry.height()
+    finally:
+        if owns_app:
+            app.quit()
+
+
+_BOOTSTRAP_GEOMETRY = _preferred_screen_geometry()
+
+if _BOOTSTRAP_GEOMETRY:
+    x, y, width, height = _BOOTSTRAP_GEOMETRY
+    Config.set("graphics", "position", "custom")
+    Config.set("graphics", "left", str(x))
+    Config.set("graphics", "top", str(y))
+    Config.set("graphics", "width", str(width))
+    Config.set("graphics", "height", str(height))
 
 Config.set("kivy", "exit_on_escape", "0")
 Config.write()
@@ -38,6 +85,7 @@ class TabletopApp(App):
         super().__init__(**kwargs)
         self._overlay_process: Optional[OverlayProcess] = None
         self._esc_handler: Optional[Any] = None
+        self._preferred_geometry: Optional[Tuple[int, int, int, int]] = None
 
     def build(self) -> TabletopRoot:
         """Create the root widget for the Kivy application."""
@@ -87,6 +135,8 @@ class TabletopApp(App):
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
 
+        self._preferred_geometry = _BOOTSTRAP_GEOMETRY or _preferred_screen_geometry()
+
         def _start_overlay_late(_dt: float) -> None:
             process_handle: Optional[OverlayProcess]
             if root and getattr(root, "overlay_process", None):
@@ -109,6 +159,7 @@ class TabletopApp(App):
 
         def _enter_fullscreen(_dt: float) -> None:
             try:
+                self._apply_preferred_geometry()
                 Window.borderless = True
                 Window.fullscreen = "auto"
                 log.info("Fullscreen engaged (auto).")
@@ -118,6 +169,7 @@ class TabletopApp(App):
             self._bind_esc()
             Clock.schedule_once(_start_overlay_late, 0.25)
 
+        self._apply_preferred_geometry()
         Clock.schedule_once(_enter_fullscreen, 0.0)
 
     def on_stop(self) -> None:  # pragma: no cover - framework callback
@@ -145,6 +197,25 @@ class TabletopApp(App):
             close_round_log(root)
 
         super().on_stop()
+
+
+    def _apply_preferred_geometry(self) -> None:
+        """Position the Kivy window on the preferred display when available."""
+
+        geometry = self._preferred_geometry or _preferred_screen_geometry()
+        if geometry is None:
+            return
+
+        x, y, width, height = geometry
+        try:
+            Window.left = x
+            Window.top = y
+            Window.size = (width, height)
+            log.info(
+                "Window positioned at (%s, %s) with size %sx%s", x, y, width, height
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.exception("Failed to position window on preferred screen: %s", exc)
 
 
 def main() -> None:
