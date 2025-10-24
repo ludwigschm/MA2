@@ -44,25 +44,25 @@
     CardWidget:
         id: p1_outer
         size_hint: None, None
-        size: 420 * root.scale, 640 * root.scale
-        pos: root.horizontal_margin_px, 180 * root.scale
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.horizontal_margin_px + root.cm_to_px(5), 180 * root.scale
 
     CardWidget:
         id: p1_inner
         size_hint: None, None
-        size: 420 * root.scale, 640 * root.scale
+        size: 336 * root.scale, 512 * root.scale
         pos: root.ids.p1_outer.right + 70 * root.scale, 180 * root.scale
 
     CardWidget:
         id: p2_outer
         size_hint: None, None
-        size: 420 * root.scale, 640 * root.scale
-        pos: root.width - root.horizontal_margin_px - self.width, root.height - 180 * root.scale - self.height
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.width - root.horizontal_margin_px - root.cm_to_px(5) - self.width, root.height - 180 * root.scale - self.height
 
     CardWidget:
         id: p2_inner
         size_hint: None, None
-        size: 420 * root.scale, 640 * root.scale
+        size: 336 * root.scale, 512 * root.scale
         pos: root.ids.p2_outer.x - self.width - 70 * root.scale, root.ids.p2_outer.y
 
     IconButton:
