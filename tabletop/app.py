@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional, Tuple, cast
+from typing import Any, List, Optional, Tuple, cast
 
 import logging
+import os
+import sys
 
 from kivy.app import App
 from kivy.config import Config
@@ -27,11 +28,159 @@ from tabletop.overlay.process import (
 )
 from tabletop.tabletop_view import TabletopRoot
 
-from PyQt6.QtGui import QGuiApplication
-
 log = logging.getLogger(__name__)
 
 _KV_LOADED = False
+
+
+def _screens_via_qt() -> Optional[Tuple[str, List[Tuple[int, int, int, int]]]]:
+    """Return screen geometries using a Qt backend when available."""
+
+    gui_mod = None
+    try:
+        from PyQt5.QtGui import QGuiApplication as _QGuiApplication  # type: ignore
+
+        gui_mod = _QGuiApplication
+    except Exception:
+        try:
+            from PySide6.QtGui import QGuiApplication as _QGuiApplication  # type: ignore
+
+            gui_mod = _QGuiApplication
+        except Exception:
+            try:
+                from PyQt6.QtGui import QGuiApplication as _QGuiApplication  # type: ignore
+
+                gui_mod = _QGuiApplication
+            except Exception:
+                return None
+
+    if gui_mod is None:
+        return None
+
+    owns = gui_mod.instance() is None
+    app = gui_mod.instance() or gui_mod([])
+    try:
+        geoms: List[Tuple[int, int, int, int]] = []
+        for screen in gui_mod.screens():
+            geom = screen.geometry()
+            geoms.append((geom.x(), geom.y(), geom.width(), geom.height()))
+        return ("qt", geoms)
+    finally:
+        if owns:
+            app.quit()
+
+
+def _screens_via_winapi() -> Optional[Tuple[str, List[Tuple[int, int, int, int]]]]:
+    """Return screen geometries using the Windows API."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None
+
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return None
+
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.POINTER(wintypes.RECT),
+        ctypes.c_double,
+    )
+
+    rects: List[Tuple[int, int, int, int]] = []
+
+    def _cb(_hmon, _hdc, rect_ptr, _lparam):
+        rect = rect_ptr.contents
+        rects.append((rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
+        return 1
+
+    if not user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(_cb), 0):
+        return None
+
+    return ("winapi", rects)
+
+
+def _screens_via_pyglet() -> Optional[Tuple[str, List[Tuple[int, int, int, int]]]]:
+    """Return screen geometries using pyglet."""
+
+    try:
+        import pyglet
+
+        display = pyglet.canvas.get_display()
+        geoms: List[Tuple[int, int, int, int]] = []
+        for screen in display.get_screens():
+            geoms.append((screen.x, screen.y, screen.width, screen.height))
+        return ("pyglet", geoms)
+    except Exception:
+        return None
+
+
+def detect_screens() -> Tuple[str, List[Tuple[int, int, int, int]]]:
+    """Detect available screen geometries using supported backends."""
+
+    for getter in (_screens_via_qt, _screens_via_winapi, _screens_via_pyglet):
+        result = getter()
+        if result and result[1]:
+            return result
+
+    try:
+        width, height = Window.system_size
+    except Exception:
+        width, height = (1280, 720)
+
+    return ("fallback", [(0, 0, width, height)])
+
+
+def _parse_display_override() -> Optional[int]:
+    """Parse overrides from environment variable or CLI arguments."""
+
+    env_value = os.environ.get("TABLETOP_DISPLAY_INDEX")
+    if env_value is not None:
+        try:
+            return int(env_value.strip())
+        except (ValueError, AttributeError):
+            log.warning(
+                "Invalid TABLETOP_DISPLAY_INDEX value %r ignored.", env_value
+            )
+
+    for argument in sys.argv[1:]:
+        if argument.startswith("--display="):
+            _, value = argument.split("=", 1)
+            try:
+                return int(value.strip())
+            except ValueError:
+                log.warning("Invalid --display value %r ignored.", argument)
+                break
+
+    return None
+
+
+def pick_preferred_geometry(
+    default_index: int = 1,
+) -> Tuple[int, int, int, int, str, int]:
+    """Pick the geometry for the preferred display.
+
+    Returns a tuple of (x, y, width, height, backend, chosen_index).
+    """
+
+    backend, screens = detect_screens()
+    override = _parse_display_override()
+
+    if override is not None:
+        index = override
+    elif len(screens) > default_index:
+        index = default_index
+    else:
+        index = 0
+
+    index = max(0, min(index, len(screens) - 1))
+    x, y, width, height = screens[index]
+    return x, y, width, height, backend, index
 
 
 class TabletopApp(App):
@@ -42,6 +191,24 @@ class TabletopApp(App):
         self._overlay_process: Optional[OverlayProcess] = None
         self._esc_handler: Optional[Any] = None
         self._preferred_geometry: Optional[Tuple[int, int, int, int]] = None
+        self._preferred_backend: str = "fallback"
+        self._preferred_index: int = 0
+
+    def _ensure_preferred_geometry(self) -> None:
+        if self._preferred_geometry is None:
+            x, y, width, height, backend, index = pick_preferred_geometry()
+            self._preferred_geometry = (x, y, width, height)
+            self._preferred_backend = backend
+            self._preferred_index = index
+            log.info(
+                "Using display %d via %s backend: x=%d y=%d w=%d h=%d",
+                index,
+                backend,
+                x,
+                y,
+                width,
+                height,
+            )
 
     def build(self) -> TabletopRoot:
         """Create the root widget for the Kivy application."""
@@ -51,6 +218,14 @@ class TabletopApp(App):
             if kv_path.exists():
                 Builder.load_file(str(kv_path))
             _KV_LOADED = True
+
+        self._ensure_preferred_geometry()
+        self._apply_preferred_geometry()
+        try:
+            Window.borderless = True
+            Window.fullscreen = False
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.exception("Failed to configure initial window state: %s", exc)
 
         root = TabletopRoot()
 
@@ -91,7 +266,7 @@ class TabletopApp(App):
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
 
-        self._preferred_geometry = _preferred_screen_geometry()
+        self._ensure_preferred_geometry()
 
         def _start_overlay_late(_dt: float) -> None:
             process_handle: Optional[OverlayProcess]
@@ -111,22 +286,21 @@ class TabletopApp(App):
             self._overlay_process = process_handle
             if root is not None:
                 root.overlay_process = process_handle
-            log.info("Overlay started after fullscreen.")
+            log.info("Overlay started after window preparation.")
 
-        def _enter_fullscreen(_dt: float) -> None:
+        def _prepare_window(_dt: float) -> None:
             try:
                 self._apply_preferred_geometry()
                 Window.borderless = True
-                Window.fullscreen = "auto"
-                log.info("Fullscreen engaged (auto).")
+                Window.fullscreen = False
             except Exception as exc:  # pragma: no cover - safety net
-                log.exception("Failed to enter fullscreen: %s", exc)
+                log.exception("Failed to prepare window: %s", exc)
 
             self._bind_esc()
             Clock.schedule_once(_start_overlay_late, 0.25)
 
         self._apply_preferred_geometry()
-        Clock.schedule_once(_enter_fullscreen, 0.0)
+        Clock.schedule_once(_prepare_window, 0.0)
 
     def on_stop(self) -> None:  # pragma: no cover - framework callback
         root = cast(Optional[TabletopRoot], self.root)
@@ -158,7 +332,8 @@ class TabletopApp(App):
     def _apply_preferred_geometry(self) -> None:
         """Position the Kivy window on the preferred display when available."""
 
-        geometry = self._preferred_geometry or _preferred_screen_geometry()
+        self._ensure_preferred_geometry()
+        geometry = self._preferred_geometry
         if geometry is None:
             return
 
@@ -167,44 +342,8 @@ class TabletopApp(App):
             Window.left = x
             Window.top = y
             Window.size = (width, height)
-            log.info(
-                "Window positioned at (%s, %s) with size %sx%s", x, y, width, height
-            )
         except Exception as exc:  # pragma: no cover - defensive logging
             log.exception("Failed to position window on preferred screen: %s", exc)
-
-
-@lru_cache(maxsize=1)
-def _preferred_screen_geometry() -> Optional[Tuple[int, int, int, int]]:
-    """Return geometry for the secondary screen, falling back to primary."""
-
-    app = QGuiApplication.instance()
-    owns_app = False
-    if app is None:
-        app = QGuiApplication([])
-        owns_app = True
-
-    try:
-        screens = list(app.screens())
-        if not screens:
-            return None
-
-        primary = app.primaryScreen()
-        target = None
-        if len(screens) > 1:
-            for screen in screens:
-                if primary is None or screen != primary:
-                    target = screen
-                    break
-
-        if target is None:
-            target = primary or screens[0]
-
-        geometry = target.geometry()
-        return geometry.x(), geometry.y(), geometry.width(), geometry.height()
-    finally:
-        if owns_app:
-            app.quit()
 
 def main() -> None:
     """Run the tabletop Kivy application."""
