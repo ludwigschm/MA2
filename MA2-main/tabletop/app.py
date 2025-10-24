@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional, Sequence, cast
+
+import os
 
 import os
 
 import logging
+from contextlib import suppress
 
 from kivy.app import App
 from kivy.config import Config
@@ -37,21 +40,112 @@ class TabletopApp(App):
     """Main Kivy application that wires the UI with infrastructure services."""
 
     def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
         self._overlay_process: Optional[OverlayProcess] = None
         self._esc_handler: Optional[Any] = None
-        self._target_display_index: int = 0
+        self._bootstrap_screens: list[dict[str, int]] = self._probe_screens_pyqt()
+        self._target_display_index: int = self._determine_display_index(
+            screens=self._bootstrap_screens
+        )
+
+        self._configure_startup_display(self._target_display_index)
+        super().__init__(**kwargs)
 
     @staticmethod
-    def _clamp_display_index(display_index: int) -> int:
-        """Clamp the desired display index to the available displays."""
+    def _describe_window_screens() -> list[dict[str, int]]:
+        """Return available screen geometries from the active Kivy window."""
 
         screens = getattr(Window, "screens", None)
+        described: list[dict[str, int]] = []
         if not screens:
-            return max(0, display_index)
-        return max(0, min(display_index, len(screens) - 1))
+            return described
 
-    def _determine_display_index(self) -> int:
+        for screen in screens:
+            entry = {"left": 0, "top": 0, "width": 0, "height": 0}
+
+            pos = getattr(screen, "pos", None)
+            if pos is not None:
+                with suppress(Exception):
+                    entry["left"], entry["top"] = (int(pos[0]), int(pos[1]))
+            else:
+                entry["left"] = int(getattr(screen, "x", 0))
+                entry["top"] = int(getattr(screen, "y", 0))
+
+            size = getattr(screen, "size", None)
+            if size is not None:
+                with suppress(Exception):
+                    entry["width"], entry["height"] = (
+                        int(size[0]),
+                        int(size[1]),
+                    )
+            else:
+                entry["width"] = int(getattr(screen, "width", Window.width))
+                entry["height"] = int(getattr(screen, "height", Window.height))
+
+            described.append(entry)
+
+        return described
+
+    @staticmethod
+    def _probe_screens_pyqt() -> list[dict[str, int]]:
+        """Probe system displays via PyQt as a fallback during bootstrap."""
+
+        try:
+            from PyQt6.QtGui import QGuiApplication
+        except Exception:  # pragma: no cover - optional dependency
+            return []
+
+        app = QGuiApplication.instance()
+        owns_app = False
+        if app is None:
+            try:
+                app = QGuiApplication([])
+                owns_app = True
+            except Exception:  # pragma: no cover - optional dependency
+                return []
+
+        screens: list[dict[str, int]] = []
+        try:
+            for screen in app.screens():
+                try:
+                    geometry = screen.geometry()
+                except Exception:  # pragma: no cover - defensive fallback
+                    continue
+                screens.append(
+                    {
+                        "left": int(geometry.x()),
+                        "top": int(geometry.y()),
+                        "width": int(geometry.width()),
+                        "height": int(geometry.height()),
+                    }
+                )
+        finally:
+            if owns_app:
+                app.quit()
+
+        return screens
+
+    @staticmethod
+    def _clamp_display_index(
+        display_index: int, *, screens: Optional[Sequence[dict[str, int]]] = None
+    ) -> int:
+        """Clamp the desired display index to the available displays."""
+
+        if display_index < 0:
+            return 0
+
+        if screens is None:
+            screens = TabletopApp._describe_window_screens()
+            if not screens:
+                screens = None
+
+        if screens:
+            return min(display_index, len(screens) - 1)
+
+        return display_index
+
+    def _determine_display_index(
+        self, *, screens: Optional[Sequence[dict[str, int]]] = None
+    ) -> int:
         """Choose the preferred display for the experiment window."""
 
         env_value = os.environ.get("TABLETOP_DISPLAY_INDEX")
@@ -66,25 +160,65 @@ class TabletopApp(App):
                 )
 
         if desired_index is None:
-            screens = getattr(Window, "screens", None)
-            desired_index = 1 if screens and len(screens) >= 2 else 0
+            if screens is None:
+                screens = TabletopApp._describe_window_screens()
+                if not screens:
+                    screens = self._bootstrap_screens
+            count = len(screens) if screens is not None else 0
+            desired_index = 1 if count >= 2 else 0
 
-        return self._clamp_display_index(desired_index)
+        return self._clamp_display_index(desired_index, screens=screens)
 
     def _apply_display_environment(self, display_index: int) -> None:
         """Persist the chosen display index for child processes."""
 
         os.environ["TABLETOP_DISPLAY_INDEX"] = str(display_index)
-        os.environ.setdefault("SDL_VIDEO_FULLSCREEN_DISPLAY", str(display_index))
+        os.environ["SDL_VIDEO_FULLSCREEN_DISPLAY"] = str(display_index)
+
+    def _configure_startup_display(self, display_index: int) -> None:
+        """Prepare environment and Kivy configuration for the selected monitor."""
+
+        self._apply_display_environment(display_index)
+
+        with suppress(Exception):
+            Config.set("graphics", "display", str(display_index))
+
+        target_screen: Optional[dict[str, int]] = None
+        if 0 <= display_index < len(self._bootstrap_screens):
+            target_screen = self._bootstrap_screens[display_index]
+
+        if target_screen:
+            with suppress(Exception):
+                Config.set("graphics", "position", "custom")
+                Config.set("graphics", "left", str(target_screen["left"]))
+                Config.set("graphics", "top", str(target_screen["top"]))
+                Config.set("graphics", "width", str(target_screen["width"]))
+                Config.set("graphics", "height", str(target_screen["height"]))
+            log.info(
+                "Bootstrap configured for display %s at (%s, %s) size (%s x %s)",
+                display_index,
+                target_screen["left"],
+                target_screen["top"],
+                target_screen["width"],
+                target_screen["height"],
+            )
+
+        with suppress(Exception):
+            Config.write()
 
     def _move_window_to_display(self, display_index: int) -> int:
         """Attempt to position the window on the requested display."""
 
-        screens = getattr(Window, "screens", None)
+        screens = TabletopApp._describe_window_screens()
+        if screens:
+            self._bootstrap_screens = list(screens)
+        else:
+            screens = self._bootstrap_screens
+
         if not screens:
             return display_index
 
-        clamped = self._clamp_display_index(display_index)
+        clamped = self._clamp_display_index(display_index, screens=screens)
         try:
             target = screens[clamped]
         except Exception:  # pragma: no cover - defensive fallback
@@ -92,20 +226,13 @@ class TabletopApp(App):
             return clamped
 
         try:
-            pos = getattr(target, "pos", None)
-            if pos is not None:
-                left, top = map(int, pos)
-            else:
-                left = int(getattr(target, "x", getattr(Window, "left", 0)))
-                top = int(getattr(target, "y", getattr(Window, "top", 0)))
+            left = int(target.get("left", getattr(Window, "left", 0)))
+            top = int(target.get("top", getattr(Window, "top", 0)))
+            width = int(target.get("width", Window.width))
+            height = int(target.get("height", Window.height))
 
-            size = getattr(target, "size", None)
-            if size is not None:
-                width, height = map(int, size)
-            else:
-                width = int(getattr(target, "width", Window.width))
-                height = int(getattr(target, "height", Window.height))
-
+            with suppress(Exception):
+                Window.position = "custom"
             Window.left = left
             Window.top = top
             Window.size = (width, height)
