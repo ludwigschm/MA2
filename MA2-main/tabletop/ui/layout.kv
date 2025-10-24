@@ -31,7 +31,7 @@
         source_down: ASSETS['play']['live']
         size_hint: None, None
         size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
-        pos: root.width - root.horizontal_margin_px - self.width - 120 * root.scale, 220 * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 120 * root.scale, 300 * root.scale
 
     IconButton:
         id: btn_start_p2
@@ -39,25 +39,25 @@
         source_down: ASSETS['play']['live']
         size_hint: None, None
         size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
-        pos: root.horizontal_margin_px + 120 * root.scale, root.height - 220 * root.scale - self.height
+        pos: root.horizontal_margin_px + 120 * root.scale, root.height - 300 * root.scale - self.height
 
     CardWidget:
         id: p1_outer
         size_hint: None, None
         size: 336 * root.scale, 512 * root.scale
-        pos: root.horizontal_margin_px + 100 * root.scale, 220 * root.scale
+        pos: root.horizontal_margin_px + 100 * root.scale, 300 * root.scale
 
     CardWidget:
         id: p1_inner
         size_hint: None, None
         size: 336 * root.scale, 512 * root.scale
-        pos: root.ids.p1_outer.right + 70 * root.scale, 220 * root.scale
+        pos: root.ids.p1_outer.right + 70 * root.scale, 300 * root.scale
 
     CardWidget:
         id: p2_outer
         size_hint: None, None
         size: 336 * root.scale, 512 * root.scale
-        pos: root.width - root.horizontal_margin_px - self.width - 100 * root.scale, root.height - 220 * root.scale - self.height
+        pos: root.width - root.horizontal_margin_px - self.width - 100 * root.scale, root.height - 300 * root.scale - self.height
 
     CardWidget:
         id: p2_inner
