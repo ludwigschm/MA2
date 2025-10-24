@@ -263,22 +263,44 @@ def main():
     layout = MARKER_LAYOUT
 
     overlays: List[MarkerOverlay] = []
-    screens = app.screens()
-    if not screens:
-        geom = QRect(100, 100, 1280, 720)
-        win = MarkerOverlay(geom, layout=layout)
+    geometry = _preferred_screen_geometry(app)
+    if geometry is None:
+        geometry = QRect(100, 100, 1280, 720)
+        print("Keine Bildschirminformation gefunden, verwende Fallback-Geometrie.")
+        win = MarkerOverlay(geometry, layout=layout)
         win.show()
-        overlays.append(win)
     else:
-        for s in screens:
-            geom = s.geometry()
-            # Alternativ kompatibel:
-            # win = MarkerOverlay(geom, marker_ids=[1,7,23,37,55,71,89,101])
-            win = MarkerOverlay(geom, layout=layout)
-            win.showFullScreen()
-            overlays.append(win)
+        print(
+            "Starte Overlay auf Bildschirm bei"
+            f" ({geometry.x()}, {geometry.y()}) mit Größe {geometry.width()}x{geometry.height()}"
+        )
+        win = MarkerOverlay(geometry, layout=layout)
+        win.showFullScreen()
+    overlays.append(win)
 
     sys.exit(app.exec())
+
+
+def _preferred_screen_geometry(app: QApplication) -> Optional[QRect]:
+    """Select the secondary screen when present, else fall back to primary."""
+
+    screens = list(app.screens())
+    if not screens:
+        return None
+
+    primary = app.primaryScreen()
+    target = None
+    if len(screens) > 1:
+        for screen in screens:
+            if primary is None or screen != primary:
+                target = screen
+                break
+
+    if target is None:
+        target = primary or screens[0]
+
+    return target.geometry()
+
 
 if __name__ == "__main__":
     main()
