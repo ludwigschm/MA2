@@ -13,13 +13,20 @@
 #   -   -> Marker um -5% kleiner (nur wenn USE_FIXED_SIZE=False)
 #   Esc -> Programm beenden
 
-import sys, os, json
-from typing import List, Dict, Tuple, Optional
+import argparse
+import json
+import os
+import sys
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
-from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QGuiApplication
+from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
 from PyQt6.QtCore import Qt, QRect
 import cv2
 import numpy as np
+
+if TYPE_CHECKING:
+    from PyQt6.QtGui import QScreen
 
 # -------------------- EMPFOHLENE IDs & Positionen ----------------------------
 # Robuste, weit auseinanderliegende AprilTag-IDs (tag36h11)
@@ -49,46 +56,66 @@ LABEL_CSS   = "background: transparent; color: black; font: 12pt 'Segoe UI';"
 
 # Markergröße: entweder FIX (deterministisch) ODER prozentual
 USE_FIXED_SIZE = True
-TARGET_CM      = 6.0
-FIXED_SIZE_PX  = 240                              # wird dynamisch angepasst (~6 cm @ ~100 PPI)
-SIZE_PERCENT   = 0.16                              # falls USE_FIXED_SIZE=False
-MIN_SIZE_PX    = 160
-MAX_SIZE_PX    = 560
-
-_FIXED_SIZE_INITIALIZED = False
+TARGET_CM = 6.0
+FALLBACK_SIZE_PX = 240                              # ≈6 cm @ ~100 PPI (43" 4K Referenz)
+SIZE_PERCENT = 0.16                                # falls USE_FIXED_SIZE=False
+MIN_SIZE_PX = 160
+MAX_SIZE_PX = 560
 
 
-def _initialize_fixed_size() -> None:
-    """Compute the fixed marker size in pixels based on primary screen metrics."""
-    global FIXED_SIZE_PX, _FIXED_SIZE_INITIALIZED
+def _calculate_fixed_size(screen: Optional["QScreen"]) -> int:
+    """Return the fixed marker size in pixels for the given screen."""
 
-    if _FIXED_SIZE_INITIALIZED:
-        return
-
-    screen = QGuiApplication.primaryScreen()
-    fallback_reason = "no primary screen"
-    ppi = None
+    ppi: Optional[float] = None
+    fallback_reason = "no screen information"
 
     if screen is not None:
-        p_width_px = screen.geometry().width()
-        p_width_mm = screen.physicalSize().width()
-        fallback_reason = "physical size unavailable"
+        for attr in (
+            "physicalDotsPerInch",
+            "physicalDotsPerInchX",
+            "logicalDotsPerInch",
+        ):
+            getter = getattr(screen, attr, None)
+            if callable(getter):
+                try:
+                    value = float(getter())
+                except Exception:
+                    continue
+                if value > 0:
+                    ppi = value
+                    break
 
-        if p_width_mm > 0:
-            ppi = p_width_px / (p_width_mm / 25.4)
-            FIXED_SIZE_PX = int(round(ppi * (TARGET_CM / 2.54)))
+        if ppi is None:
+            try:
+                geom = screen.geometry()
+                physical = screen.physicalSize()
+                width_accessor = getattr(physical, "width", None)
+                if callable(width_accessor):
+                    width_mm = float(width_accessor())
+                elif width_accessor is not None:
+                    width_mm = float(width_accessor)
+                else:
+                    width_mm = 0.0
 
-    if ppi is not None:
+                if width_mm > 0:
+                    ppi = geom.width() / (width_mm / 25.4)
+                else:
+                    fallback_reason = "physical width unavailable"
+            except Exception:
+                fallback_reason = "screen geometry unavailable"
+
+    if ppi and ppi > 0:
+        size_px = int(round(ppi * (TARGET_CM / 2.54)))
         print(
-            f"ArUco overlay: primary screen ≈ {ppi:.1f} PPI, target size {FIXED_SIZE_PX}px for {TARGET_CM:.1f} cm"
+            f"ArUco overlay: target screen ≈ {ppi:.1f} PPI, target size {size_px}px for {TARGET_CM:.1f} cm"
         )
-    else:
-        print(
-            "ArUco overlay: PPI unavailable"
-            f" ({fallback_reason}), using fallback size {FIXED_SIZE_PX}px (~{TARGET_CM:.1f} cm)"
-        )
+        return size_px
 
-    _FIXED_SIZE_INITIALIZED = True
+    print(
+        "ArUco overlay: PPI unavailable"
+        f" ({fallback_reason}), using fallback size {FALLBACK_SIZE_PX}px (~{TARGET_CM:.1f} cm)"
+    )
+    return int(FALLBACK_SIZE_PX)
 
 # -------------------- TAG-RENDERING ------------------------------------------
 def generate_apriltag_qpixmap(tag_id: int, size: int, quiet_zone_ratio: float = QUIET_ZONE_RATIO) -> QPixmap:
@@ -117,6 +144,8 @@ class MarkerOverlay(QMainWindow):
         screen_geometry: QRect,
         layout: Optional[Dict[str, int]] = None,
         marker_ids: Optional[List[int]] = None,   # Abwärtskompatibel
+        *,
+        screen: Optional["QScreen"] = None,
     ):
         """
         Entweder 'layout' übergeben (empfohlen) ODER 'marker_ids' (werden in POSITION_ORDER gemappt).
@@ -130,8 +159,7 @@ class MarkerOverlay(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(BG_WHITE_CSS)
         self.setGeometry(screen_geometry)
-
-        _initialize_fixed_size()
+        self._target_screen = screen
 
         # --- Eingabe normalisieren ---
         if layout is not None:
@@ -154,7 +182,7 @@ class MarkerOverlay(QMainWindow):
         self.min_size = MIN_SIZE_PX
         self.max_size = MAX_SIZE_PX
         self.use_fixed = USE_FIXED_SIZE
-        self.fixed_size = FIXED_SIZE_PX
+        self.fixed_size = _calculate_fixed_size(screen)
 
         # UI-Objekte
         for _ in self.pos_order:
@@ -256,27 +284,69 @@ class MarkerOverlay(QMainWindow):
         # WICHTIG: keine Textlabels setzen/anzeigen -> keine weiße Fläche unterhalb
 
 # -------------------- STANDALONE-TEST ----------------------------------------
-def main():
-    app = QApplication(sys.argv)
+def _parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Start the ArUco marker overlay")
+    parser.add_argument(
+        "--display",
+        type=int,
+        default=None,
+        help="Zero-based display index that should present the overlay.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    args = _parse_cli_args(argv)
+    app = QApplication([sys.argv[0]])
 
     # Standard: 8 Marker aus MARKER_LAYOUT
     layout = MARKER_LAYOUT
 
     overlays: List[MarkerOverlay] = []
     screens = app.screens()
+    env_display = os.environ.get("TABLETOP_DISPLAY_INDEX")
+    env_display_index: Optional[int] = None
+    if env_display is not None:
+        try:
+            env_display_index = int(env_display)
+        except ValueError:
+            print(f"Warnung: Ungültiger TABLETOP_DISPLAY_INDEX={env_display!r}, ignoriere Wert")
+
+    target_display: Optional[int] = args.display if args.display is not None else env_display_index
+
     if not screens:
         geom = QRect(100, 100, 1280, 720)
         win = MarkerOverlay(geom, layout=layout)
         win.show()
         overlays.append(win)
     else:
-        for s in screens:
-            geom = s.geometry()
-            # Alternativ kompatibel:
-            # win = MarkerOverlay(geom, marker_ids=[1,7,23,37,55,71,89,101])
-            win = MarkerOverlay(geom, layout=layout)
-            win.showFullScreen()
-            overlays.append(win)
+        default_display = 1 if len(screens) >= 2 else 0
+        if target_display is None:
+            target_display = default_display
+        target_display = max(0, min(target_display, len(screens) - 1))
+
+        screen = screens[target_display]
+        geom = screen.geometry()
+        win = MarkerOverlay(geom, layout=layout, screen=screen)
+        screen_name_attr = getattr(screen, "name", None)
+        if callable(screen_name_attr):
+            try:
+                screen_name = screen_name_attr()
+            except Exception:
+                screen_name = None
+        else:
+            screen_name = screen_name_attr
+
+        if screen_name:
+            print(f"ArUco overlay: using screen '{screen_name}' (index {target_display})")
+        else:
+            print(f"ArUco overlay: using display index {target_display}")
+
+        win.showFullScreen()
+        overlays.append(win)
 
     sys.exit(app.exec())
 
