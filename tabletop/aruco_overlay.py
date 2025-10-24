@@ -25,7 +25,7 @@ from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QImage, QKeyEvent, QPixmap
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
 
-from tabletop.utils.phys_units import mm_to_px
+from .utils.phys_units import mm_to_px
 
 # -------------------- EMPFOHLENE IDs & Positionen ----------------------------
 # Robuste, weit auseinanderliegende AprilTag-IDs (tag36h11)
