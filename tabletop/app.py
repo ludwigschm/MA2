@@ -24,6 +24,7 @@ from tabletop.overlay.process import (
     start_overlay,
     stop_overlay,
 )
+from tabletop.screeninfo import capture_screen_info, preferred_screen_info
 from tabletop.tabletop_view import TabletopRoot
 
 log = logging.getLogger(__name__)
@@ -86,6 +87,25 @@ class TabletopApp(App):
     def on_start(self) -> None:  # pragma: no cover - framework callback
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
+
+        screen_infos = capture_screen_info()
+        target_screen = preferred_screen_info(screen_infos)
+
+        if target_screen is not None:
+            try:
+                Window.left = target_screen.x
+                Window.top = target_screen.y
+                Window.size = (target_screen.width, target_screen.height)
+                log.info(
+                    "Window moved to screen index %s at (%s, %s) with size %sx%s",
+                    target_screen.index,
+                    target_screen.x,
+                    target_screen.y,
+                    target_screen.width,
+                    target_screen.height,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log.exception("Failed to move window to preferred screen: %s", exc)
 
         def _start_overlay_late(_dt: float) -> None:
             process_handle: Optional[OverlayProcess]
