@@ -54,6 +54,7 @@ class TabletopState:
     p2_pressed: bool = False
     in_block_pause: bool = False
     pause_message: str = ""
+    post_fixation_start_required: bool = False
 
 
 @dataclass
@@ -84,6 +85,7 @@ class ContinueResult:
     intro_deactivated: bool = False
     requires_fixation: bool = False
     phase: Optional[UXPhase] = None
+    await_second_start: bool = False
 
 
 @dataclass
@@ -95,6 +97,7 @@ class PrepareNextRoundResult:
     requires_fixation: bool
     session_finished: bool
     start_phase: Optional[UXPhase]
+    await_second_start: bool = False
 
 
 @dataclass
@@ -296,6 +299,7 @@ class TabletopController:
             "judge_choice": None,
             "payout": state.current_round_has_stake,
         }
+        state.post_fixation_start_required = False
         if plan_info and state.round_in_block == 1:
             state.fixation_required = True
         elif plan_info:
@@ -348,12 +352,24 @@ class TabletopController:
         start_phase = self.phase_for_player(state.first_player or 1, "inner")
         if start_phase is None:
             start_phase = UXPhase.P1_INNER
-        state.phase = start_phase
+        requires_fixation = bool(state.fixation_required)
+        await_second_start = False
+        if state.post_fixation_start_required:
+            state.post_fixation_start_required = False
+            state.phase = start_phase
+        elif state.fixation_required:
+            state.fixation_required = False
+            state.post_fixation_start_required = True
+            await_second_start = True
+            state.phase = UXPhase.WAIT_BOTH_START
+        else:
+            state.phase = start_phase
         return ContinueResult(
             blocked=False,
             intro_deactivated=intro_deactivated,
-            requires_fixation=bool(state.fixation_required),
-            phase=start_phase,
+            requires_fixation=requires_fixation,
+            phase=state.phase,
+            await_second_start=await_second_start,
         )
 
     def prepare_next_round(
@@ -370,12 +386,19 @@ class TabletopController:
             start_phase = self.phase_for_player(state.first_player or 1, "inner")
             if start_phase is None:
                 start_phase = UXPhase.P1_INNER
+        requires_fixation = bool(state.fixation_required)
+        await_second_start = False
+        if start_immediately and requires_fixation:
+            state.fixation_required = False
+            state.post_fixation_start_required = True
+            await_second_start = True
         return PrepareNextRoundResult(
             setup=setup,
             in_block_pause=state.in_block_pause,
-            requires_fixation=bool(state.fixation_required),
+            requires_fixation=requires_fixation,
             session_finished=state.session_finished,
             start_phase=start_phase,
+            await_second_start=await_second_start,
         )
 
     def tap_card(self, player: int, which: str) -> CardTapResult:

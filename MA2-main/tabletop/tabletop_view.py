@@ -590,6 +590,9 @@ class TabletopRoot(FloatLayout):
             self.update_intro_overlay()
 
         def proceed():
+            if result.await_second_start:
+                self.apply_phase()
+                return
             self.log_round_start_if_pending()
             self.apply_phase()
 
@@ -714,16 +717,22 @@ class TabletopRoot(FloatLayout):
         if result.in_block_pause:
             return
 
-        def proceed():
+        def start_round():
             if result.start_phase:
                 self.phase = result.start_phase
             self.log_round_start_if_pending()
             self.apply_phase()
 
+        def after_fixation():
+            if result.await_second_start:
+                self.apply_phase()
+            else:
+                start_round()
+
         if result.requires_fixation and not self.fixation_running:
-            self.run_fixation_sequence(proceed)
+            self.run_fixation_sequence(after_fixation)
         elif start_immediately:
-            proceed()
+            start_round()
 
     def setup_round(self):
         result = self.controller.setup_round()
