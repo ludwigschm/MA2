@@ -31,7 +31,7 @@
         source_down: ASSETS['play']['live']
         size_hint: None, None
         size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
-        pos: root.width - root.horizontal_margin_px - self.width, 180 * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 120 * root.scale, 220 * root.scale
 
     IconButton:
         id: btn_start_p2
@@ -39,30 +39,30 @@
         source_down: ASSETS['play']['live']
         size_hint: None, None
         size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
-        pos: root.horizontal_margin_px, root.height - 180 * root.scale - self.height
+        pos: root.horizontal_margin_px + 120 * root.scale, root.height - 220 * root.scale - self.height
 
     CardWidget:
         id: p1_outer
         size_hint: None, None
-        size: 420 * root.scale, 640 * root.scale
-        pos: root.horizontal_margin_px, 180 * root.scale
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.horizontal_margin_px + 100 * root.scale, 220 * root.scale
 
     CardWidget:
         id: p1_inner
         size_hint: None, None
-        size: 420 * root.scale, 640 * root.scale
-        pos: root.ids.p1_outer.right + 70 * root.scale, 180 * root.scale
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.ids.p1_outer.right + 70 * root.scale, 220 * root.scale
 
     CardWidget:
         id: p2_outer
         size_hint: None, None
-        size: 420 * root.scale, 640 * root.scale
-        pos: root.width - root.horizontal_margin_px - self.width, root.height - 180 * root.scale - self.height
+        size: 336 * root.scale, 512 * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 100 * root.scale, root.height - 220 * root.scale - self.height
 
     CardWidget:
         id: p2_inner
         size_hint: None, None
-        size: 420 * root.scale, 640 * root.scale
+        size: 336 * root.scale, 512 * root.scale
         pos: root.ids.p2_outer.x - self.width - 70 * root.scale, root.ids.p2_outer.y
 
     IconButton:
@@ -180,7 +180,7 @@
         pos: root.width / 2 - 380 * root.scale - 45 * root.scale, root.height / 2 - 560 * root.scale - 30 * root.scale - 40 * root.scale - self.height
         text_size: self.width - 2 * 60 * root.scale, self.height - 2 * 40 * root.scale
         padding: 60 * root.scale, 40 * root.scale
-        font_size: 32 * root.scale if root.scale else 32
+        font_size: 38.4 * root.scale if root.scale else 38.4
         halign: 'left'
         valign: 'top'
         color: 1, 1, 1, 1
@@ -193,7 +193,7 @@
         pos: root.width / 2 - 380 * root.scale - 45 * root.scale, root.height / 2 + 560 * root.scale + 30 * root.scale + 40 * root.scale
         text_size: self.width - 2 * 60 * root.scale, self.height - 2 * 40 * root.scale
         padding: 60 * root.scale, 40 * root.scale
-        font_size: 32 * root.scale if root.scale else 32
+        font_size: 38.4 * root.scale if root.scale else 38.4
         halign: 'left'
         valign: 'top'
         color: 1, 1, 1, 1
