@@ -200,6 +200,7 @@ class TabletopApp(App):
             self._preferred_geometry = (x, y, width, height)
             self._preferred_backend = backend
             self._preferred_index = index
+            os.environ["TABLETOP_EFFECTIVE_DISPLAY_INDEX"] = str(index)
             log.info(
                 "Using display %d via %s backend: x=%d y=%d w=%d h=%d",
                 index,
