@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional, cast
 
+import os
+
 import logging
 
 from kivy.app import App
@@ -38,6 +40,87 @@ class TabletopApp(App):
         super().__init__(**kwargs)
         self._overlay_process: Optional[OverlayProcess] = None
         self._esc_handler: Optional[Any] = None
+        self._target_display_index: int = 0
+
+    @staticmethod
+    def _clamp_display_index(display_index: int) -> int:
+        """Clamp the desired display index to the available displays."""
+
+        screens = getattr(Window, "screens", None)
+        if not screens:
+            return max(0, display_index)
+        return max(0, min(display_index, len(screens) - 1))
+
+    def _determine_display_index(self) -> int:
+        """Choose the preferred display for the experiment window."""
+
+        env_value = os.environ.get("TABLETOP_DISPLAY_INDEX")
+        desired_index: Optional[int] = None
+
+        if env_value is not None:
+            try:
+                desired_index = int(env_value)
+            except ValueError:
+                log.warning(
+                    "Ignoring invalid TABLETOP_DISPLAY_INDEX=%r", env_value
+                )
+
+        if desired_index is None:
+            screens = getattr(Window, "screens", None)
+            desired_index = 1 if screens and len(screens) >= 2 else 0
+
+        return self._clamp_display_index(desired_index)
+
+    def _apply_display_environment(self, display_index: int) -> None:
+        """Persist the chosen display index for child processes."""
+
+        os.environ["TABLETOP_DISPLAY_INDEX"] = str(display_index)
+        os.environ.setdefault("SDL_VIDEO_FULLSCREEN_DISPLAY", str(display_index))
+
+    def _move_window_to_display(self, display_index: int) -> int:
+        """Attempt to position the window on the requested display."""
+
+        screens = getattr(Window, "screens", None)
+        if not screens:
+            return display_index
+
+        clamped = self._clamp_display_index(display_index)
+        try:
+            target = screens[clamped]
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("Failed to access display information for index %s", clamped)
+            return clamped
+
+        try:
+            pos = getattr(target, "pos", None)
+            if pos is not None:
+                left, top = map(int, pos)
+            else:
+                left = int(getattr(target, "x", getattr(Window, "left", 0)))
+                top = int(getattr(target, "y", getattr(Window, "top", 0)))
+
+            size = getattr(target, "size", None)
+            if size is not None:
+                width, height = map(int, size)
+            else:
+                width = int(getattr(target, "width", Window.width))
+                height = int(getattr(target, "height", Window.height))
+
+            Window.left = left
+            Window.top = top
+            Window.size = (width, height)
+            log.info(
+                "Window moved to display %s at (%s, %s) size (%s x %s)",
+                clamped,
+                left,
+                top,
+                width,
+                height,
+            )
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("Failed to reposition window for display %s", clamped)
+
+        return clamped
 
     def build(self) -> TabletopRoot:
         """Create the root widget for the Kivy application."""
@@ -87,6 +170,14 @@ class TabletopApp(App):
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
 
+        self._target_display_index = self._determine_display_index()
+        self._apply_display_environment(self._target_display_index)
+        if root is not None:
+            try:
+                root.overlay_display_index = self._target_display_index
+            except AttributeError:
+                pass
+
         def _start_overlay_late(_dt: float) -> None:
             process_handle: Optional[OverlayProcess]
             if root and getattr(root, "overlay_process", None):
@@ -96,7 +187,9 @@ class TabletopApp(App):
 
             try:
                 process_handle = start_overlay(
-                    process_handle, overlay_path=ARUCO_OVERLAY_PATH
+                    process_handle,
+                    overlay_path=ARUCO_OVERLAY_PATH,
+                    display_index=self._target_display_index,
                 )
             except Exception as exc:  # pragma: no cover - safety net
                 log.exception("Overlay start failed: %s", exc)
@@ -109,6 +202,14 @@ class TabletopApp(App):
 
         def _enter_fullscreen(_dt: float) -> None:
             try:
+                self._target_display_index = self._move_window_to_display(
+                    self._target_display_index
+                )
+                if root is not None:
+                    try:
+                        root.overlay_display_index = self._target_display_index
+                    except AttributeError:
+                        pass
                 Window.borderless = True
                 Window.fullscreen = "auto"
                 log.info("Fullscreen engaged (auto).")
