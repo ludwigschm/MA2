@@ -16,10 +16,12 @@
 import sys, os, json
 from typing import List, Dict, Tuple, Optional
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
-from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QGuiApplication
+from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
 from PyQt6.QtCore import Qt, QRect
 import cv2
 import numpy as np
+
+from tabletop.screeninfo import ScreenInfo, capture_screen_info, preferred_screen_info
 
 # -------------------- EMPFOHLENE IDs & Positionen ----------------------------
 # Robuste, weit auseinanderliegende AprilTag-IDs (tag36h11)
@@ -50,45 +52,37 @@ LABEL_CSS   = "background: transparent; color: black; font: 12pt 'Segoe UI';"
 # Markergröße: entweder FIX (deterministisch) ODER prozentual
 USE_FIXED_SIZE = True
 TARGET_CM      = 6.0
-FIXED_SIZE_PX  = 240                              # wird dynamisch angepasst (~6 cm @ ~100 PPI)
+DEFAULT_FIXED_SIZE_PX = 240                       # wird dynamisch angepasst (~6 cm @ ~100 PPI)
 SIZE_PERCENT   = 0.16                              # falls USE_FIXED_SIZE=False
 MIN_SIZE_PX    = 160
 MAX_SIZE_PX    = 560
 
-_FIXED_SIZE_INITIALIZED = False
 
+def _compute_fixed_marker_size(screen_info: Optional[ScreenInfo]) -> int:
+    """Return the marker size in pixels for the supplied screen."""
 
-def _initialize_fixed_size() -> None:
-    """Compute the fixed marker size in pixels based on primary screen metrics."""
-    global FIXED_SIZE_PX, _FIXED_SIZE_INITIALIZED
-
-    if _FIXED_SIZE_INITIALIZED:
-        return
-
-    screen = QGuiApplication.primaryScreen()
-    fallback_reason = "no primary screen"
+    fallback_reason = "no screen information"
+    fixed_size_px = DEFAULT_FIXED_SIZE_PX
     ppi = None
 
-    if screen is not None:
-        p_width_px = screen.geometry().width()
-        p_width_mm = screen.physicalSize().width()
-        fallback_reason = "physical size unavailable"
-
-        if p_width_mm > 0:
-            ppi = p_width_px / (p_width_mm / 25.4)
-            FIXED_SIZE_PX = int(round(ppi * (TARGET_CM / 2.54)))
+    if screen_info is not None:
+        ppi = screen_info.horizontal_ppi
+        if ppi is None:
+            fallback_reason = "physical width unavailable"
+        else:
+            fixed_size_px = int(round(ppi * (TARGET_CM / 2.54)))
 
     if ppi is not None:
         print(
-            f"ArUco overlay: primary screen ≈ {ppi:.1f} PPI, target size {FIXED_SIZE_PX}px for {TARGET_CM:.1f} cm"
+            f"ArUco overlay: screen #{screen_info.index} ≈ {ppi:.1f} PPI, target size {fixed_size_px}px for {TARGET_CM:.1f} cm"
         )
     else:
         print(
             "ArUco overlay: PPI unavailable"
-            f" ({fallback_reason}), using fallback size {FIXED_SIZE_PX}px (~{TARGET_CM:.1f} cm)"
+            f" ({fallback_reason}), using fallback size {fixed_size_px}px (~{TARGET_CM:.1f} cm)"
         )
 
-    _FIXED_SIZE_INITIALIZED = True
+    return fixed_size_px
 
 # -------------------- TAG-RENDERING ------------------------------------------
 def generate_apriltag_qpixmap(tag_id: int, size: int, quiet_zone_ratio: float = QUIET_ZONE_RATIO) -> QPixmap:
@@ -117,6 +111,7 @@ class MarkerOverlay(QMainWindow):
         screen_geometry: QRect,
         layout: Optional[Dict[str, int]] = None,
         marker_ids: Optional[List[int]] = None,   # Abwärtskompatibel
+        screen_info: Optional[ScreenInfo] = None,
     ):
         """
         Entweder 'layout' übergeben (empfohlen) ODER 'marker_ids' (werden in POSITION_ORDER gemappt).
@@ -130,8 +125,6 @@ class MarkerOverlay(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(BG_WHITE_CSS)
         self.setGeometry(screen_geometry)
-
-        _initialize_fixed_size()
 
         # --- Eingabe normalisieren ---
         if layout is not None:
@@ -154,7 +147,7 @@ class MarkerOverlay(QMainWindow):
         self.min_size = MIN_SIZE_PX
         self.max_size = MAX_SIZE_PX
         self.use_fixed = USE_FIXED_SIZE
-        self.fixed_size = FIXED_SIZE_PX
+        self.fixed_size = _compute_fixed_marker_size(screen_info)
 
         # UI-Objekte
         for _ in self.pos_order:
@@ -263,20 +256,26 @@ def main():
     layout = MARKER_LAYOUT
 
     overlays: List[MarkerOverlay] = []
-    screens = app.screens()
-    if not screens:
+    screen_infos = capture_screen_info(app)
+    target_info = preferred_screen_info(screen_infos)
+
+    if target_info is None:
         geom = QRect(100, 100, 1280, 720)
         win = MarkerOverlay(geom, layout=layout)
         win.show()
         overlays.append(win)
     else:
-        for s in screens:
-            geom = s.geometry()
-            # Alternativ kompatibel:
-            # win = MarkerOverlay(geom, marker_ids=[1,7,23,37,55,71,89,101])
-            win = MarkerOverlay(geom, layout=layout)
-            win.showFullScreen()
-            overlays.append(win)
+        screens = app.screens()
+        if 0 <= target_info.index < len(screens):
+            geom = screens[target_info.index].geometry()
+        elif screens:
+            geom = screens[0].geometry()
+        else:
+            geom = QRect(target_info.x, target_info.y, target_info.width, target_info.height)
+
+        win = MarkerOverlay(geom, layout=layout, screen_info=target_info)
+        win.showFullScreen()
+        overlays.append(win)
 
     sys.exit(app.exec())
 
