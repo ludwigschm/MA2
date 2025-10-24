@@ -6,6 +6,22 @@ from pathlib import Path
 from typing import Any, Optional, cast
 
 import logging
+import os
+
+try:
+    # Wenn es mindestens 2 Displays gibt, wähle Display-Index 1 (zweiter Bildschirm)
+    import ctypes  # noqa: F401  # nur geladen, um Import-Fehler früh zu erkennen
+    from kivy.core.window import Window  # nur für Typen; Zugriff erfolgt später
+    import sdl2
+
+    num_disp = sdl2.SDL_GetNumVideoDisplays()
+    if num_disp is not None and num_disp >= 2:
+        os.environ["SDL_VIDEO_FULLSCREEN_DISPLAY"] = "1"  # 0-basiert
+    else:
+        os.environ.pop("SDL_VIDEO_FULLSCREEN_DISPLAY", None)
+except Exception:
+    # Fallback: versuche trotzdem Monitor 2 zu bevorzugen
+    os.environ.setdefault("SDL_VIDEO_FULLSCREEN_DISPLAY", "1")
 
 from kivy.app import App
 from kivy.config import Config

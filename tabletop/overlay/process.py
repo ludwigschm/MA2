@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -43,7 +44,9 @@ def start_overlay(
         return None
 
     try:
-        return subprocess.Popen([sys.executable, str(path)])
+        env = os.environ.copy()
+        env.setdefault("SDL_VIDEO_FULLSCREEN_DISPLAY", "1")
+        return subprocess.Popen([sys.executable, str(path)], env=env)
     except Exception as exc:  # pragma: no cover - defensive logging
         print(f"Warnung: Overlay konnte nicht gestartet werden: {exc}")
         return None
