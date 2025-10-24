@@ -73,6 +73,8 @@ from tabletop.overlay.process import (
 )
 from tabletop.tabletop_view import TabletopRoot
 
+from PyQt6.QtGui import QGuiApplication
+
 log = logging.getLogger(__name__)
 
 _KV_LOADED = False
