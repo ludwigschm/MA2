@@ -2,9 +2,11 @@
 #   pip install pyqt6 opencv-contrib-python
 #
 # Nutzung (kompatibel zu deinem Game):
-#   # Alte Art (unbedingt 8 IDs übergeben, sonst werden nur die ersten Positionen belegt):
-#   MarkerOverlay(geo, marker_ids=[1,7,23,37,55,71,89,101])
-#   # Empfohlen (feste Zuordnung):
+#   # Alte Art (unbedingt 12 IDs übergeben, sonst werden nur die ersten Positionen belegt):
+#   MarkerOverlay(geo, marker_ids=[
+#       1, 55, 71, 7, 23, 89, 101, 37, 117, 133, 147, 163
+#   ])
+#   # Empfohlen (feste Zuordnung, siehe MARKER_LAYOUT):
 #   MarkerOverlay(geo, layout=MARKER_LAYOUT)
 #
 # Tasten im Overlay:
@@ -31,19 +33,24 @@ if TYPE_CHECKING:
 # -------------------- EMPFOHLENE IDs & Positionen ----------------------------
 # Robuste, weit auseinanderliegende AprilTag-IDs (tag36h11)
 MARKER_LAYOUT: Dict[str, int] = {
-    "top_left":     1,
-    "top_right":    7,
-    "bottom_left":  23,
-    "bottom_right": 37,
-    "top_mid":      55,
-    "bottom_mid":   71,
-    "left_mid":     89,
-    "right_mid":    101,
+    "top_left":            1,
+    "top_inner_left":      55,
+    "top_inner_right":     71,
+    "top_right":           7,
+    "bottom_left":         23,
+    "bottom_inner_left":   89,
+    "bottom_inner_right":  101,
+    "bottom_right":        37,
+    "left_inner_top":      117,
+    "left_inner_bottom":   133,
+    "right_inner_top":     147,
+    "right_inner_bottom":  163,
 }
 # Reihenfolge der Platzierung (und Mapping-Reihenfolge für marker_ids)
 POSITION_ORDER: List[str] = [
-    "top_left", "top_right", "bottom_left", "bottom_right",
-    "top_mid", "bottom_mid", "left_mid", "right_mid",
+    "top_left", "top_inner_left", "top_inner_right", "top_right",
+    "bottom_left", "bottom_inner_left", "bottom_inner_right", "bottom_right",
+    "left_inner_top", "left_inner_bottom", "right_inner_top", "right_inner_bottom",
 ]
 
 # -------------------- RENDER-PARAMETER ---------------------------------------
@@ -168,7 +175,7 @@ class MarkerOverlay(QMainWindow):
             n = min(len(marker_ids), len(POSITION_ORDER))
             self.layout = {POSITION_ORDER[i]: int(marker_ids[i]) for i in range(n)}
         else:
-            # Default: alle 8 empfohlenen Marker
+            # Default: alle 12 empfohlenen Marker
             self.layout = {name: MARKER_LAYOUT[name] for name in POSITION_ORDER}
 
         self.pos_order: List[str] = [name for name in POSITION_ORDER if name in self.layout]
@@ -214,17 +221,43 @@ class MarkerOverlay(QMainWindow):
 
     @staticmethod
     def _positions_full(w: int, h: int, msize: int, margin: int) -> Dict[str, Tuple[int, int]]:
-        # Ecken + Kantenmitten
-        return {
-            "top_left":     (margin, margin),
-            "top_right":    (w - margin - msize, margin),
-            "bottom_left":  (margin, h - margin - msize),
-            "bottom_right": (w - margin - msize, h - margin - msize),
-            "top_mid":      (w // 2 - msize // 2, margin),
-            "bottom_mid":   (w // 2 - msize // 2, h - margin - msize),
-            "left_mid":     (margin, h // 2 - msize // 2),
-            "right_mid":    (w - margin - msize, h // 2 - msize // 2),
-        }
+        """Return pixel positions for all supported marker locations."""
+
+        def _linspace(start: int, end: int, count: int) -> List[int]:
+            if count <= 1:
+                return [start]
+            span = end - start
+            return [int(round(start + span * i / (count - 1))) for i in range(count)]
+
+        positions: Dict[str, Tuple[int, int]] = {}
+
+        top_keys = ["top_left", "top_inner_left", "top_inner_right", "top_right"]
+        top_x = _linspace(margin, max(margin, w - margin - msize), len(top_keys))
+        for key, x in zip(top_keys, top_x):
+            positions[key] = (x, margin)
+
+        bottom_keys = ["bottom_left", "bottom_inner_left", "bottom_inner_right", "bottom_right"]
+        bottom_x = _linspace(margin, max(margin, w - margin - msize), len(bottom_keys))
+        bottom_y = h - margin - msize
+        for key, x in zip(bottom_keys, bottom_x):
+            positions[key] = (x, bottom_y)
+
+        left_keys = ["top_left", "left_inner_top", "left_inner_bottom", "bottom_left"]
+        left_y = _linspace(margin, max(margin, h - margin - msize), len(left_keys))
+        for key, y in zip(left_keys, left_y):
+            if key in ("top_left", "bottom_left"):
+                continue
+            positions[key] = (margin, y)
+
+        right_keys = ["top_right", "right_inner_top", "right_inner_bottom", "bottom_right"]
+        right_y = _linspace(margin, max(margin, h - margin - msize), len(right_keys))
+        right_x = w - margin - msize
+        for key, y in zip(right_keys, right_y):
+            if key in ("top_right", "bottom_right"):
+                continue
+            positions[key] = (right_x, y)
+
+        return positions
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
