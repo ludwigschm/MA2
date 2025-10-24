@@ -315,6 +315,7 @@ class TabletopRoot(FloatLayout):
         self.overlay_process = self._aruco_proc
         self.fixation_running = False
         self.fixation_required = False
+        self.block_pause_stage: str | None = None
         self.pending_fixation_callback = None
         self.intro_active = True
         self.next_block_preview = None
@@ -592,10 +593,10 @@ class TabletopRoot(FloatLayout):
             self.log_round_start_if_pending()
             self.apply_phase()
 
-        if result.requires_fixation and not self.fixation_running:
-            self.run_fixation_sequence(proceed)
-        else:
-            proceed()
+        if result.requires_fixation:
+            # Fixation wird erst durch die Stufen-Logik ausgelöst
+            return
+        proceed()
 
     def start_pressed(self, who:int):
         if self.session_finished:
@@ -615,18 +616,49 @@ class TabletopRoot(FloatLayout):
             self.p1_pressed = False
             self.p2_pressed = False
             if self.in_block_pause:
-                self.in_block_pause = False
-                self.pause_message = ''
-                self.setup_round()
-                if self.session_finished:
-                    self.apply_phase()
+                if self.block_pause_stage is None:
+                    self.block_pause_stage = "pause_shown"
                     return
-                self.phase = UXPhase.WAIT_BOTH_START
-                self.apply_phase()
-                self.continue_after_start_press()
+                if self.block_pause_stage == "pause_shown":
+                    self.block_pause_stage = "await_fixation"
+                    self.fixation_required = True
+                    return
+                if self.block_pause_stage == "await_fixation":
+                    if self.fixation_running:
+                        return
+
+                    def _after_fix(_=None):
+                        self.block_pause_stage = "await_start"
+
+                    self.run_fixation_sequence(on_complete=_after_fix)
+                    return
+                if self.block_pause_stage == "await_start":
+                    self.in_block_pause = False
+                    self.pause_message = ''
+                    self.setup_round()
+                    self.fixation_required = False
+                    if self.session_finished:
+                        self.apply_phase()
+                        self.block_pause_stage = None
+                        return
+                    self.phase = UXPhase.WAIT_BOTH_START
+                    self.apply_phase()
+                    self.continue_after_start_press()
+                    self.block_pause_stage = None
+                    return
+                return
             elif self.phase == UXPhase.SHOWDOWN:
                 self.prepare_next_round(start_immediately=True)
             else:
+                if self.fixation_required:
+                    if self.fixation_running:
+                        return
+
+                    def _after_fix(_=None):
+                        self.continue_after_start_press()
+
+                    self.run_fixation_sequence(on_complete=_after_fix)
+                    return
                 self.continue_after_start_press()
 
     def run_fixation_sequence(self, on_complete=None):
@@ -711,6 +743,7 @@ class TabletopRoot(FloatLayout):
             self.update_user_displays()
             return
         if result.in_block_pause:
+            self.block_pause_stage = None
             return
 
         def proceed():
@@ -1238,6 +1271,7 @@ class TabletopRoot(FloatLayout):
         self.pause_message = ''
         self.next_block_preview = None
         self.fixation_required = False
+        self.block_pause_stage = None
         self.pending_round_start_log = False
         self.round = 1
         self.outcome_score_applied = False
