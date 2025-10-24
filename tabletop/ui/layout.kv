@@ -31,7 +31,7 @@
         source_down: ASSETS['play']['live']
         size_hint: None, None
         size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
-        pos: root.width - root.horizontal_margin_px - self.width, 180 * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - root.cm_to_px(3), 180 * root.scale
 
     IconButton:
         id: btn_start_p2
@@ -39,7 +39,7 @@
         source_down: ASSETS['play']['live']
         size_hint: None, None
         size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
-        pos: root.horizontal_margin_px, root.height - 180 * root.scale - self.height
+        pos: root.horizontal_margin_px + root.cm_to_px(3), 180 * root.scale
 
     CardWidget:
         id: p1_outer
