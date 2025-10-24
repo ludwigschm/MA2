@@ -71,7 +71,7 @@
         source_down: ASSETS['signal']['low']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.width - root.horizontal_margin_px - self.width - 780 * root.scale, 180 * root.scale + 220 * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 780 * root.scale + root.cm_to_px(10), 180 * root.scale + 220 * root.scale
 
     IconButton:
         id: signal_p1_mid
@@ -79,7 +79,7 @@
         source_down: ASSETS['signal']['mid']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.ids.signal_p1_low.x, root.ids.signal_p1_low.top + 40 * root.button_scale * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 780 * root.scale + root.cm_to_px(10), root.ids.signal_p1_low.top + 40 * root.button_scale * root.scale
 
     IconButton:
         id: signal_p1_high
@@ -87,7 +87,7 @@
         source_down: ASSETS['signal']['high']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.ids.signal_p1_mid.x, root.ids.signal_p1_mid.top + 40 * root.button_scale * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 780 * root.scale + root.cm_to_px(10), root.ids.signal_p1_mid.top + 40 * root.button_scale * root.scale
 
     IconButton:
         id: decision_p1_bluff
@@ -95,7 +95,7 @@
         source_down: ASSETS['decide']['bluff']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.ids.signal_p1_low.x - self.width - 60 * root.button_scale * root.scale, root.ids.signal_p1_low.y
+        pos: root.ids.signal_p1_low.x - self.width - 60 * root.button_scale * root.scale - root.cm_to_px(5), root.ids.signal_p1_low.y
 
     IconButton:
         id: decision_p1_wahr
@@ -103,7 +103,7 @@
         source_down: ASSETS['decide']['wahr']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.ids.decision_p1_bluff.x, root.ids.decision_p1_bluff.top + 40 * root.button_scale * root.scale
+        pos: root.ids.signal_p1_low.x - self.width - 60 * root.button_scale * root.scale - root.cm_to_px(5), root.ids.decision_p1_bluff.top + 40 * root.button_scale * root.scale
 
     IconButton:
         id: signal_p2_low
@@ -111,7 +111,7 @@
         source_down: ASSETS['signal']['low']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.horizontal_margin_px + 780 * root.scale, root.height - 180 * root.scale - 220 * root.scale - self.height
+        pos: root.horizontal_margin_px + 780 * root.scale - root.cm_to_px(10), root.height - 180 * root.scale - 220 * root.scale - self.height
 
     IconButton:
         id: signal_p2_mid
@@ -119,7 +119,7 @@
         source_down: ASSETS['signal']['mid']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.ids.signal_p2_low.x, root.ids.signal_p2_low.y - root.ids.signal_p2_low.height - 40 * root.button_scale * root.scale
+        pos: root.horizontal_margin_px + 780 * root.scale - root.cm_to_px(10), root.ids.signal_p2_low.y - root.ids.signal_p2_low.height - 40 * root.button_scale * root.scale
 
     IconButton:
         id: signal_p2_high
@@ -127,7 +127,7 @@
         source_down: ASSETS['signal']['high']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.ids.signal_p2_mid.x, root.ids.signal_p2_mid.y - root.ids.signal_p2_mid.height - 40 * root.button_scale * root.scale
+        pos: root.horizontal_margin_px + 780 * root.scale - root.cm_to_px(10), root.ids.signal_p2_mid.y - root.ids.signal_p2_mid.height - 40 * root.button_scale * root.scale
 
     IconButton:
         id: decision_p2_bluff
@@ -135,7 +135,7 @@
         source_down: ASSETS['decide']['bluff']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.ids.signal_p2_low.right + 60 * root.button_scale * root.scale, root.ids.signal_p2_low.y
+        pos: root.ids.signal_p2_low.right + 60 * root.button_scale * root.scale + root.cm_to_px(5), root.ids.signal_p2_low.y
 
     IconButton:
         id: decision_p2_wahr
@@ -143,7 +143,7 @@
         source_down: ASSETS['decide']['wahr']['live']
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
-        pos: root.ids.decision_p2_bluff.x, root.ids.decision_p2_bluff.y - root.ids.decision_p2_bluff.height - 40 * root.button_scale * root.scale
+        pos: root.ids.signal_p2_low.right + 60 * root.button_scale * root.scale + root.cm_to_px(5), root.ids.decision_p2_bluff.y - root.ids.decision_p2_bluff.height - 40 * root.button_scale * root.scale
 
     Image:
         id: center_p1_card_right
