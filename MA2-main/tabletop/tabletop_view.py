@@ -158,6 +158,7 @@ class TabletopRoot(FloatLayout):
         self.round_log_fp = None
         self.round_log_writer = None
         self.round_log_buffer = []
+        self.overlay_display_index = 0
 
         # --- UI Elemente initialisieren
         self._configure_widgets()
@@ -1198,7 +1199,11 @@ class TabletopRoot(FloatLayout):
         """Start the ArUco overlay process with the relocated script path."""
 
         try:
-            return self.start_overlay(process, overlay_path=ARUCO_OVERLAY_PATH)
+            return self.start_overlay(
+                process,
+                overlay_path=ARUCO_OVERLAY_PATH,
+                display_index=self.overlay_display_index,
+            )
         except TypeError:
             return self.start_overlay(process)
 
