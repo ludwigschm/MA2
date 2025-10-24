@@ -92,6 +92,10 @@ class TabletopRoot(FloatLayout):
     intro_labels = DictProperty({})
     pause_labels = DictProperty({})
 
+    def cm_to_px(self, cm: float) -> float:
+        dpi = getattr(Window, "dpi", 96) or 96
+        return (dpi / 2.54) * cm
+
     def wid(self, name: str):
         # Liefert das Widget-Objekt oder None, ohne Truthiness auf WeakProxy auszulösen
         return self.ids.get(name, None)
