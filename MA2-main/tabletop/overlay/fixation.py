@@ -93,7 +93,7 @@ def run_fixation_sequence(
             btn.set_live(False)
 
     image.opacity = 1
-    _set_image_source(image, stop_image, fallback="blank")
+    _set_image_source(image, live_image, fallback="cross")
 
     def finish(_dt: float) -> None:
         if getattr(overlay, "parent", None) is not None:
@@ -109,16 +109,16 @@ def run_fixation_sequence(
         if callback:
             callback()
 
-    def show_stop_again(_dt: float) -> None:
-        _set_image_source(image, stop_image, fallback="blank")
+    def show_final_live(_dt: float) -> None:
+        _set_image_source(image, live_image, fallback="cross")
         schedule_once(finish, 5)
 
-    def show_live(_dt: float) -> None:
-        _set_image_source(image, live_image, fallback="cross")
+    def show_stop_and_tone(_dt: float) -> None:
+        _set_image_source(image, stop_image, fallback="blank")
         play_fixation_tone(controller)
-        schedule_once(show_stop_again, 0.2)
+        schedule_once(show_final_live, 0.2)
 
-    schedule_once(show_live, 5)
+    schedule_once(show_stop_and_tone, 5)
 
 
 def _path_to_source(image_path: Optional[Path | str]) -> str:
