@@ -8,15 +8,16 @@ repository.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+import atexit
 import csv
 import json
 import pathlib
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - only for static typing
     from tabletop.logging.events import Events
@@ -192,10 +193,20 @@ class EventLogger:
         self.conn.commit()
         self._csv_path: Optional[pathlib.Path] = None
         self._csv_buffer: List[Tuple[str, int, str, str, str, str, int, str]] = []
+        self._closed = False
         if csv_path:
             path = pathlib.Path(csv_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             self._csv_path = path
+        atexit.register(self.close)
+
+    def _flush_csv_buffer(self) -> None:
+        if self._csv_path is None or not self._csv_buffer:
+            return
+        with open(self._csv_path, "a", encoding="utf-8", newline="") as fp:
+            writer = csv.writer(fp)
+            writer.writerows(self._csv_buffer)
+        self._csv_buffer.clear()
 
     def log(
         self,
@@ -223,6 +234,7 @@ class EventLogger:
         self.conn.commit()
         if self._csv_path is not None:
             self._csv_buffer.append(row)
+            self._flush_csv_buffer()
         return {
             "session_id": session_id,
             "round_idx": round_idx,
@@ -234,12 +246,11 @@ class EventLogger:
         }
 
     def close(self) -> None:
-        if self._csv_path is not None and self._csv_buffer:
-            with open(self._csv_path, "a", encoding="utf-8", newline="") as fp:
-                writer = csv.writer(fp)
-                writer.writerows(self._csv_buffer)
-            self._csv_buffer.clear()
+        if self._closed:
+            return
+        self._flush_csv_buffer()
         self.conn.close()
+        self._closed = True
 
 
 # -------------- Engine --------------
