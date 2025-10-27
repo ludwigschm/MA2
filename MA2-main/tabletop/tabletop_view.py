@@ -5,7 +5,7 @@ import itertools
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from kivy.clock import Clock
@@ -46,6 +46,9 @@ from tabletop.ui.assets import (
     resolve_background_texture,
 )
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
+
+if TYPE_CHECKING:
+    from tabletop.pupil_bridge import PupilBridge
 
 
 ui_widgets.ASSETS = ASSETS
@@ -119,6 +122,10 @@ class TabletopRoot(FloatLayout):
         fixation_runner: Callable[..., Any] = overlay_run_fixation_sequence,
         fixation_player: Callable[[Any], None] = overlay_play_fixation_tone,
         fixation_tone_factory: Callable[[int], Any] = generate_fixation_tone,
+        bridge: Optional["PupilBridge"] = None,
+        bridge_player: str = "VP1",
+        bridge_session: Optional[int] = None,
+        bridge_block: Optional[int] = None,
         **kw: Any,
     ):
         super().__init__(**kw)
@@ -160,6 +167,17 @@ class TabletopRoot(FloatLayout):
         self.round_log_buffer = []
         self.overlay_display_index = 0
 
+        self._bridge: Optional["PupilBridge"] = None
+        self._bridge_player: Optional[str] = None
+        self._bridge_session: Optional[int] = None
+        self._bridge_block: Optional[int] = None
+        self.update_bridge_context(
+            bridge=bridge,
+            player=bridge_player,
+            session=bridge_session,
+            block=bridge_block,
+        )
+
         # --- UI Elemente initialisieren
         self._configure_widgets()
         self.setup_round()
@@ -180,6 +198,43 @@ class TabletopRoot(FloatLayout):
         if item in self._STATE_FIELDS and 'controller' in self.__dict__:
             return getattr(self.controller.state, item)
         raise AttributeError(item)
+
+    # ------------------------------------------------------------------
+    # Bridge helpers
+    def update_bridge_context(
+        self,
+        *,
+        bridge: Optional["PupilBridge"],
+        player: Optional[str],
+        session: Optional[int],
+        block: Optional[int],
+    ) -> None:
+        self._bridge = bridge
+        self._bridge_player = player
+        self._bridge_session = session
+        self._bridge_block = block
+
+    def _bridge_payload_base(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if self._bridge_session is not None:
+            payload["session"] = self._bridge_session
+        if self._bridge_block is not None:
+            payload["block"] = self._bridge_block
+        if self._bridge_player is not None:
+            payload["player"] = self._bridge_player
+        return payload
+
+    def send_bridge_event(
+        self, name: str, payload: Optional[Dict[str, Any]] = None
+    ) -> None:
+        if not self._bridge or not self._bridge_player:
+            return
+        if not self._bridge.is_connected(self._bridge_player):
+            return
+        event_payload = self._bridge_payload_base()
+        if payload:
+            event_payload.update(payload)
+        self._bridge.send_event(name, self._bridge_player, event_payload)
 
     # --- Layout & Elemente
     def _configure_widgets(self):
@@ -640,6 +695,10 @@ class TabletopRoot(FloatLayout):
             stop_image=FIX_STOP_IMAGE,
             live_image=FIX_LIVE_IMAGE,
             on_complete=on_complete,
+            bridge=self._bridge,
+            player=self._bridge_player,
+            session=self._bridge_session,
+            block=self._bridge_block,
         )
 
     def play_fixation_tone(self):
@@ -1100,6 +1159,16 @@ class TabletopRoot(FloatLayout):
             payload
         )
         write_round_log(self, actor, action, payload, player)
+        self.send_bridge_event(
+            f"action.{action}",
+            {
+                "actor": actor,
+                "game_player": player,
+                "phase": self.current_engine_phase(),
+                "round_index": round_idx,
+                "payload": payload,
+            },
+        )
 
     def prompt_session_number(self):
         if self.session_popup:

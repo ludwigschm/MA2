@@ -7,8 +7,6 @@ from typing import Any, Optional, Sequence, cast
 
 import os
 
-import os
-
 import logging
 from contextlib import suppress
 
@@ -30,6 +28,7 @@ from tabletop.overlay.process import (
     stop_overlay,
 )
 from tabletop.tabletop_view import TabletopRoot
+from tabletop.pupil_bridge import PupilBridge
 
 log = logging.getLogger(__name__)
 
@@ -39,15 +38,29 @@ _KV_LOADED = False
 class TabletopApp(App):
     """Main Kivy application that wires the UI with infrastructure services."""
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        session: Optional[int] = None,
+        block: Optional[int] = None,
+        player: str = "VP1",
+        bridge: Optional[PupilBridge] = None,
+        **kwargs: Any,
+    ) -> None:
         self._overlay_process: Optional[OverlayProcess] = None
         self._esc_handler: Optional[Any] = None
+        self._key_up_handler: Optional[Any] = None
         self._bootstrap_screens: list[dict[str, int]] = self._probe_screens_pyqt()
         self._target_display_index: int = self._determine_display_index(
             screens=self._bootstrap_screens
         )
 
         self._configure_startup_display(self._target_display_index)
+        self._bridge: Optional[PupilBridge] = bridge
+        self._session: Optional[int] = session
+        self._block: Optional[int] = block
+        self._player: str = player
+        self._recording_started: bool = False
         super().__init__(**kwargs)
 
     @staticmethod
@@ -258,10 +271,78 @@ class TabletopApp(App):
                 Builder.load_file(str(kv_path))
             _KV_LOADED = True
 
-        root = TabletopRoot()
+        root = TabletopRoot(
+            bridge=self._bridge,
+            bridge_player=self._player,
+            bridge_session=self._session,
+            bridge_block=self._block,
+        )
 
         # ESC binding is scheduled in ``on_start`` once the window exists.
         return root
+
+    # ------------------------------------------------------------------
+    # Bridge helpers
+    def _bridge_payload_base(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self._session is not None:
+            payload["session"] = self._session
+        if self._block is not None:
+            payload["block"] = self._block
+        return payload
+
+    def _format_key_name(self, key: int, codepoint: str) -> str:
+        if codepoint:
+            if codepoint == " ":
+                return "space"
+            return codepoint
+        return f"code_{key}"
+
+    def _emit_bridge_key_event(
+        self,
+        action: str,
+        *,
+        key: int,
+        scancode: int,
+        codepoint: str,
+        modifiers: list[str],
+    ) -> None:
+        if not self._bridge or not self._player or not self._bridge.is_connected(self._player):
+            return
+        key_name = self._format_key_name(key, codepoint)
+        payload = self._bridge_payload_base()
+        payload.update(
+            {
+                "key": key_name,
+                "keycode": key,
+                "scancode": scancode,
+                "codepoint": codepoint,
+                "modifiers": modifiers,
+            }
+        )
+        event_name = f"key.{key_name}.{action}"
+        self._bridge.send_event(event_name, self._player, payload)
+
+    def _start_bridge_recording(self) -> None:
+        if (
+            self._recording_started
+            or self._bridge is None
+            or self._player is None
+            or not self._bridge.is_connected(self._player)
+            or self._session is None
+            or self._block is None
+        ):
+            return
+        self._bridge.start_recording(self._session, self._block, self._player)
+        self._recording_started = True
+
+    def _stop_bridge_recording(self) -> None:
+        if not self._bridge or not self._player:
+            return
+        try:
+            self._bridge.stop_recording(self._player)
+        finally:
+            self._recording_started = False
 
     def _bind_esc(self) -> None:
         """Ensure ESC toggles fullscreen without closing the app."""
@@ -276,6 +357,16 @@ class TabletopApp(App):
             codepoint: str,
             modifiers: list[str],
         ) -> bool:
+            try:
+                self._emit_bridge_key_event(
+                    "down",
+                    key=key,
+                    scancode=scancode,
+                    codepoint=codepoint,
+                    modifiers=modifiers,
+                )
+            except Exception:  # pragma: no cover - defensive fallback
+                log.exception("Failed to emit bridge key down event")
             if key == 27:  # ESC
                 try:
                     if Window.fullscreen:
@@ -293,9 +384,48 @@ class TabletopApp(App):
         self._esc_handler = _on_key_down
         Window.bind(on_key_down=self._esc_handler)
 
+        if self._key_up_handler is not None:
+            return
+
+        def _on_key_up(
+            _window: Window,
+            key: int,
+            scancode: int,
+            *args: Any,
+        ) -> bool:
+            try:
+                self._emit_bridge_key_event(
+                    "up",
+                    key=key,
+                    scancode=scancode,
+                    codepoint="",
+                    modifiers=list(args[0]) if args and isinstance(args[0], (list, tuple)) else [],
+                )
+            except Exception:  # pragma: no cover - defensive fallback
+                log.exception("Failed to emit bridge key up event")
+            return False
+
+        self._key_up_handler = _on_key_up
+        Window.bind(on_key_up=self._key_up_handler)
+
     def on_start(self) -> None:  # pragma: no cover - framework callback
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
+
+        try:
+            self._start_bridge_recording()
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("Failed to start Pupil recording")
+        if root is not None:
+            try:
+                root.update_bridge_context(
+                    bridge=self._bridge,
+                    player=self._player,
+                    session=self._session,
+                    block=self._block,
+                )
+            except AttributeError:
+                pass
 
         self._target_display_index = self._determine_display_index()
         self._apply_display_environment(self._target_display_index)
@@ -372,13 +502,45 @@ class TabletopApp(App):
             flush_round_log(root)
             close_round_log(root)
 
+        try:
+            self._stop_bridge_recording()
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("Failed to stop Pupil recording")
+
         super().on_stop()
 
 
-def main() -> None:
-    """Run the tabletop Kivy application."""
+def main(
+    *,
+    session: Optional[int] = None,
+    block: Optional[int] = None,
+    player: str = "VP1",
+) -> None:
+    """Run the tabletop Kivy application with optional Pupil bridge integration."""
 
-    TabletopApp().run()
+    bridge = PupilBridge()
+    try:
+        bridge.connect()
+    except Exception:  # pragma: no cover - defensive fallback
+        log.exception("Failed to connect to Pupil devices")
+
+    app = TabletopApp(
+        session=session,
+        block=block,
+        player=player,
+        bridge=bridge,
+    )
+    try:
+        app.run()
+    finally:
+        try:
+            bridge.stop_recording(player)
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("Failed to stop recording during shutdown")
+        try:
+            bridge.close()
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("Failed to close Pupil bridge")
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution
