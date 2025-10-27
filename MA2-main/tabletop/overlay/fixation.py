@@ -5,11 +5,14 @@ from __future__ import annotations
 import importlib
 import importlib.util
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import numpy as np
 import sounddevice as sd
 import threading
+
+if TYPE_CHECKING:
+    from tabletop.pupil_bridge import PupilBridge
 
 
 _FIXATION_CROSS_ATTR = "_fixation_cross_overlay"
@@ -63,6 +66,10 @@ def run_fixation_sequence(
     stop_image: Optional[Path | str],
     live_image: Optional[Path | str],
     on_complete: Optional[Callable[[], None]] = None,
+    bridge: Optional["PupilBridge"] = None,
+    player: Optional[str] = None,
+    session: Optional[int] = None,
+    block: Optional[int] = None,
 ) -> None:
     """Execute the fixation sequence using the provided controller state."""
 
@@ -78,6 +85,19 @@ def run_fixation_sequence(
             on_complete()
         return
 
+    def _send_sync_event(name: str) -> None:
+        if bridge is None or player is None:
+            return
+        if not bridge.is_connected(player):
+            return
+        payload: dict[str, Any] = {}
+        if session is not None:
+            payload["session"] = session
+        if block is not None:
+            payload["block"] = block
+        payload["player"] = player
+        bridge.send_event(name, player, payload)
+
     controller.fixation_running = True
     controller.pending_fixation_callback = on_complete
     overlay.opacity = 1
@@ -86,6 +106,8 @@ def run_fixation_sequence(
     if getattr(overlay, "parent", None) is not None:
         controller.remove_widget(overlay)
     controller.add_widget(overlay)
+
+    _send_sync_event("sync.fixation_start")
 
     for attr in ("btn_start_p1", "btn_start_p2"):
         btn = getattr(controller, attr, None)
@@ -108,6 +130,7 @@ def run_fixation_sequence(
         controller.pending_fixation_callback = None
         if callback:
             callback()
+        _send_sync_event("sync.fixation_end")
 
     def show_final_live(_dt: float) -> None:
         _set_image_source(image, live_image, fallback="cross")
@@ -116,6 +139,7 @@ def run_fixation_sequence(
     def show_stop_and_tone(_dt: float) -> None:
         _set_image_source(image, stop_image, fallback="blank")
         play_fixation_tone(controller)
+        _send_sync_event("sync.flash_beep")
         schedule_once(show_final_live, 0.2)
 
     schedule_once(show_stop_and_tone, 5)
