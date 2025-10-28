@@ -51,7 +51,13 @@ class PupilBridge:
             return
 
         try:
-            found_devices = discover_devices(timeout_seconds=self._connect_timeout)
+            try:
+                found_devices = discover_devices(timeout_seconds=self._connect_timeout)
+            except TypeError:
+                try:
+                    found_devices = discover_devices(timeout=self._connect_timeout)
+                except TypeError:
+                    found_devices = discover_devices(self._connect_timeout)
         except Exception as exc:  # pragma: no cover - network/hardware dependent
             log.exception("Failed to discover Pupil devices: %s", exc)
             return

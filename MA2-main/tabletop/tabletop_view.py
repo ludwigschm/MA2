@@ -184,6 +184,8 @@ class TabletopRoot(FloatLayout):
             session=bridge_session,
             block=bridge_block,
         )
+        # kick recordings once Kivy has a chance to finish layout & session may be set
+        Clock.schedule_once(lambda *_: self._ensure_bridge_recordings(), 0.2)
 
         # --- UI Elemente initialisieren
         self._configure_widgets()
