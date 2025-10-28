@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Union
 
 try:  # pragma: no cover - optional dependency
     from pupil_labs.realtime_api.simple import Device, discover_devices
@@ -159,7 +159,7 @@ class PupilBridge:
         }
         self._connect_timeout = float(connect_timeout)
         self._device_by_player: Dict[str, Any] = {"VP1": None, "VP2": None}
-        self._active_recordings: set[str] = set()
+        self._active_recording: Dict[str, bool] = {"VP1": False, "VP2": False}
         self._recording_metadata: Dict[str, Dict[str, Any]] = {}
         self._auto_session: Optional[int] = None
         self._auto_block: Optional[int] = None
@@ -356,12 +356,12 @@ class PupilBridge:
         return module_serial or ""
 
     def _auto_start_recording(self, player: str, device: Any) -> None:
-        if player in self._active_recordings:
+        if self._active_recording.get(player):
             log.info("recording.start übersprungen (%s bereits aktiv)", player)
             return
         label = f"auto.{player.lower()}.{int(time.time())}"
         log.info("recording.start gesendet (%s, label=%s)", player, label)
-        begin_info = self._send_recording_start(device, label)
+        begin_info = self._send_recording_start(player, device, label)
         if begin_info is None:
             log.warning("recording.begin Timeout (%s)", player)
             return
@@ -369,11 +369,12 @@ class PupilBridge:
         recording_id = self._extract_recording_id(begin_info)
         log.info("recording.begin bestätigt (%s, id=%s)", player, recording_id or "?")
 
-        self._active_recordings.add(player)
+        self._active_recording[player] = True
         self._recording_metadata[player] = {
             "player": player,
             "recording_label": label,
             "event": "auto_start",
+            "recording_id": recording_id,
         }
 
     def _get_device_status(self, device: Any) -> Optional[Any]:
@@ -466,6 +467,7 @@ class PupilBridge:
                             set_device(data.get("device_id"))
                         if device_id:
                             break
+
                 for record in records:
                     if record.get("model") == "Hardware":
                         data = record.get("data")
@@ -736,7 +738,8 @@ class PupilBridge:
                 log.exception("Failed to close device for %s: %s", player, exc)
             finally:
                 self._device_by_player[player] = None
-        self._active_recordings.clear()
+        for player in list(self._active_recording):
+            self._active_recording[player] = False
         self._recording_metadata.clear()
 
     # ------------------------------------------------------------------
@@ -766,7 +769,7 @@ class PupilBridge:
         started: set[str] = set()
         for player in target_players:
             self.start_recording(self._auto_session, self._auto_block, player)
-            if player in self._active_recordings:
+            if self._active_recording.get(player):
                 started.add(player)
         return started
 
@@ -778,7 +781,7 @@ class PupilBridge:
             log.info("recording.start übersprungen (%s nicht verbunden)", player)
             return
 
-        if player in self._active_recordings:
+        if self._active_recording.get(player):
             log.debug("Recording already active for %s", player)
             return
 
@@ -786,7 +789,13 @@ class PupilBridge:
         recording_label = f"{session}.{block}.{vp_index}"
 
         log.info("recording.start gesendet (%s, label=%s)", player, recording_label)
-        begin_info = self._send_recording_start(device, recording_label)
+        begin_info = self._send_recording_start(
+            player,
+            device,
+            recording_label,
+            session=session,
+            block=block,
+        )
         if begin_info is None:
             log.warning("Timeout, retry/abort (%s)", player)
             return
@@ -799,22 +808,254 @@ class PupilBridge:
             "block": block,
             "player": player,
             "recording_label": recording_label,
+            "recording_id": recording_id,
         }
         self.send_event("session.recording_started", player, payload)
-        self._active_recordings.add(player)
+        self._active_recording[player] = True
         self._recording_metadata[player] = payload
 
-    def _send_recording_start(self, device: Any, label: str) -> Optional[Any]:
-        try:
-            try:
-                result = device.recording_start(label=label)
-            except TypeError:
-                result = device.recording_start(label)
-        except Exception as exc:  # pragma: no cover - hardware dependent
-            log.exception("Failed to start recording: %s", exc)
+    def _send_recording_start(
+        self,
+        player: str,
+        device: Any,
+        label: str,
+        *,
+        session: Optional[int] = None,
+        block: Optional[int] = None,
+    ) -> Optional[Any]:
+        success, _ = self._invoke_recording_start(player, device)
+        if not success:
             return None
 
-        return self._wait_for_notification(device, "recording.begin") or result
+        self._apply_recording_label(player, device, label, session=session, block=block)
+
+        begin_info = self._wait_for_notification(device, "recording.begin")
+        if begin_info is None:
+            return None
+        return begin_info
+
+    def _invoke_recording_start(
+        self,
+        player: str,
+        device: Any,
+        *,
+        allow_busy_recovery: bool = True,
+    ) -> tuple[bool, Optional[Any]]:
+        start_methods = ("recording_start", "start_recording")
+        for method_name in start_methods:
+            start_fn = getattr(device, method_name, None)
+            if not callable(start_fn):
+                continue
+            try:
+                return True, start_fn()
+            except TypeError:
+                log.debug(
+                    "recording start via %s requires unsupported arguments (%s)",
+                    method_name,
+                    player,
+                    exc_info=True,
+                )
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                log.exception(
+                    "Failed to start recording for %s via %s: %s",
+                    player,
+                    method_name,
+                    exc,
+                )
+                return False, None
+
+        rest_status, rest_payload = self._start_recording_via_rest(player)
+        if rest_status == "busy" and allow_busy_recovery:
+            if self._handle_busy_state(player, device):
+                return self._invoke_recording_start(player, device, allow_busy_recovery=False)
+            return False, None
+        if rest_status is True:
+            return True, rest_payload
+        log.error("No recording start method succeeded for %s", player)
+        return False, None
+
+    def _start_recording_via_rest(self, player: str) -> tuple[Optional[Union[str, bool]], Optional[Any]]:
+        if requests is None:
+            log.debug("requests not available – cannot start recording via REST (%s)", player)
+            return False, None
+        cfg = self._device_config.get(player)
+        if cfg is None or not cfg.ip or cfg.port is None:
+            log.debug("REST recording start skipped (%s: no IP/port)", player)
+            return False, None
+
+        url = f"http://{cfg.ip}:{cfg.port}/api/recording"
+        try:
+            response = requests.post(
+                url,
+                json={"action": "START"},
+                timeout=self._connect_timeout,
+            )
+        except Exception as exc:  # pragma: no cover - network dependent
+            log.error("REST recording start failed for %s: %s", player, exc)
+            return False, None
+
+        if response.status_code == 200:
+            try:
+                return True, response.json()
+            except ValueError:
+                return True, None
+
+        message: Optional[str] = None
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                message = str(data.get("message") or data.get("error") or "")
+        except ValueError:
+            message = response.text
+
+        if (
+            response.status_code == 400
+            and message
+            and "previous recording not completed" in message.lower()
+        ):
+            log.warning("Recording start busy for %s: %s", player, message)
+            return "busy", None
+
+        log.error(
+            "REST recording start for %s failed (%s): %s",
+            player,
+            response.status_code,
+            message or response.text,
+        )
+        return False, None
+
+    def _handle_busy_state(self, player: str, device: Any) -> bool:
+        log.info("Attempting to clear busy recording state for %s", player)
+        stopped = False
+        stop_fn = getattr(device, "recording_stop_and_save", None)
+        if callable(stop_fn):
+            try:
+                stop_fn()
+                stopped = True
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                log.warning(
+                    "recording_stop_and_save failed for %s: %s",
+                    player,
+                    exc,
+                )
+
+        if not stopped:
+            response = self._post_device_api(
+                player,
+                "/api/recording",
+                {"action": "STOP"},
+                warn=False,
+            )
+            if response is not None and response.status_code == 200:
+                stopped = True
+            elif response is not None:
+                log.warning(
+                    "REST recording STOP for %s failed (%s)",
+                    player,
+                    response.status_code,
+                )
+
+        if not stopped:
+            return False
+
+        end_info = self._wait_for_notification(device, "recording.end")
+        if end_info is None:
+            log.warning("Timeout while waiting for recording.end (%s)", player)
+        return True
+
+    def _post_device_api(
+        self,
+        player: str,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+        warn: bool = True,
+    ) -> Optional[Any]:
+        if requests is None:
+            if warn:
+                log.warning(
+                    "requests not available – cannot contact %s for %s",
+                    path,
+                    player,
+                )
+            return None
+
+        cfg = self._device_config.get(player)
+        if cfg is None or not cfg.ip or cfg.port is None:
+            if warn:
+                log.warning(
+                    "REST endpoint %s not configured for %s",
+                    path,
+                    player,
+                )
+            return None
+
+        url = f"http://{cfg.ip}:{cfg.port}{path}"
+        try:
+            return requests.post(
+                url,
+                json=payload,
+                timeout=timeout or self._connect_timeout,
+            )
+        except Exception as exc:  # pragma: no cover - network dependent
+            if warn:
+                log.warning("HTTP POST %s failed for %s: %s", url, player, exc)
+            else:
+                log.debug("HTTP POST %s failed for %s: %s", url, player, exc, exc_info=True)
+            return None
+
+    def _apply_recording_label(
+        self,
+        player: str,
+        device: Any,
+        label: str,
+        *,
+        session: Optional[int] = None,
+        block: Optional[int] = None,
+    ) -> None:
+        if not label:
+            return
+
+        response = self._post_device_api(
+            player,
+            "/api/frame_name",
+            {"frame_name": label},
+            warn=False,
+        )
+        if response is None:
+            log.warning("Setting frame_name failed for %s (no response)", player)
+        elif response.status_code != 200:
+            log.warning(
+                "Setting frame_name failed for %s (%s)",
+                player,
+                response.status_code,
+            )
+
+        payload: Dict[str, Any] = {"label": label}
+        if session is not None:
+            payload["session"] = session
+        if block is not None:
+            payload["block"] = block
+
+        event_fn = getattr(device, "send_event", None)
+        if callable(event_fn):
+            try:
+                event_fn(name="recording.label", payload=payload)
+                return
+            except TypeError:
+                try:
+                    event_fn("recording.label", payload)
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        try:
+            self.send_event("recording.label", player, payload)
+        except Exception:
+            log.debug("recording.label event fallback failed for %s", player, exc_info=True)
 
     def _wait_for_notification(
         self, device: Any, event: str, timeout: float = 5.0
@@ -849,7 +1090,7 @@ class PupilBridge:
             log.info("recording.stop übersprungen (%s: nicht konfiguriert/verbunden)", player)
             return
 
-        if player not in self._active_recordings:
+        if not self._active_recording.get(player):
             log.debug("No active recording to stop for %s", player)
             return
 
@@ -880,7 +1121,8 @@ class PupilBridge:
         else:
             log.info("recording.end nicht bestätigt (%s)", player)
 
-        self._active_recordings.discard(player)
+        if player in self._active_recording:
+            self._active_recording[player] = False
         self._recording_metadata.pop(player, None)
 
     def connected_players(self) -> set[str]:
