@@ -294,7 +294,7 @@ class TabletopApp(App):
         try:
             root.update_bridge_context(
                 bridge=self._bridge,
-                players=self._players,
+                players=set(self._players),
                 session=self._session,
                 block=self._block,
             )
@@ -439,7 +439,7 @@ class TabletopApp(App):
             try:
                 root.update_bridge_context(
                     bridge=self._bridge,
-                    players=self._players,
+                    players=set(self._players),
                     session=self._session,
                     block=self._block,
                 )
