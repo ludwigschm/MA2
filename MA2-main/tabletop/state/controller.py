@@ -229,7 +229,7 @@ class TabletopController:
                 state.session_finished = True
                 state.in_block_pause = False
                 state.pause_message = (
-                    "Alle Blöcke abgeschlossen. Vielen Dank!"
+                    "Vielen Dank die Teilnahme! Das Experiment ist nun beendet!"
                 )
                 state.next_block_preview = None
             else:
