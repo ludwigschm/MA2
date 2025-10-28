@@ -43,7 +43,8 @@ class TabletopApp(App):
         *,
         session: Optional[int] = None,
         block: Optional[int] = None,
-        player: str = "VP1",
+        player: str = "auto",
+        players: Optional[Sequence[str]] = None,
         bridge: Optional[PupilBridge] = None,
         single_block_mode: bool = False,
         **kwargs: Any,
@@ -60,8 +61,16 @@ class TabletopApp(App):
         self._bridge: Optional[PupilBridge] = bridge
         self._session: Optional[int] = session
         self._block: Optional[int] = block
-        self._player: str = player
-        self._recording_started: bool = False
+        requested_players: set[str] = set()
+        if players is not None:
+            requested_players.update(players)
+        elif player:
+            lowered = player.lower()
+            if lowered == "both":
+                requested_players.update({"VP1", "VP2"})
+            elif lowered not in {"auto"}:
+                requested_players.add(player)
+        self._players: set[str] = {entry for entry in requested_players if entry}
         self._single_block_mode: bool = single_block_mode
         super().__init__(**kwargs)
 
@@ -294,6 +303,21 @@ class TabletopApp(App):
             payload["block"] = self._block
         return payload
 
+    def _iter_active_players(self) -> list[str]:
+        if not self._bridge:
+            return []
+
+        players = set(self._players)
+        if not players:
+            try:
+                players = set(self._bridge.connected_players())
+            except AttributeError:
+                players = set()
+            if players:
+                self._players = set(players)
+
+        return [player for player in players if self._bridge.is_connected(player)]
+
     def _format_key_name(self, key: int, codepoint: str) -> str:
         if codepoint:
             if codepoint == " ":
@@ -310,42 +334,27 @@ class TabletopApp(App):
         codepoint: str,
         modifiers: list[str],
     ) -> None:
-        if not self._bridge or not self._player or not self._bridge.is_connected(self._player):
+        if not self._bridge:
             return
         key_name = self._format_key_name(key, codepoint)
-        payload = self._bridge_payload_base()
-        payload.update(
-            {
-                "key": key_name,
-                "keycode": key,
-                "scancode": scancode,
-                "codepoint": codepoint,
-                "modifiers": modifiers,
-            }
-        )
+        players = self._iter_active_players()
+        if not players:
+            return
+        payload_base = self._bridge_payload_base()
         event_name = f"key.{key_name}.{action}"
-        self._bridge.send_event(event_name, self._player, payload)
-
-    def _start_bridge_recording(self) -> None:
-        if (
-            self._recording_started
-            or self._bridge is None
-            or self._player is None
-            or not self._bridge.is_connected(self._player)
-            or self._session is None
-            or self._block is None
-        ):
-            return
-        self._bridge.start_recording(self._session, self._block, self._player)
-        self._recording_started = True
-
-    def _stop_bridge_recording(self) -> None:
-        if not self._bridge or not self._player:
-            return
-        try:
-            self._bridge.stop_recording(self._player)
-        finally:
-            self._recording_started = False
+        for player in players:
+            payload = dict(payload_base)
+            payload.update(
+                {
+                    "key": key_name,
+                    "keycode": key,
+                    "scancode": scancode,
+                    "codepoint": codepoint,
+                    "modifiers": modifiers,
+                    "player": player,
+                }
+            )
+            self._bridge.send_event(event_name, player, payload)
 
     def _bind_esc(self) -> None:
         """Ensure ESC toggles fullscreen without closing the app."""
@@ -415,15 +424,11 @@ class TabletopApp(App):
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
 
-        try:
-            self._start_bridge_recording()
-        except Exception:  # pragma: no cover - defensive fallback
-            log.exception("Failed to start Pupil recording")
         if root is not None:
             try:
                 root.update_bridge_context(
                     bridge=self._bridge,
-                    player=self._player,
+                    players=self._players,
                     session=self._session,
                     block=self._block,
                 )
@@ -505,19 +510,44 @@ class TabletopApp(App):
             flush_round_log(root)
             close_round_log(root)
 
-        try:
-            self._stop_bridge_recording()
-        except Exception:  # pragma: no cover - defensive fallback
-            log.exception("Failed to stop Pupil recording")
+        if root is not None:
+            try:
+                root.stop_bridge_recordings()
+            except AttributeError:
+                pass
+        elif self._bridge is not None:
+            for player in self._iter_active_players():
+                try:
+                    self._bridge.stop_recording(player)
+                except Exception:  # pragma: no cover - defensive fallback
+                    log.exception("Failed to stop recording for %s", player)
 
         super().on_stop()
+
+
+def _resolve_requested_players(
+    player: str, *, connected: Optional[set[str]] = None
+) -> list[str]:
+    requested = (player or "auto").strip().lower()
+    connected = {p for p in (connected or set()) if p}
+
+    if requested == "auto":
+        if connected:
+            return sorted(connected)
+        return ["VP1"]
+
+    if requested == "both":
+        return ["VP1", "VP2"]
+
+    normalized = player.upper() if player else "VP1"
+    return [normalized]
 
 
 def main(
     *,
     session: Optional[int] = None,
     block: Optional[int] = None,
-    player: str = "VP1",
+    player: str = "auto",
 ) -> None:
     """Run the tabletop Kivy application with optional Pupil bridge integration."""
 
@@ -527,22 +557,31 @@ def main(
     except Exception:  # pragma: no cover - defensive fallback
         log.exception("Failed to connect to Pupil devices")
 
+    try:
+        connected_players = bridge.connected_players()
+    except AttributeError:
+        connected_players = set()
+
+    desired_players = _resolve_requested_players(player, connected=connected_players)
+
     single_block_mode = session is not None and block is not None
 
     app = TabletopApp(
         session=session,
         block=block,
         player=player,
+        players=desired_players,
         bridge=bridge,
         single_block_mode=single_block_mode,
     )
     try:
         app.run()
     finally:
-        try:
-            bridge.stop_recording(player)
-        except Exception:  # pragma: no cover - defensive fallback
-            log.exception("Failed to stop recording during shutdown")
+        for tracked in desired_players:
+            try:
+                bridge.stop_recording(tracked)
+            except Exception:  # pragma: no cover - defensive fallback
+                log.exception("Failed to stop recording during shutdown for %s", tracked)
         try:
             bridge.close()
         except Exception:  # pragma: no cover - defensive fallback

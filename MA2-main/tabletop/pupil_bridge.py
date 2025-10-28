@@ -163,6 +163,11 @@ class PupilBridge:
             self._active_recordings.discard(player)
             self._recording_metadata.pop(player, None)
 
+    def connected_players(self) -> set[str]:
+        """Return the set of players that currently have a connected device."""
+
+        return {player for player, device in self._devices.items() if device is not None}
+
     # ------------------------------------------------------------------
     # Event helpers
     def send_event(
