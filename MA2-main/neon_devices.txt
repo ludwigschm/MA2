@@ -1,10 +1,9 @@
 # Neon Geräte-Konfiguration
-# Leerlassen = ignorieren. Nur Gerät 1 ist Pflicht, Gerät 2 optional.
 
-VP1_SERIAL=
+VP1_ID=
 VP1_IP=192.168.137.121
 VP1_PORT=8080
 
-VP2_SERIAL=
+VP2_ID=
 VP2_IP=
 VP2_PORT=8080
