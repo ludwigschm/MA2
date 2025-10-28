@@ -176,7 +176,7 @@
     RotatableLabel:
         id: user_display_p1
         size_hint: None, None
-        size: 760 * root.scale + 90 * root.scale, 660 * root.scale
+        size: 1042 * root.scale, 660 * root.scale
         pos: root.width / 2 - 380 * root.scale - 45 * root.scale, root.height / 2 - 560 * root.scale - 30 * root.scale - 40 * root.scale - self.height
         text_size: self.width - 2 * 60 * root.scale, self.height - 2 * 40 * root.scale
         padding: 60 * root.scale, 40 * root.scale
@@ -189,7 +189,7 @@
     RotatableLabel:
         id: user_display_p2
         size_hint: None, None
-        size: 760 * root.scale + 90 * root.scale, 660 * root.scale
+        size: 1042 * root.scale, 660 * root.scale
         pos: root.width / 2 - 380 * root.scale - 45 * root.scale, root.height / 2 + 560 * root.scale + 30 * root.scale + 40 * root.scale
         text_size: self.width - 2 * 60 * root.scale, self.height - 2 * 40 * root.scale
         padding: 60 * root.scale, 40 * root.scale
@@ -277,6 +277,20 @@
             color: 0, 0, 0, 1
             text_size: self.size
             font_size: 56 * root.scale if root.scale else 56
+        IconButton:
+            id: pause_btn_p1
+            source_normal: ASSETS['play']['stop']
+            source_down: ASSETS['play']['live']
+            size_hint: None, None
+            size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
+            pos: root.width - root.horizontal_margin_px - self.width - 120 * root.scale, 300 * root.scale
+        IconButton:
+            id: pause_btn_p2
+            source_normal: ASSETS['play']['stop']
+            source_down: ASSETS['play']['live']
+            size_hint: None, None
+            size: 360 * root.button_scale * root.scale, 360 * root.button_scale * root.scale
+            pos: root.horizontal_margin_px + 120 * root.scale, root.height - 300 * root.scale - self.height
 
     FloatLayout:
         id: fixation_overlay
