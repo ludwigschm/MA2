@@ -28,7 +28,6 @@ from tabletop.overlay.process import (
     stop_overlay,
 )
 from tabletop.tabletop_view import TabletopRoot
-from tabletop.pupil_bridge import PupilBridge
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +44,6 @@ class TabletopApp(App):
         block: Optional[int] = None,
         player: str = "auto",
         players: Optional[Sequence[str]] = None,
-        bridge: Optional[PupilBridge] = None,
         single_block_mode: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -58,7 +56,6 @@ class TabletopApp(App):
         )
 
         self._configure_startup_display(self._target_display_index)
-        self._bridge: Optional[PupilBridge] = bridge
         self._session: Optional[int] = session
         self._block: Optional[int] = block
         requested_players: set[str] = set()
@@ -284,50 +281,21 @@ class TabletopApp(App):
 
         primary_player = next(iter(self._players), "")
         root = TabletopRoot(
-            bridge=self._bridge,
-            bridge_player=primary_player,
-            bridge_session=self._session,
-            bridge_block=self._block,
+            players=self._players,
+            primary_player=primary_player or None,
+            session=self._session,
+            block=self._block,
             single_block_mode=self._single_block_mode,
         )
         # propagate multi-player context so the view can start/stop recordings for all
-        try:
-            root.update_bridge_context(
-                bridge=self._bridge,
-                players=set(self._players),
-                session=self._session,
-                block=self._block,
-            )
-        except Exception:
-            pass
+        root.update_bridge_context(
+            players=set(self._players),
+            session=self._session,
+            block=self._block,
+        )
 
         # ESC binding is scheduled in ``on_start`` once the window exists.
         return root
-
-    # ------------------------------------------------------------------
-    # Bridge helpers
-    def _bridge_payload_base(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if self._session is not None:
-            payload["session"] = self._session
-        if self._block is not None:
-            payload["block"] = self._block
-        return payload
-
-    def _iter_active_players(self) -> list[str]:
-        if not self._bridge:
-            return []
-
-        players = set(self._players)
-        if not players:
-            try:
-                players = set(self._bridge.connected_players())
-            except AttributeError:
-                players = set()
-            if players:
-                self._players = set(players)
-
-        return [player for player in players if self._bridge.is_connected(player)]
 
     def _format_key_name(self, key: int, codepoint: str) -> str:
         if codepoint:
@@ -335,37 +303,6 @@ class TabletopApp(App):
                 return "space"
             return codepoint
         return f"code_{key}"
-
-    def _emit_bridge_key_event(
-        self,
-        action: str,
-        *,
-        key: int,
-        scancode: int,
-        codepoint: str,
-        modifiers: list[str],
-    ) -> None:
-        if not self._bridge:
-            return
-        key_name = self._format_key_name(key, codepoint)
-        players = self._iter_active_players()
-        if not players:
-            return
-        payload_base = self._bridge_payload_base()
-        event_name = f"key.{key_name}.{action}"
-        for player in players:
-            payload = dict(payload_base)
-            payload.update(
-                {
-                    "key": key_name,
-                    "keycode": key,
-                    "scancode": scancode,
-                    "codepoint": codepoint,
-                    "modifiers": modifiers,
-                    "player": player,
-                }
-            )
-            self._bridge.send_event(event_name, player, payload)
 
     def _bind_esc(self) -> None:
         """Ensure ESC toggles fullscreen without closing the app."""
@@ -380,16 +317,6 @@ class TabletopApp(App):
             codepoint: str,
             modifiers: list[str],
         ) -> bool:
-            try:
-                self._emit_bridge_key_event(
-                    "down",
-                    key=key,
-                    scancode=scancode,
-                    codepoint=codepoint,
-                    modifiers=modifiers,
-                )
-            except Exception:  # pragma: no cover - defensive fallback
-                log.exception("Failed to emit bridge key down event")
             if key == 27:  # ESC
                 try:
                     if Window.fullscreen:
@@ -416,16 +343,6 @@ class TabletopApp(App):
             scancode: int,
             *args: Any,
         ) -> bool:
-            try:
-                self._emit_bridge_key_event(
-                    "up",
-                    key=key,
-                    scancode=scancode,
-                    codepoint="",
-                    modifiers=list(args[0]) if args and isinstance(args[0], (list, tuple)) else [],
-                )
-            except Exception:  # pragma: no cover - defensive fallback
-                log.exception("Failed to emit bridge key up event")
             return False
 
         self._key_up_handler = _on_key_up
@@ -436,15 +353,11 @@ class TabletopApp(App):
         root = cast(Optional[TabletopRoot], self.root)
 
         if root is not None:
-            try:
-                root.update_bridge_context(
-                    bridge=self._bridge,
-                    players=set(self._players),
-                    session=self._session,
-                    block=self._block,
-                )
-            except AttributeError:
-                pass
+            root.update_bridge_context(
+                players=set(self._players),
+                session=self._session,
+                block=self._block,
+            )
 
         self._target_display_index = self._determine_display_index()
         self._apply_display_environment(self._target_display_index)
@@ -521,30 +434,13 @@ class TabletopApp(App):
             flush_round_log(root)
             close_round_log(root)
 
-        if root is not None:
-            try:
-                root.stop_bridge_recordings()
-            except AttributeError:
-                pass
-        elif self._bridge is not None:
-            for player in self._iter_active_players():
-                try:
-                    self._bridge.stop_recording(player)
-                except Exception:  # pragma: no cover - defensive fallback
-                    log.exception("Failed to stop recording for %s", player)
-
         super().on_stop()
 
 
-def _resolve_requested_players(
-    player: str, *, connected: Optional[set[str]] = None
-) -> list[str]:
+def _resolve_requested_players(player: str) -> list[str]:
     requested = (player or "auto").strip().lower()
-    connected = {p for p in (connected or set()) if p}
 
-    if requested == "auto":
-        if connected:
-            return sorted(connected)
+    if requested in {"auto", ""}:
         return ["VP1"]
 
     if requested == "both":
@@ -560,20 +456,9 @@ def main(
     block: Optional[int] = None,
     player: str = "auto",
 ) -> None:
-    """Run the tabletop Kivy application with optional Pupil bridge integration."""
+    """Run the tabletop Kivy application."""
 
-    bridge = PupilBridge()
-    try:
-        bridge.connect()
-    except Exception:  # pragma: no cover - defensive fallback
-        log.exception("Failed to connect to Pupil devices")
-
-    try:
-        connected_players = bridge.connected_players()
-    except AttributeError:
-        connected_players = set()
-
-    desired_players = _resolve_requested_players(player, connected=connected_players)
+    desired_players = _resolve_requested_players(player)
 
     single_block_mode = session is not None and block is not None
 
@@ -582,21 +467,9 @@ def main(
         block=block,
         player=player,
         players=desired_players,
-        bridge=bridge,
         single_block_mode=single_block_mode,
     )
-    try:
-        app.run()
-    finally:
-        for tracked in desired_players:
-            try:
-                bridge.stop_recording(tracked)
-            except Exception:  # pragma: no cover - defensive fallback
-                log.exception("Failed to stop recording during shutdown for %s", tracked)
-        try:
-            bridge.close()
-        except Exception:  # pragma: no cover - defensive fallback
-            log.exception("Failed to close Pupil bridge")
+    app.run()
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution
