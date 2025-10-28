@@ -1396,7 +1396,6 @@ class TabletopRoot(FloatLayout):
             suffix = 'In der nächsten Runde spielen Sie zum Spaß.'
         return f"{base}\n{suffix}"
 
-
     def describe_level(self, level:str) -> str:
         return self.format_signal_choice(level) or (level or '-')
 
