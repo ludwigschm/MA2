@@ -29,10 +29,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--player",
         type=str,
-        default="VP1",
-        choices=("VP1", "VP2"),
+        default="auto",
+        choices=("auto", "both", "VP1", "VP2"),
         required=False,
-        help="Optional: Player-Label; Default VP1.",
+        help=(
+            "Optional: Player selector. 'auto' (default) tracks all connected players, "
+            "'both' forces VP1 and VP2, otherwise restrict to the chosen player."
+        ),
     )
     return parser.parse_args(argv)
 

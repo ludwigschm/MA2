@@ -51,7 +51,13 @@ class PupilBridge:
             return
 
         try:
-            found_devices = discover_devices(timeout_seconds=self._connect_timeout)
+            try:
+                found_devices = discover_devices(timeout_seconds=self._connect_timeout)
+            except TypeError:
+                try:
+                    found_devices = discover_devices(timeout=self._connect_timeout)
+                except TypeError:
+                    found_devices = discover_devices(self._connect_timeout)
         except Exception as exc:  # pragma: no cover - network/hardware dependent
             log.exception("Failed to discover Pupil devices: %s", exc)
             return
@@ -162,6 +168,11 @@ class PupilBridge:
         finally:
             self._active_recordings.discard(player)
             self._recording_metadata.pop(player, None)
+
+    def connected_players(self) -> set[str]:
+        """Return the set of players that currently have a connected device."""
+
+        return {player for player, device in self._devices.items() if device is not None}
 
     # ------------------------------------------------------------------
     # Event helpers
