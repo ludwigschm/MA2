@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -22,9 +21,6 @@ except Exception:  # pragma: no cover - optional dependency
     requests = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
-
-_HEX_DIGITS = set("0123456789abcdefABCDEF")
-
 
 CONFIG_TEMPLATE = """# Neon Geräte-Konfiguration
 
@@ -49,27 +45,17 @@ def _ensure_config_file(path: Path) -> None:
         log.exception("Konfigurationsdatei %s konnte nicht erstellt werden", path)
 
 
-def _parse_port(value: str) -> Optional[int]:
-    value = value.strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        log.warning("Ungültiger Portwert in neon_devices.txt: %r", value)
-        return None
-
-
 @dataclass
 class NeonDeviceConfig:
     player: str
     device_id: str = ""
     ip: str = ""
     port: Optional[int] = None
+    port_invalid: bool = False
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.device_id)
+        return bool(self.ip)
 
     @property
     def address(self) -> Optional[str]:
@@ -82,9 +68,13 @@ class NeonDeviceConfig:
     def summary(self) -> str:
         if not self.is_configured:
             return f"{self.player}(deaktiviert)"
-        port_display = str(self.port) if self.port is not None else "-"
         ip_display = self.ip or "-"
-        return f"{self.player}(id={self.device_id}, ip={ip_display}, port={port_display})"
+        if self.port_invalid:
+            port_display = "?"
+        else:
+            port_display = str(self.port) if self.port is not None else "-"
+        id_display = self.device_id or "-"
+        return f"{self.player}(ip={ip_display}, port={port_display}, id={id_display})"
 
 
 def _load_device_config(path: Path) -> Dict[str, NeonDeviceConfig]:
@@ -112,13 +102,29 @@ def _load_device_config(path: Path) -> Dict[str, NeonDeviceConfig]:
 
     vp1 = configs["VP1"]
     vp1.device_id = parsed.get("VP1_ID", vp1.device_id)
-    vp1.ip = parsed.get("VP1_IP", vp1.ip)
-    vp1.port = _parse_port(parsed.get("VP1_PORT", "")) or vp1.port
+    vp1.ip = parsed.get("VP1_IP", vp1.ip).strip()
+    vp1_port_raw = parsed.get("VP1_PORT", "").strip()
+    if vp1_port_raw:
+        try:
+            vp1.port = int(vp1_port_raw)
+        except ValueError:
+            vp1.port_invalid = True
+            vp1.port = None
+    else:
+        vp1.port = 8080
 
     vp2 = configs["VP2"]
     vp2.device_id = parsed.get("VP2_ID", vp2.device_id)
-    vp2.ip = parsed.get("VP2_IP", vp2.ip)
-    vp2.port = _parse_port(parsed.get("VP2_PORT", "")) or vp2.port
+    vp2.ip = parsed.get("VP2_IP", vp2.ip).strip()
+    vp2_port_raw = parsed.get("VP2_PORT", "").strip()
+    if vp2_port_raw:
+        try:
+            vp2.port = int(vp2_port_raw)
+        except ValueError:
+            vp2.port_invalid = True
+            vp2.port = None
+    elif vp2.ip:
+        vp2.port = 8080
 
     log.info("[Konfig geladen] %s, %s", vp1.summary(), vp2.summary())
 
@@ -168,129 +174,109 @@ class PupilBridge:
             return self._connect_from_config(configured_players)
         return self._connect_via_discovery()
 
+    def _validate_config(self) -> None:
+        vp1 = self._device_config.get("VP1")
+        if vp1 is None or not vp1.ip:
+            log.error("VP1_IP ist nicht gesetzt – Verbindung wird abgebrochen.")
+            raise RuntimeError("VP1_IP fehlt in neon_devices.txt")
+        if vp1.port_invalid or vp1.port is None:
+            log.error("VP1_PORT ist ungültig – Verbindung wird abgebrochen.")
+            raise RuntimeError("VP1_PORT ungültig in neon_devices.txt")
+        if vp1.port is None:
+            vp1.port = 8080
+
+        vp2 = self._device_config.get("VP2")
+        if vp2 and vp2.is_configured and (vp2.port_invalid or vp2.port is None):
+            log.error("VP2_PORT ist ungültig – Gerät wird übersprungen.")
+
     def _connect_from_config(self, configured_players: Iterable[str]) -> bool:
         if Device is None:
             raise RuntimeError(
                 "Pupil Labs realtime API not available – direkte Verbindung nicht möglich."
             )
 
+        self._validate_config()
+
         success = True
-        discovered_devices: Optional[list[Any]] = None
         for player in ("VP1", "VP2"):
             cfg = self._device_config.get(player)
-            if not cfg or not cfg.is_configured:
+            if cfg is None:
                 continue
-            preconnected: Optional[Any] = None
-            if not cfg.ip:
-                if discovered_devices is None:
-                    discovered_devices = self._perform_discovery(log_errors=False)
-                match = self._match_discovered_device(cfg.device_id, discovered_devices)
-                if match is not None:
-                    preconnected = match.get("device")
-                    cfg.ip = match.get("ip", cfg.ip) or cfg.ip
-                    if cfg.port is None and match.get("port") is not None:
-                        cfg.port = match["port"]
-                    if preconnected is not None:
-                        with suppress(ValueError):
-                            discovered_devices.remove(preconnected)
-            if not cfg.ip:
-                log.warning("WARNUNG: Kein Gerät mit ID %s gefunden!", cfg.device_id)
+            if not cfg.is_configured:
+                if player == "VP2":
+                    log.info("VP2(deaktiviert) – keine Verbindung aufgebaut.")
+                continue
+            if cfg.port_invalid or cfg.port is None:
+                message = f"Ungültiger Port für {player}: {cfg.port!r}"
                 if player == "VP1":
-                    raise RuntimeError(
-                        f"VP1 konnte nicht verbunden werden: Kein Gerät mit ID {cfg.device_id}"
-                    )
+                    raise RuntimeError(message)
+                log.error(message)
                 success = False
                 continue
             try:
-                device = self._connect_device_with_retries(player, cfg, preconnected_device=preconnected)
+                device = self._connect_device_with_retries(player, cfg)
+                actual_id = self._validate_device_identity(device, cfg)
             except Exception as exc:  # pragma: no cover - hardware dependent
                 if player == "VP1":
                     raise RuntimeError(f"VP1 konnte nicht verbunden werden: {exc}") from exc
-                log.warning("Verbindung zu VP2 fehlgeschlagen: %s", exc)
+                log.error("Verbindung zu VP2 fehlgeschlagen: %s", exc)
                 success = False
                 continue
+
             self._device_by_player[player] = device
             log.info(
-                "Verbunden mit %s (device_id=%s, ip=%s)",
+                "Verbunden mit %s (ip=%s, port=%s, device_id=%s)",
                 player,
-                cfg.device_id,
-                cfg.ip or "-",
+                cfg.ip,
+                cfg.port,
+                actual_id,
             )
+            self._auto_start_recording(player, device)
+
         if "VP1" in configured_players and self._device_by_player.get("VP1") is None:
             raise RuntimeError("VP1 ist konfiguriert, konnte aber nicht verbunden werden.")
         return success and (self._device_by_player.get("VP1") is not None)
 
-    def _connect_device_with_retries(
-        self, player: str, cfg: NeonDeviceConfig, *, preconnected_device: Optional[Any] = None
-    ) -> Any:  # pragma: no cover - hardware dependent
-        delays = [1.0, 2.0, 4.0]
+    def _connect_device_with_retries(self, player: str, cfg: NeonDeviceConfig) -> Any:
+        delays = [1.0, 1.5, 2.0]
         last_error: Optional[BaseException] = None
-        for attempt, delay in enumerate(delays, start=1):
+        for attempt in range(1, 4):
+            log.info("Verbinde mit ip=%s, port=%s (Versuch %s/3)", cfg.ip, cfg.port, attempt)
             try:
-                if preconnected_device is not None:
-                    device = self._ensure_device_connection(preconnected_device)
-                    preconnected_device = None
-                else:
-                    device = self._connect_device_once(cfg)
-                self._assert_device_ready(device, cfg)
-                return device
+                device = self._connect_device_once(cfg)
+                return self._ensure_device_connection(device)
             except Exception as exc:
                 last_error = exc
-                log.warning(
-                    "Verbindungsversuch %s/3 für %s fehlgeschlagen: %s",
-                    attempt,
-                    player,
-                    exc,
-                )
-                if attempt < len(delays):
-                    time.sleep(delay)
+                log.error("Verbindungsversuch %s/3 für %s fehlgeschlagen: %s", attempt, player, exc)
+                if attempt < 3:
+                    time.sleep(delays[attempt - 1])
         raise last_error if last_error else RuntimeError("Unbekannter Verbindungsfehler")
 
     def _connect_device_once(self, cfg: NeonDeviceConfig) -> Any:
         assert Device is not None  # guarded by caller
-        device: Any
+        if not cfg.ip or cfg.port is None:
+            raise RuntimeError("IP oder Port fehlen für den Verbindungsaufbau")
 
-        # Try factory helpers first
-        if cfg.address:
-            factory = getattr(Device, "from_address", None)
-            if callable(factory):
-                try:
-                    candidate = factory(cfg.address)
-                    return self._ensure_device_connection(candidate)
-                except Exception:
-                    log.debug("Device.from_address(%s) fehlgeschlagen", cfg.address, exc_info=True)
+        ip = cfg.ip
+        port = int(cfg.port)
+        first_error: Optional[BaseException] = None
+        try:
+            return Device(ip, port)
+        except Exception as exc:
+            first_error = exc
+            log.error(
+                "Device(ip, port) fehlgeschlagen (%s) – versuche Keyword-Signatur.",
+                exc,
+            )
 
-        # fall back to direct instantiation with different signatures
-        attempts: list[Dict[str, Any]] = []
-        if cfg.ip:
-            if cfg.address:
-                attempts.append({"address": cfg.address})
-            attempts.append({"host": cfg.ip, "port": cfg.port})
-            attempts.append({"ip": cfg.ip, "port": cfg.port})
-
-        device = None
-        for entry in attempts:
-            cleaned = {k: v for k, v in entry.items() if v is not None}
-            if not cleaned:
-                continue
-            try:
-                device = Device(**cleaned)
-                break
-            except TypeError:
-                continue
-        if device is None:
-            kwargs: Dict[str, Any] = {}
-            if cfg.address:
-                kwargs["address"] = cfg.address
-            elif cfg.ip:
-                kwargs["host"] = cfg.ip
-                if cfg.port is not None:
-                    kwargs["port"] = cfg.port
-            if not kwargs:
-                raise RuntimeError("Keine gültigen Verbindungsparameter vorhanden")
-            device = Device(**kwargs)
-
-        return self._ensure_device_connection(device)
+        try:
+            return Device(ip=ip, port=port)
+        except Exception as exc:
+            if first_error:
+                raise RuntimeError(
+                    f"Device konnte nicht initialisiert werden: {first_error}; {exc}"
+                ) from exc
+            raise
 
     def _ensure_device_connection(self, device: Any) -> Any:
         connect_fn = getattr(device, "connect", None)
@@ -301,34 +287,66 @@ class PupilBridge:
                 connect_fn(device)
         return device
 
-    def _assert_device_ready(self, device: Any, cfg: NeonDeviceConfig) -> None:
+    def _close_device(self, device: Any) -> None:
+        for attr in ("disconnect", "close"):
+            fn = getattr(device, attr, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    log.debug("%s() schlug fehl beim Aufräumen", attr, exc_info=True)
+
+    def _validate_device_identity(self, device: Any, cfg: NeonDeviceConfig) -> str:
         status = self._get_device_status(device)
-        if status is None and requests is not None and cfg.address:
-            url = f"http://{cfg.address}/api/status"
+        if status is None and requests is not None and cfg.ip and cfg.port is not None:
+            url = f"http://{cfg.ip}:{cfg.port}/api/status"
             try:
-                resp = requests.get(url, timeout=self._connect_timeout)
-                resp.raise_for_status()
-                status = resp.json()
-            except Exception:
-                log.debug("HTTP-Statusabfrage %s fehlgeschlagen", url, exc_info=True)
+                response = requests.get(url, timeout=self._connect_timeout)
+                response.raise_for_status()
+                status = response.json()
+            except Exception as exc:
+                log.error("HTTP-Statusabfrage %s fehlgeschlagen: %s", url, exc)
 
         if status is None:
-            log.warning("/api/status konnte nicht bestätigt werden (ip=%s)", cfg.ip or "-")
-            return
+            raise RuntimeError("/api/status konnte nicht abgerufen werden")
 
         actual_id = self._extract_device_id_from_status(status)
-        if actual_id is None:
-            log.warning(
-                "Gerät %s liefert keine device_id im Status (ip=%s)",
-                cfg.device_id,
-                cfg.ip or "-",
+        if not actual_id:
+            raise RuntimeError("Gerät meldet keine device_id im Status")
+
+        expected_id = (cfg.device_id or "").strip()
+        log.info("device_id=%s bestätigt (Konfig=%s)", actual_id, expected_id or "-")
+        if expected_id and actual_id.lower() != expected_id.lower():
+            self._close_device(device)
+            raise RuntimeError(
+                f"Gefundenes device_id={actual_id} passt nicht zu Konfig {expected_id}"
             )
+
+        if not cfg.device_id:
+            cfg.device_id = actual_id
+
+        return actual_id
+
+    def _auto_start_recording(self, player: str, device: Any) -> None:
+        if player in self._active_recordings:
+            log.info("recording.start übersprungen (%s bereits aktiv)", player)
+            return
+        label = f"auto.{player.lower()}.{int(time.time())}"
+        log.info("recording.start gesendet (%s, label=%s)", player, label)
+        begin_info = self._send_recording_start(device, label)
+        if begin_info is None:
+            log.warning("recording.begin Timeout (%s)", player)
             return
 
-        if actual_id.lower() != cfg.device_id.lower():
-            raise RuntimeError(
-                f"Geräte-ID stimmt nicht überein (erwartet {cfg.device_id}, erhalten {actual_id})"
-            )
+        recording_id = self._extract_recording_id(begin_info)
+        log.info("recording.begin bestätigt (%s, id=%s)", player, recording_id or "?")
+
+        self._active_recordings.add(player)
+        self._recording_metadata[player] = {
+            "player": player,
+            "recording_label": label,
+            "event": "auto_start",
+        }
 
     def _get_device_status(self, device: Any) -> Optional[Dict[str, Any]]:
         for attr in ("api_status", "status", "get_status"):
@@ -371,25 +389,16 @@ class PupilBridge:
         return None
 
     def _extract_device_id_from_status(self, status: Dict[str, Any]) -> Optional[str]:
-        paths = [
-            ("device_id",),
-            ("device", "device_id"),
-            ("device", "mdns_id"),
-            ("device", "bonjour_id"),
-            ("system", "device_id"),
-            ("system", "bonjour_id"),
-            ("bonjour", "id"),
-        ]
-        for path in paths:
+        for path in (("device_id",), ("device", "device_id"), ("system", "device_id")):
             value = self._dig(status, path)
-            normalized = self._normalise_device_id(value)
-            if normalized:
-                return normalized
-
-        bonjour_name = self._dig(status, ("bonjour_name",)) or self._dig(status, ("device", "bonjour_name"))
-        normalized = self._normalise_device_id(bonjour_name)
-        if normalized:
-            return normalized
+            if value is None:
+                continue
+            if isinstance(value, str):
+                candidate = value.strip()
+            else:
+                candidate = str(value).strip()
+            if candidate:
+                return candidate
         return None
 
     def _perform_discovery(self, *, log_errors: bool = True) -> list[Any]:
@@ -447,49 +456,14 @@ class PupilBridge:
         return info
 
     def _extract_device_id_attribute(self, device: Any) -> Optional[str]:
-        for attr in (
-            "device_id",
-            "mdns_id",
-            "bonjour_id",
-            "bonjour_name",
-            "mdns_name",
-            "identifier",
-            "id",
-        ):
+        for attr in ("device_id", "id"):
             value = getattr(device, attr, None)
-            normalized = self._normalise_device_id(value)
-            if normalized:
-                return normalized
+            if value is None:
+                continue
+            candidate = str(value).strip()
+            if candidate:
+                return candidate
         return None
-
-    def _normalise_device_id(self, value: Any) -> Optional[str]:
-        if not value:
-            return None
-        if isinstance(value, bytes):
-            try:
-                value = value.decode("utf-8")
-            except Exception:
-                return None
-        if not isinstance(value, str):
-            value = str(value)
-        candidate = value.strip()
-        if not candidate:
-            return None
-        if candidate.startswith("http://") or candidate.startswith("https://"):
-            candidate = candidate.split("//", 1)[-1]
-        # Try to find a plausible hex identifier within the string
-        tokens = [candidate]
-        if "-" in candidate:
-            tokens.extend(candidate.split("-"))
-        if "." in candidate:
-            tokens.extend(candidate.split("."))
-        if "_" in candidate:
-            tokens.extend(candidate.split("_"))
-        for token in reversed(tokens):
-            stripped = token.strip()
-            if stripped and all(ch in _HEX_DIGITS for ch in stripped):
-                return stripped.lower()
-        return candidate.lower() if all(ch in _HEX_DIGITS for ch in candidate) else None
 
     def _extract_ip_port(
         self, device: Any, status: Optional[Dict[str, Any]] = None
@@ -598,13 +572,29 @@ class PupilBridge:
                 log.info("Ignoring unmapped device with device_id %s", device_id)
                 continue
             cfg = NeonDeviceConfig(player=player, device_id=device_id)
-            cfg.ip = info.get("ip", "") or ""
-            cfg.port = info.get("port")
+            cfg.ip = (info.get("ip") or "").strip()
+            port_info = info.get("port")
+            if isinstance(port_info, str):
+                try:
+                    cfg.port = int(port_info)
+                except ValueError:
+                    cfg.port = None
+            else:
+                cfg.port = port_info
+            if cfg.ip and cfg.port is None:
+                cfg.port = 8080
             try:
                 prepared = self._ensure_device_connection(device)
-                self._assert_device_ready(prepared, cfg)
+                actual_id = self._validate_device_identity(prepared, cfg)
                 self._device_by_player[player] = prepared
-                log.info("Mapped Pupil device %s to %s", device_id, player)
+                log.info(
+                    "Verbunden mit %s (ip=%s, port=%s, device_id=%s)",
+                    player,
+                    cfg.ip or "-",
+                    cfg.port,
+                    actual_id,
+                )
+                self._auto_start_recording(player, prepared)
             except Exception as exc:  # pragma: no cover - hardware dependent
                 log.warning("Gerät %s konnte nicht verbunden werden: %s", device_id, exc)
 
