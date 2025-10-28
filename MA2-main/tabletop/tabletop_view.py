@@ -333,6 +333,21 @@ class TabletopRoot(FloatLayout):
             btn_start_p2.bind(on_release=lambda *_: self.start_pressed(2))
             btn_start_p2.set_rotation(180)
 
+        pause_btn_p1 = self.wid_safe('pause_btn_p1')
+        if pause_btn_p1 is not None:
+            pause_btn_p1.bind(on_release=lambda *_: self.start_pressed(1))
+            pause_btn_p1.set_rotation(0)
+            pause_btn_p1.set_live(False)
+            pause_btn_p1.disabled = True
+            pause_btn_p1.opacity = 0
+        pause_btn_p2 = self.wid_safe('pause_btn_p2')
+        if pause_btn_p2 is not None:
+            pause_btn_p2.bind(on_release=lambda *_: self.start_pressed(2))
+            pause_btn_p2.set_rotation(180)
+            pause_btn_p2.set_live(False)
+            pause_btn_p2.disabled = True
+            pause_btn_p2.opacity = 0
+
         p1_outer = self.wid_safe('p1_outer')
         if p1_outer is not None:
             p1_outer.bind(on_release=lambda *_: self.tap_card(1, 'outer'))
@@ -425,6 +440,11 @@ class TabletopRoot(FloatLayout):
                 label.set_rotation(0 if player == 1 else 180)
                 label.bind(texture_size=lambda *_: None)
 
+        self.pause_start_buttons = {
+            1: 'pause_btn_p1',
+            2: 'pause_btn_p2',
+        }
+
         fixation_overlay = self.wid_safe('fixation_overlay')
         if fixation_overlay is not None:
             fixation_overlay.opacity = 0
@@ -462,6 +482,7 @@ class TabletopRoot(FloatLayout):
         self.next_block_preview = None
         self.fixation_tone_fs = 44100
         self.fixation_tone = self.fixation_tone_factory(self.fixation_tone_fs)
+        self.in_round_pause = False
 
         self._update_scale()
         self.update_user_displays()
@@ -743,9 +764,10 @@ class TabletopRoot(FloatLayout):
             proceed()
 
     def start_pressed(self, who:int):
-        if self.session_finished:
+        if self.session_finished and not (self.in_round_pause or self.in_block_pause):
             return
-        if self.phase not in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN):
+        allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
+        if not allowed_phase and not (self.in_round_pause or self.in_block_pause):
             return
         if who == 1:
             self.p1_pressed = True
@@ -759,9 +781,16 @@ class TabletopRoot(FloatLayout):
             # in nächste Phase
             self.p1_pressed = False
             self.p2_pressed = False
+            if self.in_round_pause:
+                self.in_round_pause = False
+                self.pause_message = ''
+                self.update_pause_overlay()
+                self.prepare_next_round(start_immediately=True)
+                return
             if self.in_block_pause:
                 self.in_block_pause = False
                 self.pause_message = ''
+                self.update_pause_overlay()
                 self.setup_round()
                 if self.session_finished:
                     self.apply_phase()
@@ -769,8 +798,19 @@ class TabletopRoot(FloatLayout):
                 self.phase = UXPhase.WAIT_BOTH_START
                 self.apply_phase()
                 self.continue_after_start_press()
+                return
             elif self.phase == UXPhase.SHOWDOWN:
-                self.prepare_next_round(start_immediately=True)
+                next_info = self.peek_next_round_info()
+                if not next_info:
+                    self.prepare_next_round(start_immediately=True)
+                    return
+                if next_info.get('round_index', 0) == 0:
+                    self.prepare_next_round(start_immediately=True)
+                    return
+                self.pause_message = self.build_round_pause_message(next_info)
+                self.in_round_pause = True
+                self.update_pause_overlay()
+                return
             else:
                 self.continue_after_start_press()
 
@@ -1149,7 +1189,12 @@ class TabletopRoot(FloatLayout):
         pause_cover = self.wid_safe('pause_cover')
         if pause_cover is None:
             return
-        active = (self.in_block_pause or self.session_finished) and bool(self.pause_message)
+        active = (
+            self.in_round_pause
+            or self.in_block_pause
+            or self.session_finished
+        ) and bool(self.pause_message)
+        buttons_active = self.in_round_pause or self.in_block_pause
         if active:
             if pause_cover.parent is None:
                 self.add_widget(pause_cover)
@@ -1161,6 +1206,13 @@ class TabletopRoot(FloatLayout):
                 lbl = self.wid_safe(label_id)
                 if lbl is not None:
                     lbl.text = self.pause_message
+            for player, btn_id in getattr(self, 'pause_start_buttons', {}).items():
+                btn = self.wid_safe(btn_id)
+                if btn is None:
+                    continue
+                btn.opacity = 1 if buttons_active else 0
+                btn.disabled = not buttons_active
+                btn.set_live(buttons_active)
         else:
             pause_cover.opacity = 0
             pause_cover.disabled = True
@@ -1168,10 +1220,32 @@ class TabletopRoot(FloatLayout):
                 lbl = self.wid_safe(label_id)
                 if lbl is not None:
                     lbl.text = ''
+            for btn_id in getattr(self, 'pause_start_buttons', {}).values():
+                btn = self.wid_safe(btn_id)
+                if btn is None:
+                    continue
+                btn.opacity = 0
+                btn.disabled = True
+                btn.set_live(False)
             if pause_cover.parent is not None:
                 self.remove_widget(pause_cover)
                 # Reihenfolge der Buttons erhalten
                 self.bring_start_buttons_to_front()
+
+    def build_round_pause_message(self, next_info: Optional[Dict[str, Any]]) -> str:
+        base = (
+            "Pause. Atmen Sie kurz durch, wenn Sie bereit für die nächste Runde sind, "
+            "spielen Sie weiter."
+        )
+        if not next_info:
+            return base
+        block = next_info.get('block') or {}
+        payout = block.get('payout')
+        if payout:
+            suffix = 'In der nächsten Runde spielen Sie um Punkte und Lose.'
+        else:
+            suffix = 'In der nächsten Runde spielen Sie zum Spaß.'
+        return f"{base}\n{suffix}"
 
 
 
@@ -1384,6 +1458,7 @@ class TabletopRoot(FloatLayout):
         self.session_finished = False
         self.in_block_pause = False
         self.pause_message = ''
+        self.in_round_pause = False
         self.next_block_preview = None
         self.fixation_required = False
         self.pending_round_start_log = False
