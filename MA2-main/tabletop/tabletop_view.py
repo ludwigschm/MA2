@@ -4,10 +4,9 @@ import csv
 import itertools
 import logging
 import os
-from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import numpy as np
 from kivy.clock import Clock
@@ -50,10 +49,6 @@ from tabletop.ui.assets import (
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
 
 log = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from tabletop.pupil_bridge import PupilBridge
-
 
 ui_widgets.ASSETS = ASSETS
 
@@ -126,10 +121,10 @@ class TabletopRoot(FloatLayout):
         fixation_runner: Callable[..., Any] = overlay_run_fixation_sequence,
         fixation_player: Callable[[Any], None] = overlay_play_fixation_tone,
         fixation_tone_factory: Callable[[int], Any] = generate_fixation_tone,
-        bridge: Optional["PupilBridge"] = None,
-        bridge_player: str = "VP1",
-        bridge_session: Optional[int] = None,
-        bridge_block: Optional[int] = None,
+        players: Optional[Iterable[str]] = None,
+        primary_player: Optional[str] = None,
+        session: Optional[int] = None,
+        block: Optional[int] = None,
         single_block_mode: bool = False,
         **kw: Any,
     ):
@@ -172,23 +167,17 @@ class TabletopRoot(FloatLayout):
         self.round_log_buffer = []
         self.overlay_display_index = 0
 
-        self._bridge: Optional["PupilBridge"] = None
-        self._bridge_player: Optional[str] = None
-        self._bridge_players: set[str] = set()
-        self._bridge_session: Optional[int] = None
-        self._bridge_block: Optional[int] = None
-        self._bridge_recordings_active: set[str] = set()
-        self._bridge_recording_block: Optional[int] = None
-        self._single_block_mode = single_block_mode
-        self.update_bridge_context(
-            bridge=bridge,
-            player=bridge_player,
-            players={bridge_player} if bridge_player else None,
-            session=bridge_session,
-            block=bridge_block,
+        self._bridge_players: set[str] = {p for p in (players or []) if p}
+        if primary_player:
+            self._bridge_players.add(primary_player)
+        self._bridge_player: Optional[str] = (
+            primary_player
+            if primary_player
+            else (next(iter(self._bridge_players), None) if self._bridge_players else None)
         )
-        # kick recordings once Kivy has a chance to finish layout & session may be set
-        Clock.schedule_once(lambda *_: self._ensure_bridge_recordings(), 0.2)
+        self._bridge_session: Optional[int] = session
+        self._bridge_block: Optional[int] = block
+        self._single_block_mode = single_block_mode
 
         # --- UI Elemente initialisieren
         self._configure_widgets()
@@ -219,22 +208,15 @@ class TabletopRoot(FloatLayout):
     def update_bridge_context(
         self,
         *,
-        bridge: Optional["PupilBridge"],
         player: Optional[str] = None,
         players: Optional[Iterable[str]] = None,
-        session: Optional[int],
-        block: Optional[int],
+        session: Optional[int] = None,
+        block: Optional[int] = None,
     ) -> None:
-        self._bridge = bridge
         if players is not None:
             self._bridge_players = {p for p in players if p}
         elif player:
             self._bridge_players = {player}
-        elif bridge is not None:
-            with suppress(AttributeError):
-                detected = bridge.connected_players()
-                if detected:
-                    self._bridge_players = {p for p in detected if p}
         if self._bridge_players:
             self._bridge_player = next(iter(self._bridge_players))
         elif player:
@@ -243,56 +225,8 @@ class TabletopRoot(FloatLayout):
             self._bridge_session = session
         if block is not None:
             self._bridge_block = block
-        players_snapshot = set(self._bridge_players)
-        if players_snapshot and "VP2" not in players_snapshot:
-            log.info("Nur VP1 aktiv – VP2 deaktiviert")
-
-        if bridge is not None:
-            def _kick_autostart(_dt: float) -> None:
-                bridge_ref = self._bridge
-                if bridge_ref is None:
-                    return
-                selected = players_snapshot or (
-                    {self._bridge_player} if self._bridge_player else None
-                )
-                try:
-                    bridge_ref.ensure_recordings(
-                        session=self._bridge_session,
-                        block=self._bridge_block,
-                        players=selected,
-                    )
-                except AttributeError:
-                    pass
-
-            Clock.schedule_once(_kick_autostart, 0.2)
-
-        self._ensure_bridge_recordings()
-
-    def _bridge_payload_base(self, *, player: Optional[str] = None) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {}
-        if self._bridge_session is not None:
-            payload["session"] = self._bridge_session
-        if self._bridge_block is not None:
-            payload["block"] = self._bridge_block
-        if player is not None:
-            payload["player"] = player
-        elif self._bridge_player is not None:
-            payload["player"] = self._bridge_player
-        return payload
-
-    def _bridge_ready_players(self) -> List[str]:
-        if not self._bridge:
-            return []
-
-        players = set(self._bridge_players)
-        if not players:
-            with suppress(AttributeError):
-                detected = self._bridge.connected_players()
-                if detected:
-                    players = {p for p in detected if p}
-                    self._bridge_players = players
-
-        return [player for player in players if self._bridge.is_connected(player)]
+        if self._bridge_session is None and self.session_number is not None:
+            self._bridge_session = self.session_number
 
     def _current_bridge_block_index(self) -> Optional[int]:
         block_info = self.current_block_info
@@ -305,9 +239,6 @@ class TabletopRoot(FloatLayout):
         return None
 
     def _ensure_bridge_recordings(self) -> None:
-        if not self._bridge or not self.session_configured:
-            return
-
         if self._bridge_session is None and self.session_number is not None:
             self._bridge_session = self.session_number
 
@@ -315,63 +246,10 @@ class TabletopRoot(FloatLayout):
         if current_block is not None:
             self._bridge_block = current_block
 
-        session_value = self._bridge_session
-        block_value = self._bridge_block
-        if session_value is None or block_value is None:
-            return
-
-        if (
-            self._bridge_recording_block is not None
-            and block_value != self._bridge_recording_block
-            and self._bridge_recordings_active
-        ):
-            self.stop_bridge_recordings()
-
-        players = self._bridge_ready_players()
-        if not players:
-            return
-
-        for player in players:
-            if player in self._bridge_recordings_active:
-                continue
-            self._bridge.start_recording(session_value, block_value, player)
-            self._bridge_recordings_active.add(player)
-
-        if self._bridge_recordings_active:
-            self._bridge_recording_block = block_value
-
-    def stop_bridge_recordings(self) -> None:
-        if not self._bridge_recordings_active:
-            self._bridge_recording_block = None
-            return
-
-        if not self._bridge:
-            self._bridge_recordings_active.clear()
-            self._bridge_recording_block = None
-            return
-
-        for player in list(self._bridge_recordings_active):
-            try:
-                self._bridge.stop_recording(player)
-            finally:
-                self._bridge_recordings_active.discard(player)
-
-        self._bridge_recording_block = None
-
     def send_bridge_event(
         self, name: str, payload: Optional[Dict[str, Any]] = None
     ) -> None:
-        if not self._bridge:
-            return
-        self._ensure_bridge_recordings()
-        players = self._bridge_ready_players()
-        if not players:
-            return
-        for player in players:
-            event_payload = self._bridge_payload_base(player=player)
-            if payload:
-                event_payload.update(payload)
-            self._bridge.send_event(name, player, event_payload)
+        return
 
     def _emit_button_bridge_event(
         self,
@@ -963,10 +841,6 @@ class TabletopRoot(FloatLayout):
             stop_image=FIX_STOP_IMAGE,
             live_image=FIX_LIVE_IMAGE,
             on_complete=on_complete,
-            bridge=self._bridge,
-            player=self._bridge_player,
-            session=self._bridge_session,
-            block=self._bridge_block,
         )
 
     def play_fixation_tone(self):
