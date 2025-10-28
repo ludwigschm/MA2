@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,8 @@ VP2_PORT=8080
 """
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "neon_devices.txt"
+
+_HEX_ID_PATTERN = re.compile(r"([0-9a-fA-F]{16,})")
 
 
 def _ensure_config_file(path: Path) -> None:
@@ -310,22 +313,47 @@ class PupilBridge:
         if status is None:
             raise RuntimeError("/api/status konnte nicht abgerufen werden")
 
-        actual_id = self._extract_device_id_from_status(status)
-        if not actual_id:
-            raise RuntimeError("Gerät meldet keine device_id im Status")
+        device_id, module_serial = self._extract_identity_fields(status)
+        expected_raw = (cfg.device_id or "").strip()
+        expected_hex = self._extract_hex_device_id(expected_raw)
 
-        expected_id = (cfg.device_id or "").strip()
-        log.info("device_id=%s bestätigt (Konfig=%s)", actual_id, expected_id or "-")
-        if expected_id and actual_id.lower() != expected_id.lower():
-            self._close_device(device)
-            raise RuntimeError(
-                f"Gefundenes device_id={actual_id} passt nicht zu Konfig {expected_id}"
+        if not expected_raw:
+            log.warning(
+                "Keine device_id für %s in der Konfiguration gesetzt – Validierung nur über Statusdaten.",
+                cfg.player,
+            )
+        elif not expected_hex:
+            log.warning(
+                "Konfigurierte device_id %s enthält keine gültige Hex-ID.", expected_raw
             )
 
-        if not cfg.device_id:
-            cfg.device_id = actual_id
+        cfg_display = expected_hex or (expected_raw or "-")
 
-        return actual_id
+        if device_id:
+            log.info("device_id=%s bestätigt (cfg=%s)", device_id, cfg_display)
+            if expected_hex and device_id.lower() != expected_hex.lower():
+                self._close_device(device)
+                raise RuntimeError(
+                    f"Gefundenes device_id={device_id} passt nicht zu Konfig {cfg_display}"
+                )
+            if not cfg.device_id:
+                cfg.device_id = device_id
+            return device_id
+
+        if module_serial:
+            log.info("Kein device_id im Status, nutze module_serial=%s (cfg=%s)", module_serial, cfg_display)
+        else:
+            log.warning(
+                "device_id not present in status; proceeding based on IP/port only (cfg=%s)",
+                cfg_display,
+            )
+
+        if expected_hex and not device_id:
+            log.warning(
+                "Konfigurierte device_id %s konnte nicht bestätigt werden.", expected_hex
+            )
+
+        return module_serial or ""
 
     def _auto_start_recording(self, player: str, device: Any) -> None:
         if player in self._active_recordings:
@@ -348,7 +376,7 @@ class PupilBridge:
             "event": "auto_start",
         }
 
-    def _get_device_status(self, device: Any) -> Optional[Dict[str, Any]]:
+    def _get_device_status(self, device: Any) -> Optional[Any]:
         for attr in ("api_status", "status", "get_status"):
             status_fn = getattr(device, attr, None)
             if not callable(status_fn):
@@ -362,13 +390,15 @@ class PupilBridge:
                 continue
             if isinstance(result, dict):
                 return result
+            if isinstance(result, (list, tuple)):
+                return list(result)
             if isinstance(result, str):
                 try:
                     parsed = json.loads(result)
                 except json.JSONDecodeError:
                     continue
                 else:
-                    if isinstance(parsed, dict):
+                    if isinstance(parsed, (dict, list)):
                         return parsed
             to_dict = getattr(result, "to_dict", None)
             if callable(to_dict):
@@ -376,7 +406,7 @@ class PupilBridge:
                     converted = to_dict()
                 except Exception:
                     continue
-                if isinstance(converted, dict):
+                if isinstance(converted, (dict, list)):
                     return converted
             as_dict = getattr(result, "_asdict", None)
             if callable(as_dict):
@@ -384,22 +414,98 @@ class PupilBridge:
                     converted = as_dict()
                 except Exception:
                     continue
-                if isinstance(converted, dict):
+                if isinstance(converted, (dict, list)):
                     return converted
         return None
 
-    def _extract_device_id_from_status(self, status: Dict[str, Any]) -> Optional[str]:
-        for path in (("device_id",), ("device", "device_id"), ("system", "device_id")):
-            value = self._dig(status, path)
-            if value is None:
-                continue
-            if isinstance(value, str):
-                candidate = value.strip()
-            else:
-                candidate = str(value).strip()
-            if candidate:
-                return candidate
-        return None
+    def _extract_device_id_from_status(self, status: Any) -> Optional[str]:
+        device_id, _ = self._extract_identity_fields(status)
+        return device_id
+
+    def _extract_identity_fields(self, status: Any) -> tuple[Optional[str], Optional[str]]:
+        device_id: Optional[str] = None
+        module_serial: Optional[str] = None
+
+        def set_device(candidate: Any) -> None:
+            nonlocal device_id
+            if device_id:
+                return
+            coerced = self._coerce_identity_value(candidate)
+            if coerced:
+                device_id = coerced
+
+        def set_module(candidate: Any) -> None:
+            nonlocal module_serial
+            if module_serial:
+                return
+            coerced = self._coerce_identity_value(candidate)
+            if coerced:
+                module_serial = coerced
+
+        try:
+            if isinstance(status, dict):
+                set_device(status.get("device_id"))
+                data = status.get("data")
+                if isinstance(data, dict):
+                    set_device(data.get("device_id"))
+                    set_module(data.get("module_serial"))
+                set_module(status.get("module_serial"))
+            elif isinstance(status, (list, tuple)):
+                records = [record for record in status if isinstance(record, dict)]
+                for record in records:
+                    if record.get("model") == "Phone":
+                        data = record.get("data")
+                        if isinstance(data, dict):
+                            set_device(data.get("device_id"))
+                        if device_id:
+                            break
+                if not device_id:
+                    for record in records:
+                        data = record.get("data")
+                        if isinstance(data, dict):
+                            set_device(data.get("device_id"))
+                        if device_id:
+                            break
+                for record in records:
+                    if record.get("model") == "Hardware":
+                        data = record.get("data")
+                        if isinstance(data, dict):
+                            set_module(data.get("module_serial"))
+                        if module_serial:
+                            break
+                if not module_serial:
+                    for record in records:
+                        data = record.get("data")
+                        if isinstance(data, dict):
+                            set_module(data.get("module_serial"))
+                        if module_serial:
+                            break
+        except Exception:
+            log.debug("Konnte Statusinformationen nicht vollständig auswerten", exc_info=True)
+
+        return device_id, module_serial
+
+    def _coerce_identity_value(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except Exception:
+                return None
+        if isinstance(value, str):
+            candidate = value.strip()
+        else:
+            candidate = str(value).strip()
+        return candidate or None
+
+    def _extract_hex_device_id(self, value: str) -> Optional[str]:
+        if not value:
+            return None
+        match = _HEX_ID_PATTERN.search(value)
+        if not match:
+            return None
+        return match.group(1).lower()
 
     def _perform_discovery(self, *, log_errors: bool = True) -> list[Any]:
         if discover_devices is None:
@@ -466,7 +572,7 @@ class PupilBridge:
         return None
 
     def _extract_ip_port(
-        self, device: Any, status: Optional[Dict[str, Any]] = None
+        self, device: Any, status: Optional[Any] = None
     ) -> tuple[Optional[str], Optional[int]]:
         for attr in ("address", "ip", "ip_address", "host"):
             value = getattr(device, attr, None)
@@ -474,18 +580,29 @@ class PupilBridge:
             if ip:
                 return ip, port
         if status:
-            for path in (
-                ("address",),
-                ("ip",),
-                ("network", "ip"),
-                ("network", "address"),
-                ("system", "ip"),
-                ("system", "address"),
-            ):
-                value = self._dig(status, path)
-                ip, port = self._parse_network_value(value)
-                if ip:
-                    return ip, port
+            dict_sources: list[Dict[str, Any]] = []
+            if isinstance(status, dict):
+                dict_sources.append(status)
+            elif isinstance(status, (list, tuple)):
+                for record in status:
+                    if isinstance(record, dict):
+                        dict_sources.append(record)
+                        data = record.get("data")
+                        if isinstance(data, dict):
+                            dict_sources.append(data)
+            for source in dict_sources:
+                for path in (
+                    ("address",),
+                    ("ip",),
+                    ("network", "ip"),
+                    ("network", "address"),
+                    ("system", "ip"),
+                    ("system", "address"),
+                ):
+                    value = self._dig(source, path)
+                    ip, port = self._parse_network_value(value)
+                    if ip:
+                        return ip, port
         return None, None
 
     def _parse_network_value(self, value: Any) -> tuple[Optional[str], Optional[int]]:
