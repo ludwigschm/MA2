@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import itertools
+import logging
 import os
 from contextlib import suppress
 from datetime import datetime
@@ -47,6 +48,8 @@ from tabletop.ui.assets import (
     resolve_background_texture,
 )
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tabletop.pupil_bridge import PupilBridge
@@ -240,6 +243,29 @@ class TabletopRoot(FloatLayout):
             self._bridge_session = session
         if block is not None:
             self._bridge_block = block
+        players_snapshot = set(self._bridge_players)
+        if players_snapshot and "VP2" not in players_snapshot:
+            log.info("Nur VP1 aktiv – VP2 deaktiviert")
+
+        if bridge is not None:
+            def _kick_autostart(_dt: float) -> None:
+                bridge_ref = self._bridge
+                if bridge_ref is None:
+                    return
+                selected = players_snapshot or (
+                    {self._bridge_player} if self._bridge_player else None
+                )
+                try:
+                    bridge_ref.ensure_recordings(
+                        session=self._bridge_session,
+                        block=self._bridge_block,
+                        players=selected,
+                    )
+                except AttributeError:
+                    pass
+
+            Clock.schedule_once(_kick_autostart, 0.2)
+
         self._ensure_bridge_recordings()
 
     def _bridge_payload_base(self, *, player: Optional[str] = None) -> Dict[str, Any]:
