@@ -12,19 +12,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments for the experiment launcher."""
 
     parser = argparse.ArgumentParser(description="Start the Bluffing Eyes tabletop app")
-    parser.add_argument("--session", type=int, required=True, help="Experiment session number")
+    parser.add_argument(
+        "--session",
+        type=int,
+        required=False,
+        default=None,
+        help="Optional: Session-ID. Wenn nicht gesetzt, fragt die UI.",
+    )
     parser.add_argument(
         "--block",
         type=int,
-        required=True,
-        help="Block number (0 for practice, 1-4 experimental)",
+        required=False,
+        default=None,
+        help="Optional: einzelner Block. Wenn nicht gesetzt, steuert der Code die Blöcke.",
     )
     parser.add_argument(
         "--player",
         type=str,
         default="VP1",
         choices=("VP1", "VP2"),
-        help="Player identifier for the connected Pupil device",
+        required=False,
+        help="Optional: Player-Label; Default VP1.",
     )
     return parser.parse_args(argv)
 

@@ -45,6 +45,7 @@ class TabletopApp(App):
         block: Optional[int] = None,
         player: str = "VP1",
         bridge: Optional[PupilBridge] = None,
+        single_block_mode: bool = False,
         **kwargs: Any,
     ) -> None:
         self._overlay_process: Optional[OverlayProcess] = None
@@ -61,6 +62,7 @@ class TabletopApp(App):
         self._block: Optional[int] = block
         self._player: str = player
         self._recording_started: bool = False
+        self._single_block_mode: bool = single_block_mode
         super().__init__(**kwargs)
 
     @staticmethod
@@ -276,6 +278,7 @@ class TabletopApp(App):
             bridge_player=self._player,
             bridge_session=self._session,
             bridge_block=self._block,
+            single_block_mode=self._single_block_mode,
         )
 
         # ESC binding is scheduled in ``on_start`` once the window exists.
@@ -524,11 +527,14 @@ def main(
     except Exception:  # pragma: no cover - defensive fallback
         log.exception("Failed to connect to Pupil devices")
 
+    single_block_mode = session is not None and block is not None
+
     app = TabletopApp(
         session=session,
         block=block,
         player=player,
         bridge=bridge,
+        single_block_mode=single_block_mode,
     )
     try:
         app.run()

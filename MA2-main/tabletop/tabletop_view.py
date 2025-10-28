@@ -126,6 +126,7 @@ class TabletopRoot(FloatLayout):
         bridge_player: str = "VP1",
         bridge_session: Optional[int] = None,
         bridge_block: Optional[int] = None,
+        single_block_mode: bool = False,
         **kw: Any,
     ):
         super().__init__(**kw)
@@ -171,6 +172,7 @@ class TabletopRoot(FloatLayout):
         self._bridge_player: Optional[str] = None
         self._bridge_session: Optional[int] = None
         self._bridge_block: Optional[int] = None
+        self._single_block_mode = single_block_mode
         self.update_bridge_context(
             bridge=bridge,
             player=bridge_player,
@@ -182,7 +184,10 @@ class TabletopRoot(FloatLayout):
         self._configure_widgets()
         self.setup_round()
         self.apply_phase()
-        Clock.schedule_once(lambda *_: self.prompt_session_number(), 0.1)
+        if self._single_block_mode and self._bridge_session is not None and self._bridge_block is not None:
+            Clock.schedule_once(self._configure_session_from_cli, 0.1)
+        else:
+            Clock.schedule_once(lambda *_: self.prompt_session_number(), 0.1)
 
     def __setattr__(self, key, value):
         if key in self._STATE_FIELDS and 'controller' in self.__dict__:
@@ -235,6 +240,87 @@ class TabletopRoot(FloatLayout):
         if payload:
             event_payload.update(payload)
         self._bridge.send_event(name, self._bridge_player, event_payload)
+
+    # ------------------------------------------------------------------
+    # Session helpers
+    def _available_block_count(self) -> int:
+        blocks = self._blocks or []
+        return len(blocks)
+
+    def _clamp_start_block_choice(self, choice: int) -> int:
+        total = self._available_block_count()
+        if total <= 0:
+            return 1
+        return max(1, min(choice, total))
+
+    def _start_block_from_cli(self, block_index: Optional[int]) -> int:
+        total = self._available_block_count()
+        if total <= 0:
+            return 1
+        try:
+            index = int(block_index) if block_index is not None else 0
+        except (TypeError, ValueError):
+            index = 0
+        index = max(0, min(index, total - 1))
+        return index + 1
+
+    def _finalize_session_setup(
+        self,
+        session_label: str,
+        *,
+        start_block_value: Optional[int] = None,
+        aruco_enabled: Optional[bool] = None,
+    ) -> None:
+        if not session_label:
+            return
+
+        self.session_id = session_label
+        digits = ''.join(ch for ch in session_label if ch.isdigit())
+        self.session_number = int(digits) if digits else None
+
+        start_choice = start_block_value if start_block_value is not None else self.start_block
+        self.start_block = self._clamp_start_block_choice(start_choice)
+
+        if aruco_enabled is not None:
+            self.aruco_enabled = bool(aruco_enabled)
+
+        safe_session_id = ''.join(
+            ch if ch.isalnum() or ch in ('-', '_') else '_'
+            for ch in self.session_id
+        ) or 'session'
+
+        self.session_configured = True
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
+        self.session_storage_id = safe_session_id
+        self.logger = self.events_factory(self.session_id, str(db_path))
+        init_round_log(self)
+        self.update_role_assignments()
+
+        self.log_event(
+            None,
+            'session_start',
+            {
+                'session_number': self.session_number,
+                'session_id': self.session_id,
+                'aruco_enabled': self.aruco_enabled,
+                'start_block': self.start_block,
+            },
+        )
+        self._apply_session_options_and_start()
+
+    def _configure_session_from_cli(self, *_args: Any) -> None:
+        if self.session_configured:
+            return
+        if self._bridge_session is None:
+            self.prompt_session_number()
+            return
+        start_block_value = self._start_block_from_cli(self._bridge_block)
+        self._finalize_session_setup(
+            str(self._bridge_session),
+            start_block_value=start_block_value,
+            aruco_enabled=self.aruco_enabled,
+        )
 
     # --- Layout & Elemente
     def _configure_widgets(self):
@@ -1228,42 +1314,21 @@ class TabletopRoot(FloatLayout):
                 error_label.text = 'Bitte Session ID eingeben.'
                 return
 
-            self.session_id = session_text
-            digits = ''.join(ch for ch in session_text if ch.isdigit())
-            self.session_number = int(digits) if digits else None
-            self.aruco_enabled = bool(overlay_switch.active)
             try:
-                self.start_block = int(block_spinner.text)
+                start_block_choice = int(block_spinner.text)
             except Exception:
-                self.start_block = 1
-
-            safe_session_id = ''.join(
-                ch if ch.isalnum() or ch in ('-', '_') else '_'
-                for ch in self.session_id
-            ) or 'session'
-
-            self.session_configured = True
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
-            self.session_storage_id = safe_session_id
-            self.logger = self.events_factory(self.session_id, str(db_path))
-            init_round_log(self)
-            self.update_role_assignments()
+                start_block_choice = 1
+            start_block_choice = self._clamp_start_block_choice(start_block_choice)
+            aruco_active = bool(overlay_switch.active)
 
             popup.dismiss()
             self.session_popup = None
 
-            self.log_event(
-                None,
-                'session_start',
-                {
-                    'session_number': self.session_number,
-                    'session_id': self.session_id,
-                    'aruco_enabled': self.aruco_enabled,
-                    'start_block': self.start_block,
-                },
+            self._finalize_session_setup(
+                session_text,
+                start_block_value=start_block_choice,
+                aruco_enabled=aruco_active,
             )
-            self._apply_session_options_and_start()
 
         def _on_cancel(_btn):
             popup.dismiss()
