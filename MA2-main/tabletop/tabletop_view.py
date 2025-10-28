@@ -609,8 +609,6 @@ class TabletopRoot(FloatLayout):
         self.next_block_preview = None
         self.fixation_tone_fs = 44100
         self.fixation_tone = self.fixation_tone_factory(self.fixation_tone_fs)
-        self.in_round_pause = False
-
         self._update_scale()
         self.update_user_displays()
         self.update_intro_overlay()
@@ -891,17 +889,10 @@ class TabletopRoot(FloatLayout):
             proceed()
 
     def start_pressed(self, who:int):
-        phase_allowed = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
-        allowed = (not self.session_finished) and phase_allowed
-        self._emit_button_bridge_event(
-            "start",
-            player=who,
-            extra={
-                "allowed": allowed,
-                "session_configured": self.session_configured,
-            },
-        )
-        if not allowed:
+        if self.session_finished and not self.in_block_pause:
+            return
+        allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
+        if not allowed_phase and not self.in_block_pause:
             return
         if who == 1:
             self.p1_pressed = True
@@ -934,16 +925,7 @@ class TabletopRoot(FloatLayout):
                 self.continue_after_start_press()
                 return
             elif self.phase == UXPhase.SHOWDOWN:
-                next_info = self.peek_next_round_info()
-                if not next_info:
-                    self.prepare_next_round(start_immediately=True)
-                    return
-                if next_info.get('round_index', 0) == 0:
-                    self.prepare_next_round(start_immediately=True)
-                    return
-                self.pause_message = self.build_round_pause_message(next_info)
-                self.in_round_pause = True
-                self.update_pause_overlay()
+                self.prepare_next_round(start_immediately=True)
                 return
             else:
                 self.continue_after_start_press()
@@ -1056,10 +1038,17 @@ class TabletopRoot(FloatLayout):
         self._apply_round_setup(result.setup)
         self.apply_phase()
         if result.session_finished:
-            self.stop_bridge_recordings()
+            message = self.controller.state.pause_message or (
+                'Vielen Dank die Teilnahme! Das Experiment ist nun beendet!'
+            )
+            self.pause_message = message
+            self.update_pause_overlay()
             self.update_user_displays()
             return
         if result.in_block_pause:
+            self.in_block_pause = True
+            self.pause_message = self.controller.state.pause_message or ''
+            self.update_pause_overlay()
             return
 
         def start_round():
@@ -1351,11 +1340,10 @@ class TabletopRoot(FloatLayout):
         if pause_cover is None:
             return
         active = (
-            self.in_round_pause
-            or self.in_block_pause
+            self.in_block_pause
             or self.session_finished
         ) and bool(self.pause_message)
-        buttons_active = self.in_round_pause or self.in_block_pause
+        buttons_active = self.in_block_pause
         if active:
             if pause_cover.parent is None:
                 self.add_widget(pause_cover)
@@ -1407,7 +1395,6 @@ class TabletopRoot(FloatLayout):
         else:
             suffix = 'In der nächsten Runde spielen Sie zum Spaß.'
         return f"{base}\n{suffix}"
-
 
 
     def describe_level(self, level:str) -> str:
