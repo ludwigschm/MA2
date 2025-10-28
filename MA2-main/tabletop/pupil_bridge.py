@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -22,15 +23,16 @@ except Exception:  # pragma: no cover - optional dependency
 
 log = logging.getLogger(__name__)
 
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+
 
 CONFIG_TEMPLATE = """# Neon Geräte-Konfiguration
-# Leerlassen = ignorieren. Nur Gerät 1 ist Pflicht, Gerät 2 optional.
 
-VP1_SERIAL=
+VP1_ID=
 VP1_IP=192.168.137.121
 VP1_PORT=8080
 
-VP2_SERIAL=
+VP2_ID=
 VP2_IP=
 VP2_PORT=8080
 """
@@ -61,13 +63,13 @@ def _parse_port(value: str) -> Optional[int]:
 @dataclass
 class NeonDeviceConfig:
     player: str
-    serial: str = ""
+    device_id: str = ""
     ip: str = ""
     port: Optional[int] = None
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.ip or self.serial)
+        return bool(self.device_id)
 
     @property
     def address(self) -> Optional[str]:
@@ -79,11 +81,10 @@ class NeonDeviceConfig:
 
     def summary(self) -> str:
         if not self.is_configured:
-            return "deaktiviert"
+            return f"{self.player}(deaktiviert)"
         port_display = str(self.port) if self.port is not None else "-"
         ip_display = self.ip or "-"
-        serial_display = self.serial or "-"
-        return f"ip={ip_display}, port={port_display}, serial={serial_display}"
+        return f"{self.player}(id={self.device_id}, ip={ip_display}, port={port_display})"
 
 
 def _load_device_config(path: Path) -> Dict[str, NeonDeviceConfig]:
@@ -110,23 +111,16 @@ def _load_device_config(path: Path) -> Dict[str, NeonDeviceConfig]:
         parsed[key.strip().upper()] = value.strip()
 
     vp1 = configs["VP1"]
-    vp1.serial = parsed.get("VP1_SERIAL", vp1.serial)
+    vp1.device_id = parsed.get("VP1_ID", vp1.device_id)
     vp1.ip = parsed.get("VP1_IP", vp1.ip)
     vp1.port = _parse_port(parsed.get("VP1_PORT", "")) or vp1.port
 
     vp2 = configs["VP2"]
-    vp2.serial = parsed.get("VP2_SERIAL", vp2.serial)
+    vp2.device_id = parsed.get("VP2_ID", vp2.device_id)
     vp2.ip = parsed.get("VP2_IP", vp2.ip)
     vp2.port = _parse_port(parsed.get("VP2_PORT", "")) or vp2.port
 
-    log.info(
-        "Konfig geladen: VP1(%s), VP2(%s)",
-        vp1.summary(),
-        vp2.summary(),
-    )
-
-    if not vp2.is_configured:
-        log.info("VP2 deaktiviert (keine IP/Serial)")
+    log.info("[Konfig geladen] %s, %s", vp1.summary(), vp2.summary())
 
     return configs
 
@@ -137,12 +131,12 @@ _ensure_config_file(CONFIG_PATH)
 class PupilBridge:
     """Facade around the Pupil Labs realtime API with graceful fallbacks."""
 
-    DEFAULT_MAPPING: Dict[str, str] = {"146118": "VP1"}
+    DEFAULT_MAPPING: Dict[str, str] = {}
     _PLAYER_INDICES: Dict[str, int] = {"VP1": 1, "VP2": 2}
 
     def __init__(
         self,
-        serial_to_player: Optional[Dict[str, str]] = None,
+        device_mapping: Optional[Dict[str, str]] = None,
         connect_timeout: float = 10.0,
         *,
         config_path: Optional[Path] = None,
@@ -150,9 +144,10 @@ class PupilBridge:
         config_file = config_path or CONFIG_PATH
         _ensure_config_file(config_file)
         self._device_config = _load_device_config(config_file)
-        self._serial_to_player: Dict[str, str] = (
-            dict(serial_to_player) if serial_to_player is not None else dict(self.DEFAULT_MAPPING)
-        )
+        mapping_src = device_mapping if device_mapping is not None else self.DEFAULT_MAPPING
+        self._device_id_to_player: Dict[str, str] = {
+            str(device_id).lower(): player for device_id, player in mapping_src.items() if player
+        }
         self._connect_timeout = float(connect_timeout)
         self._device_by_player: Dict[str, Any] = {"VP1": None, "VP2": None}
         self._active_recordings: set[str] = set()
@@ -180,12 +175,34 @@ class PupilBridge:
             )
 
         success = True
+        discovered_devices: Optional[list[Any]] = None
         for player in ("VP1", "VP2"):
             cfg = self._device_config.get(player)
             if not cfg or not cfg.is_configured:
                 continue
+            preconnected: Optional[Any] = None
+            if not cfg.ip:
+                if discovered_devices is None:
+                    discovered_devices = self._perform_discovery(log_errors=False)
+                match = self._match_discovered_device(cfg.device_id, discovered_devices)
+                if match is not None:
+                    preconnected = match.get("device")
+                    cfg.ip = match.get("ip", cfg.ip) or cfg.ip
+                    if cfg.port is None and match.get("port") is not None:
+                        cfg.port = match["port"]
+                    if preconnected is not None:
+                        with suppress(ValueError):
+                            discovered_devices.remove(preconnected)
+            if not cfg.ip:
+                log.warning("WARNUNG: Kein Gerät mit ID %s gefunden!", cfg.device_id)
+                if player == "VP1":
+                    raise RuntimeError(
+                        f"VP1 konnte nicht verbunden werden: Kein Gerät mit ID {cfg.device_id}"
+                    )
+                success = False
+                continue
             try:
-                device = self._connect_device_with_retries(player, cfg)
+                device = self._connect_device_with_retries(player, cfg, preconnected_device=preconnected)
             except Exception as exc:  # pragma: no cover - hardware dependent
                 if player == "VP1":
                     raise RuntimeError(f"VP1 konnte nicht verbunden werden: {exc}") from exc
@@ -194,23 +211,27 @@ class PupilBridge:
                 continue
             self._device_by_player[player] = device
             log.info(
-                "Verbunden mit %s (ip=%s, serial=%s)",
+                "Verbunden mit %s (device_id=%s, ip=%s)",
                 player,
+                cfg.device_id,
                 cfg.ip or "-",
-                cfg.serial or "-",
             )
         if "VP1" in configured_players and self._device_by_player.get("VP1") is None:
             raise RuntimeError("VP1 ist konfiguriert, konnte aber nicht verbunden werden.")
         return success and (self._device_by_player.get("VP1") is not None)
 
     def _connect_device_with_retries(
-        self, player: str, cfg: NeonDeviceConfig
+        self, player: str, cfg: NeonDeviceConfig, *, preconnected_device: Optional[Any] = None
     ) -> Any:  # pragma: no cover - hardware dependent
         delays = [1.0, 2.0, 4.0]
         last_error: Optional[BaseException] = None
         for attempt, delay in enumerate(delays, start=1):
             try:
-                device = self._connect_device_once(cfg)
+                if preconnected_device is not None:
+                    device = self._ensure_device_connection(preconnected_device)
+                    preconnected_device = None
+                else:
+                    device = self._connect_device_once(cfg)
                 self._assert_device_ready(device, cfg)
                 return device
             except Exception as exc:
@@ -234,17 +255,10 @@ class PupilBridge:
             factory = getattr(Device, "from_address", None)
             if callable(factory):
                 try:
-                    return factory(cfg.address)
+                    candidate = factory(cfg.address)
+                    return self._ensure_device_connection(candidate)
                 except Exception:
                     log.debug("Device.from_address(%s) fehlgeschlagen", cfg.address, exc_info=True)
-
-        if cfg.serial:
-            from_serial = getattr(Device, "from_serial", None)
-            if callable(from_serial):
-                try:
-                    return from_serial(cfg.serial)
-                except Exception:
-                    log.debug("Device.from_serial(%s) fehlgeschlagen", cfg.serial, exc_info=True)
 
         # fall back to direct instantiation with different signatures
         attempts: list[Dict[str, Any]] = []
@@ -253,9 +267,6 @@ class PupilBridge:
                 attempts.append({"address": cfg.address})
             attempts.append({"host": cfg.ip, "port": cfg.port})
             attempts.append({"ip": cfg.ip, "port": cfg.port})
-        if cfg.serial:
-            attempts.append({"serial": cfg.serial})
-            attempts.append({"serial_number": cfg.serial})
 
         device = None
         for entry in attempts:
@@ -271,10 +282,17 @@ class PupilBridge:
             kwargs: Dict[str, Any] = {}
             if cfg.address:
                 kwargs["address"] = cfg.address
-            if cfg.serial:
-                kwargs["serial_number"] = cfg.serial
-            device = Device(**{k: v for k, v in kwargs.items() if v})
+            elif cfg.ip:
+                kwargs["host"] = cfg.ip
+                if cfg.port is not None:
+                    kwargs["port"] = cfg.port
+            if not kwargs:
+                raise RuntimeError("Keine gültigen Verbindungsparameter vorhanden")
+            device = Device(**kwargs)
 
+        return self._ensure_device_connection(device)
+
+    def _ensure_device_connection(self, device: Any) -> Any:
         connect_fn = getattr(device, "connect", None)
         if callable(connect_fn):
             try:
@@ -284,27 +302,278 @@ class PupilBridge:
         return device
 
     def _assert_device_ready(self, device: Any, cfg: NeonDeviceConfig) -> None:
-        status_checked = False
-        for attr in ("api_status", "status", "get_status"):
-            status_fn = getattr(device, attr, None)
-            if callable(status_fn):
-                try:
-                    status = status_fn()
-                    if status is not None:
-                        status_checked = True
-                        break
-                except Exception:
-                    log.debug("Statusabfrage über %s fehlgeschlagen", attr, exc_info=True)
-        if not status_checked and requests is not None and cfg.address:
+        status = self._get_device_status(device)
+        if status is None and requests is not None and cfg.address:
             url = f"http://{cfg.address}/api/status"
             try:
                 resp = requests.get(url, timeout=self._connect_timeout)
                 resp.raise_for_status()
-                status_checked = True
+                status = resp.json()
             except Exception:
                 log.debug("HTTP-Statusabfrage %s fehlgeschlagen", url, exc_info=True)
-        if not status_checked:
+
+        if status is None:
             log.warning("/api/status konnte nicht bestätigt werden (ip=%s)", cfg.ip or "-")
+            return
+
+        actual_id = self._extract_device_id_from_status(status)
+        if actual_id is None:
+            log.warning(
+                "Gerät %s liefert keine device_id im Status (ip=%s)",
+                cfg.device_id,
+                cfg.ip or "-",
+            )
+            return
+
+        if actual_id.lower() != cfg.device_id.lower():
+            raise RuntimeError(
+                f"Geräte-ID stimmt nicht überein (erwartet {cfg.device_id}, erhalten {actual_id})"
+            )
+
+    def _get_device_status(self, device: Any) -> Optional[Dict[str, Any]]:
+        for attr in ("api_status", "status", "get_status"):
+            status_fn = getattr(device, attr, None)
+            if not callable(status_fn):
+                continue
+            try:
+                result = status_fn()
+            except Exception:
+                log.debug("Statusabfrage über %s fehlgeschlagen", attr, exc_info=True)
+                continue
+            if result is None:
+                continue
+            if isinstance(result, dict):
+                return result
+            if isinstance(result, str):
+                try:
+                    parsed = json.loads(result)
+                except json.JSONDecodeError:
+                    continue
+                else:
+                    if isinstance(parsed, dict):
+                        return parsed
+            to_dict = getattr(result, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    converted = to_dict()
+                except Exception:
+                    continue
+                if isinstance(converted, dict):
+                    return converted
+            as_dict = getattr(result, "_asdict", None)
+            if callable(as_dict):
+                try:
+                    converted = as_dict()
+                except Exception:
+                    continue
+                if isinstance(converted, dict):
+                    return converted
+        return None
+
+    def _extract_device_id_from_status(self, status: Dict[str, Any]) -> Optional[str]:
+        paths = [
+            ("device_id",),
+            ("device", "device_id"),
+            ("device", "mdns_id"),
+            ("device", "bonjour_id"),
+            ("system", "device_id"),
+            ("system", "bonjour_id"),
+            ("bonjour", "id"),
+        ]
+        for path in paths:
+            value = self._dig(status, path)
+            normalized = self._normalise_device_id(value)
+            if normalized:
+                return normalized
+
+        bonjour_name = self._dig(status, ("bonjour_name",)) or self._dig(status, ("device", "bonjour_name"))
+        normalized = self._normalise_device_id(bonjour_name)
+        if normalized:
+            return normalized
+        return None
+
+    def _perform_discovery(self, *, log_errors: bool = True) -> list[Any]:
+        if discover_devices is None:
+            return []
+        try:
+            try:
+                devices = discover_devices(timeout_seconds=self._connect_timeout)
+            except TypeError:
+                try:
+                    devices = discover_devices(timeout=self._connect_timeout)
+                except TypeError:
+                    devices = discover_devices(self._connect_timeout)
+        except Exception as exc:  # pragma: no cover - network/hardware dependent
+            if log_errors:
+                log.exception("Failed to discover Pupil devices: %s", exc)
+            else:
+                log.debug("Discovery fehlgeschlagen: %s", exc, exc_info=True)
+            return []
+        return list(devices) if devices else []
+
+    def _match_discovered_device(
+        self, device_id: str, devices: Optional[Iterable[Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not device_id or not devices:
+            return None
+        wanted = device_id.lower()
+        for device in devices:
+            info = self._inspect_discovered_device(device)
+            candidate = info.get("device_id")
+            if candidate and candidate.lower() == wanted:
+                return info
+        return None
+
+    def _inspect_discovered_device(self, device: Any) -> Dict[str, Any]:
+        info: Dict[str, Any] = {"device": device}
+        direct_id = self._extract_device_id_attribute(device)
+        status: Optional[Dict[str, Any]] = None
+        if direct_id:
+            info["device_id"] = direct_id
+            status = self._get_device_status(device)
+        else:
+            status = self._get_device_status(device)
+            if status is not None:
+                status_id = self._extract_device_id_from_status(status)
+                if status_id:
+                    info["device_id"] = status_id
+        if status is None:
+            status = {}
+        ip, port = self._extract_ip_port(device, status)
+        if ip:
+            info["ip"] = ip
+        if port is not None:
+            info["port"] = port
+        return info
+
+    def _extract_device_id_attribute(self, device: Any) -> Optional[str]:
+        for attr in (
+            "device_id",
+            "mdns_id",
+            "bonjour_id",
+            "bonjour_name",
+            "mdns_name",
+            "identifier",
+            "id",
+        ):
+            value = getattr(device, attr, None)
+            normalized = self._normalise_device_id(value)
+            if normalized:
+                return normalized
+        return None
+
+    def _normalise_device_id(self, value: Any) -> Optional[str]:
+        if not value:
+            return None
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except Exception:
+                return None
+        if not isinstance(value, str):
+            value = str(value)
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            candidate = candidate.split("//", 1)[-1]
+        # Try to find a plausible hex identifier within the string
+        tokens = [candidate]
+        if "-" in candidate:
+            tokens.extend(candidate.split("-"))
+        if "." in candidate:
+            tokens.extend(candidate.split("."))
+        if "_" in candidate:
+            tokens.extend(candidate.split("_"))
+        for token in reversed(tokens):
+            stripped = token.strip()
+            if stripped and all(ch in _HEX_DIGITS for ch in stripped):
+                return stripped.lower()
+        return candidate.lower() if all(ch in _HEX_DIGITS for ch in candidate) else None
+
+    def _extract_ip_port(
+        self, device: Any, status: Optional[Dict[str, Any]] = None
+    ) -> tuple[Optional[str], Optional[int]]:
+        for attr in ("address", "ip", "ip_address", "host"):
+            value = getattr(device, attr, None)
+            ip, port = self._parse_network_value(value)
+            if ip:
+                return ip, port
+        if status:
+            for path in (
+                ("address",),
+                ("ip",),
+                ("network", "ip"),
+                ("network", "address"),
+                ("system", "ip"),
+                ("system", "address"),
+            ):
+                value = self._dig(status, path)
+                ip, port = self._parse_network_value(value)
+                if ip:
+                    return ip, port
+        return None, None
+
+    def _parse_network_value(self, value: Any) -> tuple[Optional[str], Optional[int]]:
+        if value is None:
+            return None, None
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return None, None
+            host = value[0]
+            port = value[1] if len(value) > 1 else None
+            return self._coerce_host(host), self._coerce_port(port)
+        if isinstance(value, dict):
+            host = value.get("host") or value.get("ip") or value.get("address")
+            port = value.get("port")
+            return self._coerce_host(host), self._coerce_port(port)
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except Exception:
+                return None, None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None, None
+            if "//" in text:
+                text = text.split("//", 1)[-1]
+            if ":" in text:
+                host_part, _, port_part = text.rpartition(":")
+                host = host_part.strip() or None
+                port = self._coerce_port(port_part)
+                return host, port
+            return text, None
+        return self._coerce_host(value), None
+
+    def _coerce_host(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except Exception:
+                return None
+        host = str(value).strip()
+        return host or None
+
+    def _coerce_port(self, value: Any) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _dig(self, data: Dict[str, Any], path: Iterable[str]) -> Any:
+        current: Any = data
+        for key in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+            if current is None:
+                return None
+        return current
 
     def _connect_via_discovery(self) -> bool:
         if discover_devices is None:
@@ -313,33 +582,31 @@ class PupilBridge:
             )
             return False
 
-        try:
-            try:
-                found_devices = discover_devices(timeout_seconds=self._connect_timeout)
-            except TypeError:
-                try:
-                    found_devices = discover_devices(timeout=self._connect_timeout)
-                except TypeError:
-                    found_devices = discover_devices(self._connect_timeout)
-        except Exception as exc:  # pragma: no cover - network/hardware dependent
-            log.exception("Failed to discover Pupil devices: %s", exc)
-            return False
-
+        found_devices = self._perform_discovery(log_errors=True)
         if not found_devices:
             log.warning("No Pupil devices discovered within %.1fs", self._connect_timeout)
             return False
 
         for device in found_devices:
-            serial = getattr(device, "serial_number", None) or getattr(device, "serial", None)
-            if not serial:
-                log.debug("Skipping device without serial: %r", device)
+            info = self._inspect_discovered_device(device)
+            device_id = info.get("device_id")
+            if not device_id:
+                log.debug("Skipping device ohne device_id: %r", device)
                 continue
-            player = self._serial_to_player.get(str(serial))
+            player = self._device_id_to_player.get(device_id.lower())
             if not player:
-                log.info("Ignoring unmapped device with serial %s", serial)
+                log.info("Ignoring unmapped device with device_id %s", device_id)
                 continue
-            self._device_by_player[player] = device
-            log.info("Mapped Pupil device %s to %s", serial, player)
+            cfg = NeonDeviceConfig(player=player, device_id=device_id)
+            cfg.ip = info.get("ip", "") or ""
+            cfg.port = info.get("port")
+            try:
+                prepared = self._ensure_device_connection(device)
+                self._assert_device_ready(prepared, cfg)
+                self._device_by_player[player] = prepared
+                log.info("Mapped Pupil device %s to %s", device_id, player)
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                log.warning("Gerät %s konnte nicht verbunden werden: %s", device_id, exc)
 
         missing_players = [player for player, device in self._device_by_player.items() if device is None]
         if missing_players:
