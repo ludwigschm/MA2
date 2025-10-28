@@ -282,13 +282,24 @@ class TabletopApp(App):
                 Builder.load_file(str(kv_path))
             _KV_LOADED = True
 
+        primary_player = next(iter(self._players), "")
         root = TabletopRoot(
             bridge=self._bridge,
-            bridge_player=self._player,
+            bridge_player=primary_player,
             bridge_session=self._session,
             bridge_block=self._block,
             single_block_mode=self._single_block_mode,
         )
+        # propagate multi-player context so the view can start/stop recordings for all
+        try:
+            root.update_bridge_context(
+                bridge=self._bridge,
+                players=self._players,
+                session=self._session,
+                block=self._block,
+            )
+        except Exception:
+            pass
 
         # ESC binding is scheduled in ``on_start`` once the window exists.
         return root
