@@ -21,6 +21,7 @@ from kivy.uix.spinner import Spinner
 from kivy.uix.switch import Switch
 from kivy.uix.textinput import TextInput
 
+from tabletop.bridge import NeonEyeTrackerBridge
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from tabletop.logging.events import Events
@@ -178,6 +179,7 @@ class TabletopRoot(FloatLayout):
         self._bridge_session: Optional[int] = session
         self._bridge_block: Optional[int] = block
         self._single_block_mode = single_block_mode
+        self.eye_tracker_bridge = NeonEyeTrackerBridge.from_config(player="VP1")
 
         # --- UI Elemente initialisieren
         self._configure_widgets()
@@ -227,6 +229,11 @@ class TabletopRoot(FloatLayout):
             self._bridge_block = block
         if self._bridge_session is None and self.session_number is not None:
             self._bridge_session = self.session_number
+        if self.eye_tracker_bridge is not None:
+            self.eye_tracker_bridge.update_context(
+                session_number=self._bridge_session,
+                block=self._bridge_block,
+            )
 
     def _current_bridge_block_index(self) -> Optional[int]:
         block_info = self.current_block_info
@@ -245,11 +252,19 @@ class TabletopRoot(FloatLayout):
         current_block = self._current_bridge_block_index()
         if current_block is not None:
             self._bridge_block = current_block
+        if self.eye_tracker_bridge is not None:
+            self.eye_tracker_bridge.update_context(
+                session_label=self.session_id,
+                session_number=self.session_number or self._bridge_session,
+                block=self._bridge_block,
+            )
 
     def send_bridge_event(
         self, name: str, payload: Optional[Dict[str, Any]] = None
     ) -> None:
-        return
+        if self.eye_tracker_bridge is None:
+            return
+        self.eye_tracker_bridge.handle_event(name, payload or {})
 
     def _emit_button_bridge_event(
         self,
@@ -338,6 +353,20 @@ class TabletopRoot(FloatLayout):
             },
         )
         self._ensure_bridge_recordings()
+        if self.eye_tracker_bridge is not None:
+            self.eye_tracker_bridge.update_context(
+                session_label=self.session_id,
+                session_number=self.session_number,
+                block=self._bridge_block,
+            )
+            self.eye_tracker_bridge.ensure_recording(
+                session_label=self.session_id,
+                metadata={
+                    'session_number': self.session_number,
+                    'start_block': self.start_block,
+                    'aruco_enabled': self.aruco_enabled,
+                },
+            )
         self._apply_session_options_and_start()
 
     def _configure_session_from_cli(self, *_args: Any) -> None:
@@ -802,6 +831,13 @@ class TabletopRoot(FloatLayout):
             self.p1_pressed = True
         else:
             self.p2_pressed = True
+        self._emit_button_bridge_event(
+            'start',
+            player=who,
+            extra={
+                'in_block_pause': self.in_block_pause,
+            },
+        )
         self.record_action(who, 'Play gedrückt')
         if self.session_configured:
             action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
@@ -835,6 +871,16 @@ class TabletopRoot(FloatLayout):
                 self.continue_after_start_press()
 
     def run_fixation_sequence(self, on_complete=None):
+        round_index = max(0, self.round - 1)
+        block_index = self._current_bridge_block_index()
+        self.send_bridge_event(
+            'fixation.start',
+            {
+                'round_index': round_index,
+                'block_index': block_index,
+                'phase': getattr(self.phase, 'name', None),
+            },
+        )
         self.fixation_runner(
             self,
             schedule_once=Clock.schedule_once,
@@ -844,6 +890,16 @@ class TabletopRoot(FloatLayout):
         )
 
     def play_fixation_tone(self):
+        round_index = max(0, self.round - 1)
+        block_index = self._current_bridge_block_index()
+        self.send_bridge_event(
+            'fixation.tone',
+            {
+                'round_index': round_index,
+                'block_index': block_index,
+                'phase': getattr(self.phase, 'name', None),
+            },
+        )
         self.fixation_player(self)
 
     def tap_card(self, who:int, which:str):
