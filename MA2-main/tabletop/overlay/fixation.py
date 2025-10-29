@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
 import sounddevice as sd
 import threading
+
+log = logging.getLogger(__name__)
 
 _FIXATION_CROSS_ATTR = "_fixation_cross_overlay"
 
@@ -91,6 +94,13 @@ def run_fixation_sequence(
         if btn is not None and hasattr(btn, "set_live"):
             btn.set_live(False)
 
+    callback = getattr(controller, "on_fixation_start", None)
+    if callable(callback):
+        try:
+            callback()
+        except Exception:  # pragma: no cover - defensive logging only
+            log.warning("Fixation start callback failed", exc_info=True)
+
     image.opacity = 1
     _set_image_source(image, live_image, fallback="cross")
 
@@ -103,6 +113,12 @@ def run_fixation_sequence(
         controller.fixation_running = False
         if hasattr(controller, "fixation_required"):
             controller.fixation_required = False
+        end_callback = getattr(controller, "on_fixation_end", None)
+        if callable(end_callback):
+            try:
+                end_callback()
+            except Exception:  # pragma: no cover - defensive logging only
+                log.warning("Fixation end callback failed", exc_info=True)
         callback = getattr(controller, "pending_fixation_callback", None)
         controller.pending_fixation_callback = None
         if callback:
@@ -198,3 +214,4 @@ __all__ = [
     "play_fixation_tone",
     "run_fixation_sequence",
 ]
+

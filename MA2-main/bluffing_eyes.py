@@ -37,6 +37,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "'both' forces VP1 and VP2, otherwise restrict to the chosen player."
         ),
     )
+    parser.add_argument(
+        "--eye-tracker",
+        type=str,
+        choices=("off", "neon"),
+        default=None,
+        required=False,
+        help="Optional: Aktiviere die Neon-Anbindung (default: off).",
+    )
     return parser.parse_args(argv)
 
 
@@ -44,7 +52,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Entry point that wires CLI arguments into the Kivy application."""
 
     args = parse_args(argv)
-    app_main(session=args.session, block=args.block, player=args.player)
+    app_main(
+        session=args.session,
+        block=args.block,
+        player=args.player,
+        eye_tracker=args.eye_tracker,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience wrapper
