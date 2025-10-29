@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
 import numpy as np
+from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.properties import DictProperty, NumericProperty, ObjectProperty
@@ -265,6 +266,47 @@ class TabletopRoot(FloatLayout):
         if self.eye_tracker_bridge is None:
             return
         self.eye_tracker_bridge.handle_event(name, payload or {})
+
+    def _neon_client(self):
+        app = App.get_running_app()
+        if app is None:
+            return None
+        return getattr(app, "_neon", None)
+
+    def _neon_fixation_payload(self) -> Dict[str, Any]:
+        state = getattr(self.controller, "state", None)
+        round_idx = None
+        if state is not None:
+            round_idx = getattr(state, "current_round_idx", None)
+            if round_idx is None:
+                round_idx = getattr(state, "round", None)
+        payload: Dict[str, Any] = {"round": round_idx}
+        block_index = self._current_bridge_block_index()
+        if block_index is not None:
+            payload["block"] = block_index
+        if self.session_id:
+            payload["session_id"] = self.session_id
+        if self.session_number is not None:
+            payload["session_number"] = self.session_number
+        return payload
+
+    def on_fixation_start(self) -> None:
+        client = self._neon_client()
+        if client is None:
+            return
+        try:
+            client.annotate("FIXATION_START", self._neon_fixation_payload())
+        except Exception:
+            pass
+
+    def on_fixation_end(self) -> None:
+        client = self._neon_client()
+        if client is None:
+            return
+        try:
+            client.annotate("FIXATION_END", self._neon_fixation_payload())
+        except Exception:
+            pass
 
     def _emit_button_bridge_event(
         self,

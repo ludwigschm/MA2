@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional, Sequence, cast
+from typing import Any, Mapping, Optional, Sequence, cast
 
 import os
 
@@ -21,6 +21,7 @@ from kivy.core.window import Window
 from kivy.lang import Builder
 
 from tabletop.data.config import ARUCO_OVERLAY_PATH
+from tabletop.logging.events import Events
 from tabletop.logging.round_csv import close_round_log, flush_round_log
 from tabletop.overlay.process import (
     OverlayProcess,
@@ -45,6 +46,7 @@ class TabletopApp(App):
         player: str = "auto",
         players: Optional[Sequence[str]] = None,
         single_block_mode: bool = False,
+        eye_tracker: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         self._overlay_process: Optional[OverlayProcess] = None
@@ -69,7 +71,74 @@ class TabletopApp(App):
                 requested_players.add(player)
         self._players: set[str] = {entry for entry in requested_players if entry}
         self._single_block_mode: bool = single_block_mode
+        self._eye_tracker_choice = (
+            (eye_tracker or "").strip().lower()
+            or os.environ.get("EYE_TRACKER", "off").strip().lower()
+        )
+        self._neon = None
+        self._neon_session_active = False
+        if self._eye_tracker_choice == "neon" and "VP1" in self._players:
+            try:
+                from tabletop.eye.neon import NeonClient
+            except Exception as exc:  # pragma: no cover - optional dependency
+                log.warning("Neon client unavailable: %s", exc)
+            else:
+                self._neon = NeonClient.for_vp("VP1")
+                if self._neon:
+                    log.info("Neon client initialised for VP1")
+                else:
+                    log.warning("Neon configuration for VP1 missing or disabled")
         super().__init__(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Neon helpers
+    def _neon_session_payload(self) -> dict[str, Any]:
+        session_label: Any = self._session if self._session is not None else "NA"
+        block_label: Any = self._block if self._block is not None else "NA"
+        players = sorted(self._players)
+        return {
+            "session": session_label,
+            "block": block_label,
+            "players": players,
+        }
+
+    def _neon_annotator(self, label: str, payload: Mapping[str, Any]) -> None:
+        if self._neon is None:
+            return
+        try:
+            self._neon.annotate(label, payload)
+        except Exception:  # pragma: no cover - annotations are best-effort
+            pass
+
+    def _start_neon_session(self) -> None:
+        if self._neon is None or self._neon_session_active:
+            return
+        payload = self._neon_session_payload()
+        session_label = payload.get("session", "NA")
+        block_label = payload.get("block", "NA")
+        try:
+            self._neon.start_recording(session=session_label, block=block_label)
+        except Exception:  # pragma: no cover - best-effort communication
+            pass
+        try:
+            self._neon.annotate("APP_START", payload)
+        except Exception:  # pragma: no cover - optional integration
+            pass
+        self._neon_session_active = True
+
+    def _shutdown_neon_session(self) -> None:
+        if self._neon is None:
+            return
+        if self._neon_session_active:
+            try:
+                self._neon.annotate("APP_STOP", self._neon_session_payload())
+            except Exception:  # pragma: no cover - optional integration
+                pass
+            self._neon_session_active = False
+        try:
+            self._neon.stop_recording()
+        except Exception:  # pragma: no cover - optional integration
+            pass
 
     @staticmethod
     def _describe_window_screens() -> list[dict[str, int]]:
@@ -280,12 +349,18 @@ class TabletopApp(App):
             _KV_LOADED = True
 
         primary_player = next(iter(self._players), "")
+        def _events_factory(
+            session_id: str, db_path: str, csv_path: Optional[str] = None
+        ) -> Events:
+            annotator = self._neon_annotator if self._neon else None
+            return Events(session_id, db_path, csv_path, annotator=annotator)
         root = TabletopRoot(
             players=self._players,
             primary_player=primary_player or None,
             session=self._session,
             block=self._block,
             single_block_mode=self._single_block_mode,
+            events_factory=_events_factory,
         )
         # propagate multi-player context so the view can start/stop recordings for all
         root.update_bridge_context(
@@ -317,6 +392,7 @@ class TabletopApp(App):
             codepoint: str,
             modifiers: list[str],
         ) -> bool:
+            handled = False
             if key == 27:  # ESC
                 try:
                     if Window.fullscreen:
@@ -328,8 +404,21 @@ class TabletopApp(App):
                     log.info("ESC toggled fullscreen. Now fullscreen=%s", Window.fullscreen)
                 except Exception as exc:  # pragma: no cover - safety net
                     log.exception("Error toggling fullscreen: %s", exc)
-                return True
-            return False
+                handled = True
+            if self._neon is not None:
+                try:
+                    self._neon.annotate(
+                        "KEY_DOWN",
+                        {
+                            "key": key,
+                            "scancode": scancode,
+                            "codepoint": codepoint,
+                            "modifiers": modifiers,
+                        },
+                    )
+                except Exception:  # pragma: no cover - annotate failures are logged inside
+                    pass
+            return handled
 
         self._esc_handler = _on_key_down
         Window.bind(on_key_down=self._esc_handler)
@@ -358,6 +447,9 @@ class TabletopApp(App):
                 session=self._session,
                 block=self._block,
             )
+
+        if self._neon is not None:
+            self._start_neon_session()
 
         self._target_display_index = self._determine_display_index()
         self._apply_display_environment(self._target_display_index)
@@ -434,7 +526,13 @@ class TabletopApp(App):
             flush_round_log(root)
             close_round_log(root)
 
+        self._shutdown_neon_session()
+
         super().on_stop()
+
+    def on_request_close(self, *args: Any, **kwargs: Any) -> bool:
+        self._shutdown_neon_session()
+        return super().on_request_close(*args, **kwargs)
 
 
 def _resolve_requested_players(player: str) -> list[str]:
@@ -455,6 +553,7 @@ def main(
     session: Optional[int] = None,
     block: Optional[int] = None,
     player: str = "auto",
+    eye_tracker: Optional[str] = None,
 ) -> None:
     """Run the tabletop Kivy application."""
 
@@ -468,6 +567,7 @@ def main(
         player=player,
         players=desired_players,
         single_block_mode=single_block_mode,
+        eye_tracker=eye_tracker,
     )
     app.run()
 
