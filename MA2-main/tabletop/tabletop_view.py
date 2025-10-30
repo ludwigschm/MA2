@@ -80,6 +80,7 @@ class TabletopRoot(FloatLayout):
     button_vertical_spacing = NumericProperty(0.0)
     signal_stack_height = NumericProperty(0.0)
     signal_cluster_half_gap = NumericProperty(0.0)
+    center_offset_px = NumericProperty(300.0)
 
     btn_start_p1 = ObjectProperty(None)
     btn_start_p2 = ObjectProperty(None)
