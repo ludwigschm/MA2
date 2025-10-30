@@ -76,6 +76,10 @@ class TabletopRoot(FloatLayout):
 
     # Ergebniswert (in Pixeln)
     horizontal_margin_px = NumericProperty(0.0)
+    button_horizontal_spacing = NumericProperty(0.0)
+    button_vertical_spacing = NumericProperty(0.0)
+    signal_stack_height = NumericProperty(0.0)
+    signal_cluster_half_gap = NumericProperty(0.0)
 
     btn_start_p1 = ObjectProperty(None)
     btn_start_p2 = ObjectProperty(None)
@@ -644,6 +648,25 @@ class TabletopRoot(FloatLayout):
 
         # finale Margin
         self.horizontal_margin_px = max(min(frac_px, max_px), min_px)
+
+        button_size = 260.0 * float(self.button_scale) * float(self.scale)
+        horizontal_spacing = 60.0 * float(self.button_scale) * float(self.scale)
+        vertical_spacing = 40.0 * float(self.button_scale) * float(self.scale)
+        self.button_horizontal_spacing = horizontal_spacing
+        self.button_vertical_spacing = vertical_spacing
+        self.signal_stack_height = 3.0 * button_size + 2.0 * vertical_spacing
+
+        central_guard = (380.0 + 45.0) * float(self.scale)
+        cluster_margin = 40.0 * float(self.scale)
+        min_half_gap = button_size + horizontal_spacing + central_guard + cluster_margin
+        available_half = max(float(width) / 2.0 - float(self.horizontal_margin_px) - button_size, 0.0)
+
+        if available_half <= 0.0:
+            self.signal_cluster_half_gap = 0.0
+        elif available_half < min_half_gap:
+            self.signal_cluster_half_gap = available_half
+        else:
+            self.signal_cluster_half_gap = min_half_gap
 
     @staticmethod
     def _parse_value(value):
