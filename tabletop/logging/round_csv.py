@@ -3,13 +3,82 @@
 from __future__ import annotations
 
 import csv
+import logging
+import queue
+import threading
+import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 try:  # Optional dependency used when available.
     import pandas as _pd  # type: ignore
 except Exception:  # pragma: no cover - pandas is optional at runtime
     _pd = None
+
+from tabletop.utils.runtime import (
+    is_low_latency_disabled,
+    is_perf_logging_enabled,
+)
+
+log = logging.getLogger(__name__)
+
+_LOW_LATENCY_DISABLED = is_low_latency_disabled()
+_PERF_LOGGING = is_perf_logging_enabled()
+_ROUND_QUEUE_MAXSIZE = 8
+_ROUND_BUFFER_MAX = 500
+_ROUND_FLUSH_INTERVAL = 1.0
+_ROUND_QUEUE: Optional[queue.Queue[Tuple[Path, List[List[Any]], bool]]] = None
+_ROUND_QUEUE_LOCK = threading.Lock()
+_ROUND_WRITER: Optional[threading.Thread] = None
+
+
+def _write_round_rows(path: Path, rows: List[List[Any]], write_header: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="") as fp:
+        writer = csv.writer(fp)
+        if write_header:
+            writer.writerow(ROUND_LOG_HEADER)
+        writer.writerows(rows)
+
+
+def _round_writer_loop(queue_obj: queue.Queue[Tuple[Path, List[List[Any]], bool]]) -> None:
+    while True:
+        path, rows, write_header = queue_obj.get()
+        start = time.perf_counter()
+        try:
+            _write_round_rows(path, rows, write_header)
+            if _PERF_LOGGING:
+                duration = (time.perf_counter() - start) * 1000.0
+                log.debug(
+                    "Round CSV flush wrote %d rows in %.2f ms", len(rows), duration
+                )
+        except Exception:  # pragma: no cover - defensive logging
+            log.exception("Failed to flush %d round log rows", len(rows))
+        finally:
+            queue_obj.task_done()
+
+
+def _ensure_round_writer() -> queue.Queue[Tuple[Path, List[List[Any]], bool]]:
+    global _ROUND_QUEUE, _ROUND_WRITER
+    if _ROUND_QUEUE is not None:
+        return _ROUND_QUEUE
+    with _ROUND_QUEUE_LOCK:
+        if _ROUND_QUEUE is not None:
+            return _ROUND_QUEUE
+        queue_obj: queue.Queue[Tuple[Path, List[List[Any]], bool]] = queue.Queue(
+            maxsize=_ROUND_QUEUE_MAXSIZE
+        )
+        writer_thread = threading.Thread(
+            target=_round_writer_loop,
+            args=(queue_obj,),
+            name="RoundCsvWriter",
+            daemon=True,
+        )
+        writer_thread.start()
+        _ROUND_QUEUE = queue_obj
+        _ROUND_WRITER = writer_thread
+        return queue_obj
 
 
 ROUND_LOG_HEADER: List[str] = [
@@ -47,6 +116,7 @@ def init_round_log(app: Any) -> None:
         app.round_log_buffer = []
     else:
         buffer.clear()
+    app.round_log_last_flush = time.monotonic()
 
 
 def round_log_action_label(app: Any, action: str, payload: Dict[str, Any]) -> str:
@@ -160,34 +230,71 @@ def write_round_log(app: Any, actor: str, action: str, payload: Dict[str, Any], 
         buffer = []
         app.round_log_buffer = buffer
     buffer.append(row)
+    if not hasattr(app, "round_log_last_flush"):
+        app.round_log_last_flush = time.monotonic()
+    flush_round_log(app)
 
 
-def flush_round_log(app: Any, pandas_module: Any | None = None) -> None:
+def flush_round_log(
+    app: Any,
+    pandas_module: Any | None = None,
+    *,
+    force: bool = False,
+    wait: bool = False,
+) -> None:
     if not getattr(app, "round_log_path", None):
         return
     buffer: Optional[List[List[Any]]] = getattr(app, "round_log_buffer", None)
     if not buffer:
         return
-    path = app.round_log_path
+
+    now = time.monotonic()
+    last_flush = getattr(app, "round_log_last_flush", 0.0)
+    if (
+        not force
+        and not _LOW_LATENCY_DISABLED
+        and len(buffer) < _ROUND_BUFFER_MAX
+        and now - last_flush < _ROUND_FLUSH_INTERVAL
+    ):
+        return
+
+    path = Path(app.round_log_path)
     app.log_dir.mkdir(parents=True, exist_ok=True)
     file_exists = path.exists() and path.stat().st_size > 0
     rows = list(buffer)
-    pd = pandas_module if pandas_module is not None else _pd
-    if pd is not None:
-        df = pd.DataFrame(rows, columns=ROUND_LOG_HEADER)
-        df.to_csv(path, mode="a", header=not file_exists, index=False)
-    else:
-        write_header = not file_exists
-        with open(path, "a", encoding="utf-8", newline="") as fp:
-            writer = csv.writer(fp)
-            if write_header:
-                writer.writerow(ROUND_LOG_HEADER)
-            writer.writerows(rows)
     buffer.clear()
+    app.round_log_last_flush = now
+
+    if _LOW_LATENCY_DISABLED:
+        pd = pandas_module if pandas_module is not None else _pd
+        if pd is not None:
+            df = pd.DataFrame(rows, columns=ROUND_LOG_HEADER)
+            df.to_csv(path, mode="a", header=not file_exists, index=False)
+        else:
+            _write_round_rows(path, rows, not file_exists)
+        return
+
+    queue_obj = _ensure_round_writer()
+    write_header = not file_exists
+    try:
+        queue_obj.put_nowait((path, rows, write_header))
+    except queue.Full:
+        log.warning(
+            "Round log queue saturated – falling back to synchronous flush (%d rows)",
+            len(rows),
+        )
+        _write_round_rows(path, rows, write_header)
+    else:
+        if _PERF_LOGGING and queue_obj.maxsize:
+            load = queue_obj.qsize() / queue_obj.maxsize
+            if load >= 0.8:
+                log.warning("Round log queue at %.0f%% capacity", load * 100.0)
+        if wait:
+            queue_obj.join()
 
 
 def close_round_log(app: Any) -> None:
-    flush_round_log(app)
+    flush_round_log(app, force=True, wait=not _LOW_LATENCY_DISABLED)
     if getattr(app, "round_log_fp", None):
         app.round_log_fp.close()
     app.round_log_fp = None

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,11 @@ except Exception:  # pragma: no cover - optional dependency
     requests = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
+
+from tabletop.utils.runtime import (
+    is_low_latency_disabled,
+    is_perf_logging_enabled,
+)
 
 CONFIG_TEMPLATE = """# Neon Geräte-Konfiguration
 
@@ -158,12 +165,35 @@ class PupilBridge:
             str(device_id).lower(): player for device_id, player in mapping_src.items() if player
         }
         self._connect_timeout = float(connect_timeout)
+        self._http_timeout = max(0.1, min(0.3, float(connect_timeout)))
         self._device_by_player: Dict[str, Any] = {"VP1": None, "VP2": None}
         self._active_recording: Dict[str, bool] = {"VP1": False, "VP2": False}
         self._recording_metadata: Dict[str, Dict[str, Any]] = {}
         self._auto_session: Optional[int] = None
         self._auto_block: Optional[int] = None
         self._auto_players: set[str] = set()
+        self._low_latency_disabled = is_low_latency_disabled()
+        self._perf_logging = is_perf_logging_enabled()
+        self._event_queue_maxsize = 1000
+        self._event_queue_drop = 0
+        self._queue_sentinel: object = object()
+        self._sender_stop = threading.Event()
+        self._event_queue: Optional[
+            queue.Queue[tuple[str, str, Optional[Dict[str, Any]]]]
+        ] = None
+        self._sender_thread: Optional[threading.Thread] = None
+        self._event_batch_size = 10
+        self._event_batch_window = 0.02
+        self._last_queue_log = 0.0
+        self._last_send_log = 0.0
+        if not self._low_latency_disabled:
+            self._event_queue = queue.Queue(maxsize=self._event_queue_maxsize)
+            self._sender_thread = threading.Thread(
+                target=self._event_sender_loop,
+                name="PupilBridgeSender",
+                daemon=True,
+            )
+            self._sender_thread.start()
 
     # ---------------------------------------------------------------------
     # Lifecycle management
@@ -727,6 +757,16 @@ class PupilBridge:
     def close(self) -> None:
         """Close all connected devices if necessary."""
 
+        if self._event_queue is not None:
+            self._sender_stop.set()
+            try:
+                self._event_queue.put_nowait(self._queue_sentinel)
+            except queue.Full:
+                self._event_queue.put(self._queue_sentinel)
+            if self._sender_thread is not None:
+                self._sender_thread.join(timeout=1.0)
+            self._event_queue = None
+            self._sender_thread = None
         for player, device in list(self._device_by_player.items()):
             if device is None:
                 continue
@@ -888,7 +928,7 @@ class PupilBridge:
             response = requests.post(
                 url,
                 json={"action": "START"},
-                timeout=self._connect_timeout,
+                timeout=self._http_timeout,
             )
         except Exception as exc:  # pragma: no cover - network dependent
             log.error("REST recording start failed for %s: %s", player, exc)
@@ -992,18 +1032,32 @@ class PupilBridge:
             return None
 
         url = f"http://{cfg.ip}:{cfg.port}{path}"
-        try:
-            return requests.post(
-                url,
-                json=payload,
-                timeout=timeout or self._connect_timeout,
-            )
-        except Exception as exc:  # pragma: no cover - network dependent
-            if warn:
-                log.warning("HTTP POST %s failed for %s: %s", url, player, exc)
-            else:
-                log.debug("HTTP POST %s failed for %s: %s", url, player, exc, exc_info=True)
-            return None
+        effective_timeout = timeout or self._http_timeout
+        delay = 0.05
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                return requests.post(
+                    url,
+                    json=payload,
+                    timeout=effective_timeout,
+                )
+            except Exception as exc:  # pragma: no cover - network dependent
+                if attempt == attempts - 1:
+                    if warn:
+                        log.warning("HTTP POST %s failed for %s: %s", url, player, exc)
+                    else:
+                        log.debug(
+                            "HTTP POST %s failed for %s: %s",
+                            url,
+                            player,
+                            exc,
+                            exc_info=True,
+                        )
+                else:
+                    time.sleep(delay)
+                    delay *= 2
+        return None
 
     def _apply_recording_label(
         self,
@@ -1132,19 +1186,84 @@ class PupilBridge:
 
     # ------------------------------------------------------------------
     # Event helpers
-    def send_event(
+    def _event_sender_loop(self) -> None:
+        """Background worker that batches UI events before dispatching."""
+        if self._event_queue is None:
+            return
+        while True:
+            try:
+                item = self._event_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if item is self._queue_sentinel or self._sender_stop.is_set():
+                self._event_queue.task_done()
+                break
+            batch: list[tuple[str, str, Optional[Dict[str, Any]]]] = [item]
+            deadline = time.perf_counter() + self._event_batch_window
+            while len(batch) < self._event_batch_size:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    next_item = self._event_queue.get(timeout=max(remaining, 0.0))
+                except queue.Empty:
+                    break
+                if next_item is self._queue_sentinel:
+                    self._event_queue.task_done()
+                    self._sender_stop.set()
+                    break
+                if self._sender_stop.is_set():
+                    self._event_queue.task_done()
+                    break
+                batch.append(next_item)
+            self._flush_event_batch(batch)
+            for _ in batch:
+                self._event_queue.task_done()
+            if self._sender_stop.is_set():
+                break
+        # Drain any remaining events to avoid dropping on shutdown
+        while self._event_queue is not None and not self._event_queue.empty():
+            try:
+                item = self._event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not self._queue_sentinel:
+                self._flush_event_batch([item])
+            self._event_queue.task_done()
+
+    def _flush_event_batch(
+        self, batch: list[tuple[str, str, Optional[Dict[str, Any]]]]
+    ) -> None:
+        """Send a batch of queued events sequentially."""
+        if not batch:
+            return
+        start = time.perf_counter()
+        for name, player, payload in batch:
+            try:
+                self._dispatch_event(name, player, payload)
+            except Exception:  # pragma: no cover - hardware dependent
+                log.exception("Failed to send event %s for %s", name, player)
+        if self._perf_logging:
+            duration = (time.perf_counter() - start) * 1000.0
+            if time.monotonic() - self._last_send_log >= 1.0:
+                log.debug(
+                    "Pupil event batch sent %d events in %.2f ms", len(batch), duration
+                )
+                self._last_send_log = time.monotonic()
+
+    def _dispatch_event(
         self,
         name: str,
         player: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Send an event to the player's device, encoding payload as JSON suffix."""
-
+        """Send a single event to the device, falling back between APIs."""
         device = self._device_by_player.get(player)
         if device is None:
             return
 
         event_label = name
+        payload_json: Optional[str] = None
         if payload:
             try:
                 payload_json = json.dumps(payload, separators=(",", ":"), default=str)
@@ -1155,13 +1274,54 @@ class PupilBridge:
 
         try:
             device.send_event(event_label)
+            return
         except TypeError:
-            try:
-                device.send_event(name, payload)
-            except Exception as exc:  # pragma: no cover - hardware dependent
-                log.exception("Failed to send event %s for %s: %s", name, player, exc)
+            pass
         except Exception as exc:  # pragma: no cover - hardware dependent
             log.exception("Failed to send event %s for %s: %s", name, player, exc)
+            return
+
+        try:
+            device.send_event(name, payload)
+        except Exception as exc:  # pragma: no cover - hardware dependent
+            log.exception("Failed to send event %s for %s: %s", name, player, exc)
+
+    def event_queue_load(self) -> tuple[int, int]:
+        if self._event_queue is None:
+            return (0, 0)
+        return (self._event_queue.qsize(), self._event_queue_maxsize)
+
+    def send_event(
+        self,
+        name: str,
+        player: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Send an event to the player's device, encoding payload as JSON suffix."""
+
+        if self._low_latency_disabled or self._event_queue is None:
+            self._dispatch_event(name, player, payload)
+            return
+
+        payload_copy = dict(payload) if isinstance(payload, dict) else payload
+        try:
+            self._event_queue.put_nowait((name, player, payload_copy))
+        except queue.Full:
+            self._event_queue_drop += 1
+            log.warning(
+                "Dropping Pupil event %s for %s – queue full (%d drops)",
+                name,
+                player,
+                self._event_queue_drop,
+            )
+        else:
+            if self._perf_logging and self._event_queue.maxsize:
+                load = self._event_queue.qsize() / self._event_queue.maxsize
+                if load >= 0.8 and time.monotonic() - self._last_queue_log >= 1.0:
+                    log.warning(
+                        "Pupil event queue at %.0f%% capacity", load * 100.0
+                    )
+                    self._last_queue_log = time.monotonic()
 
     # ------------------------------------------------------------------
     def estimate_time_offset(self, player: str) -> Optional[float]:
