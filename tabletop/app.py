@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional, Sequence, cast
 
 import os
+import math
+import statistics
+import time
 
 import logging
 from contextlib import suppress
+from logging.handlers import QueueHandler, QueueListener
+from queue import Queue
 
 from kivy.app import App
 from kivy.config import Config
 
+Config.set("graphics", "multisamples", "0")
+Config.set("graphics", "maxfps", "60")
+Config.set("graphics", "vsync", "1")
 Config.set("kivy", "exit_on_escape", "0")
 Config.write()
 
@@ -29,6 +38,10 @@ from tabletop.overlay.process import (
 )
 from tabletop.tabletop_view import TabletopRoot
 from tabletop.pupil_bridge import PupilBridge
+from tabletop.utils.runtime import (
+    is_low_latency_disabled,
+    is_perf_logging_enabled,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +60,7 @@ class TabletopApp(App):
         players: Optional[Sequence[str]] = None,
         bridge: Optional[PupilBridge] = None,
         single_block_mode: bool = False,
+        logging_queue: Optional[Queue] = None,
         **kwargs: Any,
     ) -> None:
         self._overlay_process: Optional[OverlayProcess] = None
@@ -72,6 +86,17 @@ class TabletopApp(App):
                 requested_players.add(player)
         self._players: set[str] = {entry for entry in requested_players if entry}
         self._single_block_mode: bool = single_block_mode
+        self._perf_logging: bool = is_perf_logging_enabled()
+        self._low_latency_disabled: bool = is_low_latency_disabled()
+        self._logging_queue: Optional[Queue] = logging_queue
+        self._logging_queue_maxsize: int = (
+            logging_queue.maxsize if logging_queue is not None else 0
+        )
+        self._frame_samples = deque(maxlen=600)
+        self._frame_sampler = None
+        self._frame_log_event = None
+        self._queue_monitor_event = None
+        self._last_queue_warning = 0.0
         super().__init__(**kwargs)
 
     @staticmethod
@@ -289,6 +314,7 @@ class TabletopApp(App):
             bridge_session=self._session,
             bridge_block=self._block,
             single_block_mode=self._single_block_mode,
+            perf_logging=self._perf_logging,
         )
         # propagate multi-player context so the view can start/stop recordings for all
         try:
@@ -431,6 +457,67 @@ class TabletopApp(App):
         self._key_up_handler = _on_key_up
         Window.bind(on_key_up=self._key_up_handler)
 
+    # ------------------------------------------------------------------
+    # Performance instrumentation
+    def _track_frame_time(self, dt: float) -> None:
+        """Track frame durations for percentile logging."""
+
+        if not self._perf_logging:
+            return
+        self._frame_samples.append(dt * 1000.0)
+
+    def _percentile(self, data: list[float], fraction: float) -> float:
+        if not data:
+            return 0.0
+        if fraction <= 0:
+            return data[0]
+        if fraction >= 1:
+            return data[-1]
+        position = (len(data) - 1) * fraction
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return data[int(position)]
+        lower_val = data[lower]
+        upper_val = data[upper]
+        return lower_val + (upper_val - lower_val) * (position - lower)
+
+    def _log_frame_metrics(self, _dt: float) -> None:
+        if not self._perf_logging or not self._frame_samples:
+            return
+        samples = sorted(self._frame_samples)
+        p50 = self._percentile(samples, 0.50)
+        p95 = self._percentile(samples, 0.95)
+        p99 = self._percentile(samples, 0.99)
+        log.info(
+            "Frame timing percentiles (ms): p50=%.2f p95=%.2f p99=%.2f", p50, p95, p99
+        )
+
+    def _monitor_queues(self, _dt: float) -> None:
+        if not self._perf_logging:
+            return
+        now = time.monotonic()
+        if self._logging_queue is not None and self._logging_queue_maxsize > 0:
+            load = self._logging_queue.qsize() / self._logging_queue_maxsize
+            if load >= 0.8 and now - self._last_queue_warning >= 1.0:
+                log.warning("Logging queue at %.0f%% capacity", load * 100.0)
+                self._last_queue_warning = now
+        bridge = self._bridge
+        if bridge is not None:
+            size, capacity = bridge.event_queue_load()
+            if capacity > 0:
+                load = size / capacity
+                if load >= 0.8 and now - self._last_queue_warning >= 1.0:
+                    log.warning("Pupil event queue at %.0f%% capacity", load * 100.0)
+                    self._last_queue_warning = now
+
+    def _cancel_event(self, event: Any) -> None:
+        if event is None:
+            return
+        cancel = getattr(event, "cancel", None)
+        if callable(cancel):
+            cancel()
+
     def on_start(self) -> None:  # pragma: no cover - framework callback
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
@@ -497,8 +584,26 @@ class TabletopApp(App):
 
         Clock.schedule_once(_enter_fullscreen, 0.0)
 
+        if self._perf_logging:
+            self._frame_samples.clear()
+            self._frame_sampler = Clock.schedule_interval(
+                self._track_frame_time, 0
+            )
+            self._frame_log_event = Clock.schedule_interval(
+                self._log_frame_metrics, 10.0
+            )
+            self._queue_monitor_event = Clock.schedule_interval(
+                self._monitor_queues, 1.0
+            )
+
     def on_stop(self) -> None:  # pragma: no cover - framework callback
         root = cast(Optional[TabletopRoot], self.root)
+
+        for event in (self._frame_sampler, self._frame_log_event, self._queue_monitor_event):
+            self._cancel_event(event)
+        self._frame_sampler = None
+        self._frame_log_event = None
+        self._queue_monitor_event = None
 
         process_handle: Optional[OverlayProcess]
         if root and getattr(root, "overlay_process", None):
@@ -518,7 +623,11 @@ class TabletopApp(App):
                 if callable(close_fn):
                     close_fn()
                 root.logger = None
-            flush_round_log(root)
+            flush_round_log(
+                root,
+                force=True,
+                wait=not self._low_latency_disabled,
+            )
             close_round_log(root)
 
         if root is not None:
@@ -534,6 +643,34 @@ class TabletopApp(App):
                     log.exception("Failed to stop recording for %s", player)
 
         super().on_stop()
+
+
+def _configure_async_logging() -> tuple[Optional[QueueListener], Optional[Queue]]:
+    """Install a queue-based logging pipeline if supported."""
+
+    if is_low_latency_disabled():
+        return None, None
+
+    log_queue: Queue = Queue(maxsize=4000)
+    root_logger = logging.getLogger()
+    handlers = list(root_logger.handlers)
+    if not handlers:
+        console = logging.StreamHandler()
+        console.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        )
+        handlers = [console]
+
+    for handler in handlers:
+        root_logger.removeHandler(handler)
+
+    queue_handler = QueueHandler(log_queue)
+    root_logger.addHandler(queue_handler)
+
+    listener = QueueListener(log_queue, *handlers, respect_handler_level=True)
+    listener.daemon = True
+    listener.start()
+    return listener, log_queue
 
 
 def _resolve_requested_players(
@@ -562,6 +699,8 @@ def main(
 ) -> None:
     """Run the tabletop Kivy application with optional Pupil bridge integration."""
 
+    logging_listener, logging_queue = _configure_async_logging()
+
     bridge = PupilBridge()
     try:
         bridge.connect()
@@ -584,6 +723,7 @@ def main(
         players=desired_players,
         bridge=bridge,
         single_block_mode=single_block_mode,
+        logging_queue=logging_queue,
     )
     try:
         app.run()
@@ -597,6 +737,8 @@ def main(
             bridge.close()
         except Exception:  # pragma: no cover - defensive fallback
             log.exception("Failed to close Pupil bridge")
+        if logging_listener is not None:
+            logging_listener.stop()
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution

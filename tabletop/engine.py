@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import atexit
 import csv
+import logging
+import queue
 import json
 import pathlib
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,6 +24,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - only for static typing
     from tabletop.logging.events import Events
+
+from tabletop.utils.runtime import (
+    is_low_latency_disabled,
+    is_perf_logging_enabled,
+)
 
 __all__ = [
     "Phase",
@@ -43,6 +51,9 @@ __all__ = [
     "GameEngine",
     "POINTS_PER_WIN",
 ]
+
+
+log = logging.getLogger(__name__)
 
 
 # Points awarded for a win when stakes/payouts are active.
@@ -192,21 +203,78 @@ class EventLogger:
         )
         self.conn.commit()
         self._csv_path: Optional[pathlib.Path] = None
-        self._csv_buffer: List[Tuple[str, int, str, str, str, str, int, str]] = []
         self._closed = False
         if csv_path:
             path = pathlib.Path(csv_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             self._csv_path = path
+        self._use_async = not is_low_latency_disabled()
+        self._perf_logging = is_perf_logging_enabled()
+        self._queue_maxsize = 2000
+        self._batch_size = 500
+        self._flush_interval = 1.0
+        self._last_queue_log = 0.0
+        self._queue_sentinel: object = object()
+        self._event_queue: Optional[
+            "queue.Queue[Tuple[str, int, str, str, str, str, int, str]]"
+        ] = None
+        self._writer_thread: Optional[threading.Thread] = None
+        if self._use_async:
+            self._event_queue = queue.Queue(maxsize=self._queue_maxsize)
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop,
+                name="EventLoggerWriter",
+                daemon=True,
+            )
+            self._writer_thread.start()
         atexit.register(self.close)
 
-    def _flush_csv_buffer(self) -> None:
-        if self._csv_path is None or not self._csv_buffer:
+    def _writer_loop(self) -> None:
+        assert self._event_queue is not None
+        pending: List[Tuple[str, int, str, str, str, str, int, str]] = []
+        last_flush = time.monotonic()
+        while True:
+            timeout = max(0.0, self._flush_interval - (time.monotonic() - last_flush))
+            try:
+                item = self._event_queue.get(timeout=timeout if pending else None)
+            except queue.Empty:
+                item = None
+            if item is self._queue_sentinel:
+                self._event_queue.task_done()
+                break
+            if item is None:
+                if pending:
+                    self._flush_rows(pending)
+                    pending.clear()
+                    last_flush = time.monotonic()
+                continue
+            pending.append(item)
+            self._event_queue.task_done()
+            if len(pending) >= self._batch_size or (
+                time.monotonic() - last_flush >= self._flush_interval
+            ):
+                self._flush_rows(pending)
+                pending.clear()
+                last_flush = time.monotonic()
+        if pending:
+            self._flush_rows(pending)
+
+    def _flush_rows(
+        self, rows: List[Tuple[str, int, str, str, str, str, int, str]]
+    ) -> None:
+        if not rows:
             return
-        with open(self._csv_path, "a", encoding="utf-8", newline="") as fp:
-            writer = csv.writer(fp)
-            writer.writerows(self._csv_buffer)
-        self._csv_buffer.clear()
+        start = time.perf_counter()
+        cur = self.conn.cursor()
+        cur.executemany("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+        if self._csv_path is not None:
+            with open(self._csv_path, "a", encoding="utf-8", newline="") as fp:
+                writer = csv.writer(fp)
+                writer.writerows(rows)
+        if self._perf_logging:
+            duration = (time.perf_counter() - start) * 1000.0
+            log.debug("Event flush wrote %d rows in %.2f ms", len(rows), duration)
 
     def log(
         self,
@@ -229,12 +297,27 @@ class EventLogger:
             t_mono_ns,
             t_utc_iso,
         )
-        cur = self.conn.cursor()
-        cur.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)", row)
-        self.conn.commit()
-        if self._csv_path is not None:
-            self._csv_buffer.append(row)
-            self._flush_csv_buffer()
+        if self._use_async and self._event_queue is not None:
+            try:
+                self._event_queue.put_nowait(row)
+            except queue.Full:
+                log.warning(
+                    "Event queue saturated – writing synchronously (%s)", actor
+                )
+                self._flush_rows([row])
+            else:
+                if self._event_queue.maxsize and (
+                    self._perf_logging
+                    and time.monotonic() - self._last_queue_log >= 1.0
+                ):
+                    load = self._event_queue.qsize() / self._event_queue.maxsize
+                    if load >= 0.8:
+                        log.warning(
+                            "Event queue at %.0f%% capacity", load * 100.0
+                        )
+                        self._last_queue_log = time.monotonic()
+        else:
+            self._flush_rows([row])
         return {
             "session_id": session_id,
             "round_idx": round_idx,
@@ -248,7 +331,11 @@ class EventLogger:
     def close(self) -> None:
         if self._closed:
             return
-        self._flush_csv_buffer()
+        if self._use_async and self._event_queue is not None:
+            self._event_queue.put(self._queue_sentinel)
+            self._event_queue.join()
+            if self._writer_thread is not None:
+                self._writer_thread.join(timeout=1.0)
         self.conn.close()
         self._closed = True
 

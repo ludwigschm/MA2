@@ -4,6 +4,7 @@ import csv
 import itertools
 import logging
 import os
+import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,10 @@ from tabletop.state.controller import TabletopController, TabletopState
 from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
 from tabletop.engine import POINTS_PER_WIN
+from tabletop.utils.runtime import (
+    is_low_latency_disabled,
+    is_perf_logging_enabled,
+)
 from tabletop.ui.assets import (
     ASSETS,
     FIX_LIVE_IMAGE,
@@ -131,6 +136,7 @@ class TabletopRoot(FloatLayout):
         bridge_session: Optional[int] = None,
         bridge_block: Optional[int] = None,
         single_block_mode: bool = False,
+        perf_logging: bool = False,
         **kw: Any,
     ):
         super().__init__(**kw)
@@ -172,6 +178,10 @@ class TabletopRoot(FloatLayout):
         self.round_log_buffer = []
         self.overlay_display_index = 0
 
+        self._low_latency_disabled = is_low_latency_disabled()
+        self.perf_logging = (
+            bool(perf_logging) or is_perf_logging_enabled()
+        ) and not self._low_latency_disabled
         self._bridge: Optional["PupilBridge"] = None
         self._bridge_player: Optional[str] = None
         self._bridge_players: set[str] = set()
@@ -180,6 +190,9 @@ class TabletopRoot(FloatLayout):
         self._bridge_recordings_active: set[str] = set()
         self._bridge_recording_block: Optional[int] = None
         self._single_block_mode = single_block_mode
+        self._bridge_state_dirty = True
+        self._next_bridge_check = 0.0
+        self._bridge_check_interval = 0.3
         self.update_bridge_context(
             bridge=bridge,
             player=bridge_player,
@@ -188,7 +201,9 @@ class TabletopRoot(FloatLayout):
             block=bridge_block,
         )
         # kick recordings once Kivy has a chance to finish layout & session may be set
-        Clock.schedule_once(lambda *_: self._ensure_bridge_recordings(), 0.2)
+        Clock.schedule_once(
+            lambda *_: self._ensure_bridge_recordings(force=True), 0.2
+        )
 
         # --- UI Elemente initialisieren
         self._configure_widgets()
@@ -266,6 +281,7 @@ class TabletopRoot(FloatLayout):
 
             Clock.schedule_once(_kick_autostart, 0.2)
 
+        self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
 
     def _bridge_payload_base(self, *, player: Optional[str] = None) -> Dict[str, Any]:
@@ -304,8 +320,18 @@ class TabletopRoot(FloatLayout):
                 return None
         return None
 
-    def _ensure_bridge_recordings(self) -> None:
+    def _mark_bridge_dirty(self) -> None:
+        self._bridge_state_dirty = True
+
+    def _ensure_bridge_recordings(self, *_: Any, force: bool = False) -> None:
         if not self._bridge or not self.session_configured:
+            return
+
+        if force:
+            self._bridge_state_dirty = True
+
+        now = time.monotonic()
+        if not self._bridge_state_dirty and now < self._next_bridge_check:
             return
 
         if self._bridge_session is None and self.session_number is not None:
@@ -318,6 +344,8 @@ class TabletopRoot(FloatLayout):
         session_value = self._bridge_session
         block_value = self._bridge_block
         if session_value is None or block_value is None:
+            self._bridge_state_dirty = True
+            self._next_bridge_check = now + self._bridge_check_interval
             return
 
         if (
@@ -329,6 +357,8 @@ class TabletopRoot(FloatLayout):
 
         players = self._bridge_ready_players()
         if not players:
+            self._bridge_state_dirty = True
+            self._next_bridge_check = now + self._bridge_check_interval
             return
 
         for player in players:
@@ -339,6 +369,10 @@ class TabletopRoot(FloatLayout):
 
         if self._bridge_recordings_active:
             self._bridge_recording_block = block_value
+            self._bridge_state_dirty = False
+        else:
+            self._bridge_state_dirty = True
+        self._next_bridge_check = now + self._bridge_check_interval
 
     def stop_bridge_recordings(self) -> None:
         if not self._bridge_recordings_active:
@@ -357,6 +391,7 @@ class TabletopRoot(FloatLayout):
                 self._bridge_recordings_active.discard(player)
 
         self._bridge_recording_block = None
+        self._mark_bridge_dirty()
 
     def send_bridge_event(
         self, name: str, payload: Optional[Dict[str, Any]] = None
@@ -459,6 +494,7 @@ class TabletopRoot(FloatLayout):
                 'start_block': self.start_block,
             },
         )
+        self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
         self._apply_session_options_and_start()
 
@@ -1120,6 +1156,7 @@ class TabletopRoot(FloatLayout):
         self.update_status_label(2)
         self.refresh_center_cards(reveal=False)
         self.update_user_displays()
+        self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
 
     def refresh_center_cards(self, reveal: bool):

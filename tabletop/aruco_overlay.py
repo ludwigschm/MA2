@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
-from PyQt6.QtCore import Qt, QRect
+from PyQt6.QtCore import Qt, QRect, QTimer
 import cv2
 import numpy as np
 
@@ -184,6 +184,13 @@ class MarkerOverlay(QMainWindow):
         self.text_labels: List[QLabel] = []
         self.markers_visible = True
 
+        self._pixmap_cache: Dict[Tuple[int, int], QPixmap] = {}
+        self._layout_timer = QTimer(self)
+        self._layout_timer.setSingleShot(True)
+        self._layout_timer.setInterval(33)
+        self._layout_timer.timeout.connect(self._perform_layout_update)
+        self._layout_pending = False
+
         # Größen-Parameter
         self.size_percent = SIZE_PERCENT
         self.min_size = MIN_SIZE_PX
@@ -217,7 +224,7 @@ class MarkerOverlay(QMainWindow):
         except Exception as e:
             print(f"Warnung: Konnte marker_layout.json nicht schreiben: {e}")
 
-        self._layout_and_render_markers()
+        self._request_layout_update()
 
     @staticmethod
     def _positions_full(w: int, h: int, msize: int, margin: int) -> Dict[str, Tuple[int, int]]:
@@ -261,7 +268,7 @@ class MarkerOverlay(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._layout_and_render_markers()
+        self._request_layout_update()
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_M:
@@ -271,18 +278,28 @@ class MarkerOverlay(QMainWindow):
                 event.accept()
                 return
             self.size_percent *= 1.05
-            self._layout_and_render_markers()
+            self._request_layout_update()
         elif event.key() == Qt.Key.Key_Minus:
             if self.use_fixed:
                 event.accept()
                 return
             self.size_percent /= 1.05
-            self._layout_and_render_markers()
+            self._request_layout_update()
         elif event.key() == Qt.Key.Key_Escape:
             QApplication.instance().quit()
 
     def toggle_markers(self):
         self.markers_visible = not self.markers_visible
+        self._request_layout_update()
+
+    def _request_layout_update(self) -> None:
+        if self._layout_pending:
+            return
+        self._layout_pending = True
+        self._layout_timer.start()
+
+    def _perform_layout_update(self) -> None:
+        self._layout_pending = False
         self._layout_and_render_markers()
 
     def _layout_and_render_markers(self):
@@ -311,7 +328,12 @@ class MarkerOverlay(QMainWindow):
             x, y = pos_map[name]
             lab.resize(msize, msize)
             lab.move(x, y)
-            lab.setPixmap(generate_apriltag_qpixmap(tag_id, msize, QUIET_ZONE_RATIO))
+            cache_key = (tag_id, msize)
+            pixmap = self._pixmap_cache.get(cache_key)
+            if pixmap is None:
+                pixmap = generate_apriltag_qpixmap(tag_id, msize, QUIET_ZONE_RATIO)
+                self._pixmap_cache[cache_key] = pixmap
+            lab.setPixmap(pixmap)
             lab.setVisible(self.markers_visible)
 
         # WICHTIG: keine Textlabels setzen/anzeigen -> keine weiße Fläche unterhalb
@@ -328,12 +350,34 @@ def _parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _set_process_priority_low() -> None:
+    """Lower process priority when supported to reduce scheduling pressure."""
+
+    try:
+        os.nice(5)
+        return
+    except AttributeError:
+        pass
+    except OSError:
+        return
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        IDLE_PRIORITY_CLASS = 0x00000040
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), IDLE_PRIORITY_CLASS)
+    except Exception:
+        pass
+
+
 def main(argv: Optional[List[str]] = None):
     if argv is None:
         argv = sys.argv[1:]
 
     args = _parse_cli_args(argv)
     app = QApplication([sys.argv[0]])
+    _set_process_priority_low()
 
     # Standard: 8 Marker aus MARKER_LAYOUT
     layout = MARKER_LAYOUT
