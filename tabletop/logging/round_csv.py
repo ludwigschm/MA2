@@ -136,6 +136,12 @@ def round_log_action_label(app: Any, action: str, payload: Dict[str, Any]) -> st
         return "Showdown"
     if action == "session_start":
         return "Session"
+    if action == "fixation_start":
+        return "Fixation Start"
+    if action == "fixation_beep":
+        return "Fixation Ton"
+    if action == "fixation_end":
+        return "Fixation Ende"
     return action
 
 
@@ -143,7 +149,9 @@ def write_round_log(app: Any, actor: str, action: str, payload: Dict[str, Any], 
     if not getattr(app, "round_log_path", None):
         return
     is_showdown = action == "showdown"
-    if not is_showdown and player not in (1, 2):
+    system_actions = {"session_start", "fixation_start", "fixation_beep", "fixation_end"}
+    is_system_event = action in system_actions
+    if not is_showdown and not is_system_event and player not in (1, 2):
         return
 
     block_condition = ""
