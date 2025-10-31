@@ -8,6 +8,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Union
@@ -1179,10 +1180,14 @@ class PupilBridge:
             self._active_recording[player] = False
         self._recording_metadata.pop(player, None)
 
-    def connected_players(self) -> set[str]:
-        """Return the set of players that currently have a connected device."""
+    def connected_players(self) -> list[str]:
+        """Return the players that currently have a connected device."""
 
-        return {player for player, device in self._device_by_player.items() if device is not None}
+        return [
+            player
+            for player, device in self._device_by_player.items()
+            if device is not None
+        ]
 
     # ------------------------------------------------------------------
     # Event helpers
@@ -1299,13 +1304,14 @@ class PupilBridge:
     ) -> None:
         """Send an event to the player's device, encoding payload as JSON suffix."""
 
+        prepared_payload = self._normalise_event_payload(payload)
+
         if self._low_latency_disabled or self._event_queue is None:
-            self._dispatch_event(name, player, payload)
+            self._dispatch_event(name, player, prepared_payload)
             return
 
-        payload_copy = dict(payload) if isinstance(payload, dict) else payload
         try:
-            self._event_queue.put_nowait((name, player, payload_copy))
+            self._event_queue.put_nowait((name, player, prepared_payload))
         except queue.Full:
             self._event_queue_drop += 1
             log.warning(
@@ -1314,6 +1320,7 @@ class PupilBridge:
                 player,
                 self._event_queue_drop,
             )
+            self._dispatch_event(name, player, prepared_payload)
         else:
             if self._perf_logging and self._event_queue.maxsize:
                 load = self._event_queue.qsize() / self._event_queue.maxsize
@@ -1322,6 +1329,100 @@ class PupilBridge:
                         "Pupil event queue at %.0f%% capacity", load * 100.0
                     )
                     self._last_queue_log = time.monotonic()
+
+    def refine_event(
+        self,
+        player: str,
+        event_id: str,
+        t_ref_ns: int,
+        *,
+        confidence: float,
+        mapping_version: int,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Submit a refinement update for an existing event annotation.""""
+
+        payload: Dict[str, Any] = {
+            "event_id": event_id,
+            "t_ref_ns": int(t_ref_ns),
+            "confidence": float(confidence),
+            "mapping_version": int(mapping_version),
+            "refined": True,
+            "provisional": False,
+            "origin_device": "host_ui",
+        }
+        if extra:
+            payload.update(extra)
+
+        response = None
+        try:
+            response = self._post_device_api(
+                player,
+                "/api/annotations/refine",
+                payload,
+                warn=False,
+            )
+        except Exception:  # pragma: no cover - network dependent
+            log.debug("Refinement REST call failed for %s", player, exc_info=True)
+
+        if response is not None and getattr(response, "status_code", None) in {200, 204}:
+            log.debug(
+                "Refinement acknowledged via REST for %s (event %s, v%s)",
+                player,
+                event_id,
+                mapping_version,
+            )
+            return
+
+        log.debug(
+            "Falling back to realtime refine event for %s (event %s, v%s)",
+            player,
+            event_id,
+            mapping_version,
+        )
+        self.send_event("event.refined", player, payload)
+
+    def _normalise_event_payload(
+        self, payload: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Ensure mandatory metadata is attached to outgoing event payloads."""
+
+        data: Dict[str, Any] = {}
+        if isinstance(payload, dict):
+            data.update(payload)
+
+        event_id = data.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            event_id = str(uuid.uuid4())
+            data["event_id"] = event_id
+
+        raw_local = data.get("t_local_ns")
+        try:
+            local_ns = int(raw_local)
+        except Exception:
+            local_ns = time.perf_counter_ns()
+        else:
+            if local_ns < 0:
+                local_ns = time.perf_counter_ns()
+        data["t_local_ns"] = local_ns
+
+        provisional = data.get("provisional", True)
+        if isinstance(provisional, str):
+            data["provisional"] = provisional.strip().lower() not in {"false", "0", "no"}
+        else:
+            data["provisional"] = bool(provisional)
+
+        try:
+            mapping_version = int(data.get("mapping_version", 0))
+        except Exception:
+            mapping_version = 0
+        data["mapping_version"] = mapping_version
+
+        origin = data.get("origin_device")
+        if not isinstance(origin, str) or not origin:
+            data["origin_device"] = "host_ui"
+
+        return data
 
     # ------------------------------------------------------------------
     def estimate_time_offset(self, player: str) -> Optional[float]:

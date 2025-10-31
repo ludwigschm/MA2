@@ -193,15 +193,27 @@ class EventLogger:
     def __init__(self, db_path: str, csv_path: Optional[str] = None):
         pathlib.Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute(
-            """
+        self._db_lock = threading.Lock()
+        with self._db_lock:
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute(
+                """
         CREATE TABLE IF NOT EXISTS events(
           session_id TEXT, round_idx INT, phase TEXT, actor TEXT, action TEXT,
           payload TEXT, t_mono_ns INTEGER, t_utc_iso TEXT
         )"""
-        )
-        self.conn.commit()
+            )
+            self.conn.execute(
+                """
+        CREATE TABLE IF NOT EXISTS event_refinements(
+          event_id TEXT PRIMARY KEY,
+          t_ref_ns INTEGER,
+          mapping_version INT,
+          confidence REAL,
+          created_utc TEXT
+        )"""
+            )
+            self.conn.commit()
         self._csv_path: Optional[pathlib.Path] = None
         self._closed = False
         if csv_path:
@@ -265,9 +277,10 @@ class EventLogger:
         if not rows:
             return
         start = time.perf_counter()
-        cur = self.conn.cursor()
-        cur.executemany("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)", rows)
-        self.conn.commit()
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.executemany("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)", rows)
+            self.conn.commit()
         if self._csv_path is not None:
             with open(self._csv_path, "a", encoding="utf-8", newline="") as fp:
                 writer = csv.writer(fp)
@@ -336,8 +349,61 @@ class EventLogger:
             self._event_queue.join()
             if self._writer_thread is not None:
                 self._writer_thread.join(timeout=1.0)
-        self.conn.close()
+        with self._db_lock:
+            self.conn.close()
         self._closed = True
+
+    def record_refinement(
+        self,
+        event_id: str,
+        t_ref_ns: int,
+        mapping_version: int,
+        confidence: float,
+    ) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._db_lock:
+            self.conn.execute(
+                """
+        INSERT OR REPLACE INTO event_refinements(event_id, t_ref_ns, mapping_version, confidence, created_utc)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+                (event_id, int(t_ref_ns), int(mapping_version), float(confidence), timestamp),
+            )
+            self.conn.commit()
+
+    def fetch_events_by_event_id(self, event_id: str) -> List[Dict[str, Any]]:
+        pattern = f'%"event_id":"{event_id}"%'
+        with self._db_lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+        SELECT session_id, round_idx, phase, actor, action, payload, t_mono_ns, t_utc_iso
+        FROM events
+        WHERE payload LIKE ?
+        """,
+                (pattern,),
+            )
+            rows = cur.fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            payload_raw = row[5]
+            try:
+                payload_obj = json.loads(payload_raw)
+            except Exception:
+                payload_obj = payload_raw
+            result.append(
+                {
+                    "session_id": row[0],
+                    "round_idx": row[1],
+                    "phase": row[2],
+                    "actor": row[3],
+                    "action": row[4],
+                    "payload": payload_obj,
+                    "t_mono_ns": row[6],
+                    "t_utc_iso": row[7],
+                }
+            )
+        return result
 
 
 # -------------- Engine --------------

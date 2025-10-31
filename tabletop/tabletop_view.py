@@ -4,7 +4,9 @@ import csv
 import itertools
 import logging
 import os
+import random
 import time
+import uuid
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +43,8 @@ from tabletop.overlay.process import start_overlay_process, stop_overlay_process
 from tabletop.state.controller import TabletopController, TabletopState
 from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
-from tabletop.engine import POINTS_PER_WIN
+from tabletop.engine import POINTS_PER_WIN, EventLogger
+from tabletop.sync.reconciler import TimeReconciler
 from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
@@ -120,6 +123,13 @@ class TabletopRoot(FloatLayout):
             return None
         return w
 
+    @property
+    def _current_ab_version(self) -> int:
+        reconciler = self._time_reconciler
+        if reconciler is None:
+            return 0
+        return reconciler.current_mapping_version
+
     def __init__(
         self,
         *,
@@ -193,6 +203,13 @@ class TabletopRoot(FloatLayout):
         self._bridge_state_dirty = True
         self._next_bridge_check = 0.0
         self._bridge_check_interval = 0.3
+        self._time_reconciler: Optional[TimeReconciler] = None
+        self._heartbeat_event: Optional[Any] = None
+        self._heartbeat_interval = 60.0
+        self._heartbeat_jitter = 5.0
+        self._heartbeat_label = "sync.heartbeat"
+        self._heartbeat_counter = 0
+        self._origin_device_id = "host_ui"
         self.update_bridge_context(
             bridge=bridge,
             player=bridge_player,
@@ -283,6 +300,9 @@ class TabletopRoot(FloatLayout):
 
         self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
+        self._ensure_time_reconciler()
+        if self.session_configured:
+            self._schedule_sync_heartbeat(immediate=False)
 
     def _bridge_payload_base(self, *, player: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
@@ -393,20 +413,125 @@ class TabletopRoot(FloatLayout):
         self._bridge_recording_block = None
         self._mark_bridge_dirty()
 
+    def _resolve_event_logger(self) -> Optional[EventLogger]:
+        logger_obj = getattr(self, "logger", None)
+        if isinstance(logger_obj, EventLogger):
+            return logger_obj
+        inner = getattr(logger_obj, "_logger", None)
+        if isinstance(inner, EventLogger):
+            return inner
+        return None
+
+    def _ensure_time_reconciler(self) -> None:
+        if self._time_reconciler is not None:
+            return
+        if not self._bridge:
+            return
+        event_logger = self._resolve_event_logger()
+        if event_logger is None:
+            return
+        try:
+            reconciler = TimeReconciler(self._bridge, event_logger)
+        except Exception:
+            log.exception("Zeitabgleich konnte nicht initialisiert werden")
+            return
+        reconciler.start()
+        self._time_reconciler = reconciler
+
+    def _cancel_sync_heartbeat(self) -> None:
+        event = self._heartbeat_event
+        if event is None:
+            return
+        cancel = getattr(event, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                log.debug("Abbruch des Sync-Heartbeats fehlgeschlagen", exc_info=True)
+        self._heartbeat_event = None
+
+    def _schedule_sync_heartbeat(self, *, immediate: bool = False) -> None:
+        self._ensure_time_reconciler()
+        if not self._bridge:
+            return
+        delay = 0.5 if immediate else self._heartbeat_interval
+        if not immediate:
+            jitter = min(self._heartbeat_jitter, self._heartbeat_interval * 0.25)
+            if jitter > 0:
+                delay = max(1.0, self._heartbeat_interval + random.uniform(-jitter, jitter))
+        self._cancel_sync_heartbeat()
+        self._heartbeat_event = Clock.schedule_once(self._emit_sync_heartbeat, delay)
+
+    def _emit_sync_heartbeat(self, _dt: float) -> None:
+        payload = {"marker": "hb", "heartbeat_index": self._heartbeat_counter}
+        self._heartbeat_counter += 1
+        try:
+            self.send_bridge_event(self._heartbeat_label, payload)
+        finally:
+            self._schedule_sync_heartbeat(immediate=False)
+
+    def _notify_event_pipeline(self, name: str, event_id: str, t_local_ns: int) -> None:
+        reconciler = self._time_reconciler
+        if reconciler is None:
+            return
+        try:
+            reconciler.on_event(event_id, t_local_ns)
+            if name.startswith("sync."):
+                reconciler.submit_marker(name, t_local_ns)
+        except Exception:
+            log.debug("Weiterleitung an TimeReconciler fehlgeschlagen", exc_info=True)
+
+    def shutdown_sync_services(self) -> None:
+        self._cancel_sync_heartbeat()
+        reconciler = self._time_reconciler
+        if reconciler is not None:
+            try:
+                reconciler.stop()
+            except Exception:
+                log.debug("Stoppen des TimeReconciler fehlgeschlagen", exc_info=True)
+            self._time_reconciler = None
+
     def send_bridge_event(
         self, name: str, payload: Optional[Dict[str, Any]] = None
     ) -> None:
         if not self._bridge:
             return
+        self._ensure_time_reconciler()
         self._ensure_bridge_recordings()
         players = self._bridge_ready_players()
         if not players:
             return
+        event_id = str(uuid.uuid4())
+        t_local_ns = time.perf_counter_ns()
+        mapping_version = self._current_ab_version
+        payload_copy: Dict[str, Any] = {}
+        if payload:
+            payload_copy.update(payload)
+
+        session_label = self.session_id
+        bridge_session = self._bridge_session
+        bridge_block = self._bridge_block
+
         for player in players:
             event_payload = self._bridge_payload_base(player=player)
-            if payload:
-                event_payload.update(payload)
+            event_payload.update(payload_copy)
+            event_payload["event_id"] = event_id
+            event_payload["t_local_ns"] = t_local_ns
+            event_payload["provisional"] = True
+            event_payload["mapping_version"] = mapping_version
+            event_payload["origin_device"] = self._origin_device_id
+            event_payload.setdefault("origin_player", player)
+            if session_label:
+                event_payload.setdefault("session_label", session_label)
+            if self.session_number is not None:
+                event_payload.setdefault("session_number", self.session_number)
+            if bridge_session is not None:
+                event_payload.setdefault("bridge_session", bridge_session)
+            if bridge_block is not None:
+                event_payload.setdefault("bridge_block", bridge_block)
             self._bridge.send_event(name, player, event_payload)
+
+        self._notify_event_pipeline(name, event_id, t_local_ns)
 
     def _emit_button_bridge_event(
         self,
@@ -481,6 +606,8 @@ class TabletopRoot(FloatLayout):
         db_path = self.log_dir / f'events_{safe_session_id}.sqlite3'
         self.session_storage_id = safe_session_id
         self.logger = self.events_factory(self.session_id, str(db_path))
+        self._ensure_time_reconciler()
+        self._schedule_sync_heartbeat(immediate=True)
         init_round_log(self)
         self.update_role_assignments()
 

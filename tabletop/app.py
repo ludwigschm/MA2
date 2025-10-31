@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from collections import deque
-from pathlib import Path
-from typing import Any, Optional, Sequence, cast
-
+import argparse
 import os
 import math
+import random
 import statistics
 import time
-
-import logging
+from collections import deque
 from contextlib import suppress
 from logging.handlers import QueueHandler, QueueListener
+from pathlib import Path
 from queue import Queue
+from typing import Any, Optional, Sequence, cast
+
+import logging
 
 from kivy.app import App
 from kivy.config import Config
@@ -38,6 +39,8 @@ from tabletop.overlay.process import (
 )
 from tabletop.tabletop_view import TabletopRoot
 from tabletop.pupil_bridge import PupilBridge
+from tabletop.engine import EventLogger
+from tabletop.sync.reconciler import TimeReconciler
 from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
@@ -374,24 +377,29 @@ class TabletopApp(App):
         if not self._bridge:
             return
         key_name = self._format_key_name(key, codepoint)
+        event_name = f"key.{key_name}.{action}"
+        payload = self._bridge_payload_base()
+        payload.update(
+            {
+                "key": key_name,
+                "keycode": key,
+                "scancode": scancode,
+                "codepoint": codepoint,
+                "modifiers": modifiers,
+            }
+        )
+        root = cast(Optional[TabletopRoot], self.root)
+        if root is not None:
+            root.send_bridge_event(event_name, payload)
+            return
+
         players = self._iter_active_players()
         if not players:
             return
-        payload_base = self._bridge_payload_base()
-        event_name = f"key.{key_name}.{action}"
         for player in players:
-            payload = dict(payload_base)
-            payload.update(
-                {
-                    "key": key_name,
-                    "keycode": key,
-                    "scancode": scancode,
-                    "codepoint": codepoint,
-                    "modifiers": modifiers,
-                    "player": player,
-                }
-            )
-            self._bridge.send_event(event_name, player, payload)
+            payload_copy = dict(payload)
+            payload_copy["target_player"] = player
+            self._bridge.send_event(event_name, player, payload_copy)
 
     def _bind_esc(self) -> None:
         """Ensure ESC toggles fullscreen without closing the app."""
@@ -631,6 +639,12 @@ class TabletopApp(App):
             close_round_log(root)
 
         if root is not None:
+            shutdown_sync = getattr(root, "shutdown_sync_services", None)
+            if callable(shutdown_sync):
+                try:
+                    shutdown_sync()
+                except Exception:  # pragma: no cover - defensive fallback
+                    log.debug("shutdown_sync_services raised", exc_info=True)
             try:
                 root.stop_bridge_recordings()
             except AttributeError:
@@ -691,6 +705,101 @@ def _resolve_requested_players(
     return [normalized]
 
 
+def run_demo(*, duration: float = 8.0, heartbeat_interval: float = 2.0) -> None:
+    """Run a console demo that showcases event refinement without the UI."""
+
+    class DemoBridge:
+        def __init__(self) -> None:
+            self._offsets = {"VP1": 0.250, "VP2": 0.320}
+            self._events: dict[str, dict[str, Any]] = {}
+
+        def connected_players(self) -> list[str]:
+            return list(self._offsets.keys())
+
+        def event_queue_load(self) -> tuple[int, int]:
+            return (0, 100)
+
+        def send_event(
+            self, name: str, player: str, payload: Optional[dict[str, Any]] = None
+        ) -> None:
+            payload = payload or {}
+            event_id = payload.get("event_id", "?")
+            mapping = payload.get("mapping_version")
+            print(
+                f"[demo] provisional {player}: {name} id={event_id} mapping={mapping}"
+            )
+            self._events[event_id] = payload
+
+        def refine_event(
+            self,
+            player: str,
+            event_id: str,
+            t_ref_ns: int,
+            *,
+            confidence: float,
+            mapping_version: int,
+            extra: Optional[dict[str, Any]] = None,
+        ) -> None:
+            print(
+                f"[demo] refined   {player}: id={event_id} -> {t_ref_ns}ns "
+                f"(v{mapping_version}, conf={confidence:.3f})"
+            )
+            if extra:
+                print(f"        extra={extra}")
+
+        def estimate_time_offset(self, player: str) -> Optional[float]:
+            base = self._offsets.get(player, 0.250)
+            drift = random.uniform(-0.00015, 0.00015)
+            noise = random.uniform(-0.0015, 0.0015)
+            updated = base + drift
+            self._offsets[player] = updated
+            return updated + noise
+
+    log.info("Starting refinement demo – this runs without the Kivy UI")
+    bridge = DemoBridge()
+    log_dir = Path.cwd() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    db_path = log_dir / "demo_refinement.sqlite3"
+    try:
+        db_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    logger = EventLogger(str(db_path))
+    reconciler = TimeReconciler(bridge, logger, window_size=8)
+    reconciler.start()
+    try:
+        start = time.perf_counter()
+        next_marker = start
+        counter = 0
+        while time.perf_counter() - start < duration:
+            t_local_ns = time.perf_counter_ns()
+            event_id = f"demo-{counter:04d}"
+            payload = {
+                "event_id": event_id,
+                "t_local_ns": t_local_ns,
+                "provisional": True,
+                "mapping_version": reconciler.current_mapping_version,
+                "origin_device": "demo_host",
+            }
+            for player in bridge.connected_players():
+                bridge.send_event("demo.button", player, dict(payload, player=player))
+            reconciler.on_event(event_id, t_local_ns)
+            counter += 1
+            now = time.perf_counter()
+            if now >= next_marker:
+                marker_ns = time.perf_counter_ns()
+                print(f"[demo] heartbeat marker emitted at {marker_ns}")
+                reconciler.submit_marker("demo.heartbeat", marker_ns)
+                next_marker = now + max(0.5, heartbeat_interval)
+            time.sleep(0.35)
+        time.sleep(1.0)
+    finally:
+        reconciler.stop()
+        logger.close()
+    print(f"[demo] SQLite refinements written to {db_path}")
+
+
 def main(
     *,
     session: Optional[int] = None,
@@ -742,4 +851,17 @@ def main(
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution
-    main()
+    parser = argparse.ArgumentParser(description="Tabletop experiment UI")
+    parser.add_argument("--session", type=int, default=None, help="Session identifier")
+    parser.add_argument("--block", type=int, default=None, help="Block identifier")
+    parser.add_argument("--player", default="auto", help="Player to control (VP1/VP2/both)")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run the latency/refinement demo instead of launching the UI",
+    )
+    args = parser.parse_args()
+    if args.demo:
+        run_demo()
+    else:
+        main(session=args.session, block=args.block, player=args.player)
