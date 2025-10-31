@@ -1000,6 +1000,7 @@ class TabletopRoot(FloatLayout):
             live_image=FIX_LIVE_IMAGE,
             on_complete=on_complete,
             bridge=self._bridge,
+            players=sorted(self._bridge_players) if self._bridge_players else None,
             player=self._bridge_player,
             session=self._bridge_session,
             block=self._bridge_block,
@@ -1505,8 +1506,6 @@ class TabletopRoot(FloatLayout):
         return to_engine_phase(self.phase)
 
     def log_event(self, player: int, action: str, payload=None):
-        if self.is_practice_block_active() and action not in ('session_start',):
-            return
         if not self.logger or not self.session_configured:
             return
         payload = payload or {}

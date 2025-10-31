@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -67,6 +67,7 @@ def run_fixation_sequence(
     live_image: Optional[Path | str],
     on_complete: Optional[Callable[[], None]] = None,
     bridge: Optional["PupilBridge"] = None,
+    players: Optional[Iterable[str]] = None,
     player: Optional[str] = None,
     session: Optional[int] = None,
     block: Optional[int] = None,
@@ -85,18 +86,38 @@ def run_fixation_sequence(
             on_complete()
         return
 
+    player_targets = {
+        p for p in (players or []) if p
+    }
+    if player:
+        player_targets.add(player)
+    player_list = tuple(sorted(player_targets))
+
     def _send_sync_event(name: str) -> None:
-        if bridge is None or player is None:
+        if bridge is None or not player_list:
             return
-        if not bridge.is_connected(player):
+        for target in player_list:
+            if not bridge.is_connected(target):
+                continue
+            payload: dict[str, Any] = {"player": target}
+            if session is not None:
+                payload["session"] = session
+            if block is not None:
+                payload["block"] = block
+            bridge.send_event(name, target, payload)
+
+    def _log_fixation_event(kind: str) -> None:
+        log_event = getattr(controller, "log_event", None)
+        if not callable(log_event):
             return
         payload: dict[str, Any] = {}
+        if player_list:
+            payload["players"] = list(player_list)
         if session is not None:
             payload["session"] = session
         if block is not None:
             payload["block"] = block
-        payload["player"] = player
-        bridge.send_event(name, player, payload)
+        log_event(None, kind, payload or None)
 
     controller.fixation_running = True
     controller.pending_fixation_callback = on_complete
@@ -107,6 +128,7 @@ def run_fixation_sequence(
         controller.remove_widget(overlay)
     controller.add_widget(overlay)
 
+    _log_fixation_event("fixation_start")
     _send_sync_event("sync.fixation_start")
 
     for attr in ("btn_start_p1", "btn_start_p2"):
@@ -130,6 +152,7 @@ def run_fixation_sequence(
         controller.pending_fixation_callback = None
         if callback:
             callback()
+        _log_fixation_event("fixation_end")
         _send_sync_event("sync.fixation_end")
 
     def show_final_live(_dt: float) -> None:
@@ -139,6 +162,7 @@ def run_fixation_sequence(
     def show_stop_and_tone(_dt: float) -> None:
         _set_image_source(image, stop_image, fallback="blank")
         play_fixation_tone(controller)
+        _log_fixation_event("fixation_beep")
         _send_sync_event("sync.flash_beep")
         schedule_once(show_final_live, 0.2)
 
