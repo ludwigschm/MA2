@@ -23,16 +23,21 @@ class _PlayerState:
 
     player: str
     samples: Deque[Tuple[int, int]] = field(default_factory=deque)
+    raw_offsets: Deque[Tuple[int, int]] = field(default_factory=deque)
     intercept_ns: float = 0.0
     slope: float = 1.0
     rms_ns: float = 0.0
     confidence: float = 0.0
     mapping_version: int = 0
+    sample_count: int = 0
+    offset_sign: int = 1
     last_update: float = field(default_factory=time.monotonic)
 
 
 class TimeReconciler:
     """Continuously estimates clock offsets and refines provisional events."""
+
+    CONF_MIN = 0.8
 
     def __init__(
         self,
@@ -45,15 +50,14 @@ class TimeReconciler:
         self._window_size = max(3, int(window_size))
         self._state_lock = threading.Lock()
         self._player_states: Dict[str, _PlayerState] = {}
-        self._mapping_version = 0
-        self._global_model: Optional[Tuple[float, float, float, float, int]] = None
+        self._conf_min = float(self.CONF_MIN)
         self._task_queue: queue.Queue[Tuple[str, Tuple[Any, ...]]] = queue.Queue(
             maxsize=2000
         )
         self._queue_drop = 0
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
-        self._known_events: Dict[str, Tuple[int, int]] = {}
+        self._known_events: Dict[str, Tuple[int, Dict[str, int]]] = {}
         self._event_order: Deque[str] = deque()
         self._event_retention = max(2000, self._window_size * 200)
         self._heartbeat_count = 0
@@ -65,7 +69,9 @@ class TimeReconciler:
     @property
     def current_mapping_version(self) -> int:
         with self._state_lock:
-            return self._mapping_version
+            if not self._player_states:
+                return 0
+            return max(state.mapping_version for state in self._player_states.values())
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -159,59 +165,218 @@ class TimeReconciler:
         self._heartbeat_count += 1
 
         for player, offset_ns in offsets_ns.items():
-            device_ns = t_local_ns + offset_ns
-            samples = self._append_sample(player, t_local_ns, device_ns)
-            if samples is None:
-                continue
-            changed = self._recompute_model_from_samples(player, samples)
-            if changed:
-                model = self._global_model
-                if model is not None:
-                    intercept, slope, confidence, rms_ns, version = model
-                    log.info(
-                        "Mapping %s updated: a=%.0fns b=%.9f conf=%.3f rms=%.3fms (v%s)",
-                        player,
-                        intercept,
-                        slope,
-                        confidence,
-                        rms_ns / 1_000_000.0,
-                        version,
-                    )
-        model = self._global_model
-        if model is not None:
-            _, _, confidence, rms_ns, version = model
-            log.debug(
-                "Sync marker %s processed (hb=%d, conf=%.3f, rms=%.3fms, v%s)",
-                label,
-                self._heartbeat_count,
-                confidence,
-                rms_ns / 1_000_000.0,
-                version,
-            )
+            self._ingest_marker(player, t_local_ns, offset_ns)
 
-    def _append_sample(
-        self, player: str, t_local_ns: int, t_device_ns: int
-    ) -> Optional[list[Tuple[int, int]]]:
+        log.debug(
+            "Sync marker %s processed (hb=%d, players=%d)",
+            label,
+            self._heartbeat_count,
+            len(offsets_ns),
+        )
+
+    def _ingest_marker(self, player: str, t_local_ns: int, offset_ns: int) -> None:
+        base_samples: list[Tuple[int, int]]
         with self._state_lock:
             state = self._player_states.get(player)
             if state is None:
                 state = _PlayerState(
                     player=player,
                     samples=deque(maxlen=self._window_size),
+                    raw_offsets=deque(maxlen=self._window_size),
                 )
                 self._player_states[player] = state
             elif state.samples.maxlen != self._window_size:
                 state.samples = deque(state.samples, maxlen=self._window_size)
-            state.samples.append((t_local_ns, t_device_ns))
-            return list(state.samples)
+                state.raw_offsets = deque(state.raw_offsets, maxlen=self._window_size)
+            raw_samples = list(state.raw_offsets)
+            current_sign = state.offset_sign or 1
+            current_intercept = state.intercept_ns
+            current_slope = state.slope
+            current_count = state.sample_count
+
+        raw_candidates = self._trimmed_raw_samples(raw_samples, (t_local_ns, offset_ns))
+
+        candidate_pos = self._raw_to_samples(raw_candidates, 1)
+        candidate_neg = self._raw_to_samples(raw_candidates, -1)
+
+        pos_metrics = self._evaluate_candidate(candidate_pos)
+        neg_metrics = self._evaluate_candidate(candidate_neg)
+
+        chosen_sign = current_sign
+        chosen_samples = candidate_pos
+        chosen_metrics = pos_metrics
+
+        offset_residual_pos = float("inf")
+        offset_residual_neg = float("inf")
+        if pos_metrics is not None:
+            offset_residual_pos = self._offset_residual(
+                raw_candidates, pos_metrics[0], pos_metrics[1], 1
+            )
+        if neg_metrics is not None:
+            offset_residual_neg = self._offset_residual(
+                raw_candidates, neg_metrics[0], neg_metrics[1], -1
+            )
+        align_pos = (
+            self._offset_alignment(raw_candidates, pos_metrics[0], pos_metrics[1], 1)
+            if pos_metrics is not None
+            else 0.0
+        )
+        align_neg = (
+            self._offset_alignment(raw_candidates, neg_metrics[0], neg_metrics[1], -1)
+            if neg_metrics is not None
+            else 0.0
+        )
+        if offset_residual_neg + 1e-3 < offset_residual_pos * 0.8:
+            chosen_sign = -1
+            chosen_samples = candidate_neg
+            chosen_metrics = neg_metrics
+        elif offset_residual_pos + 1e-3 < offset_residual_neg * 0.8:
+            chosen_sign = 1
+            chosen_samples = candidate_pos
+            chosen_metrics = pos_metrics
+        elif align_neg > 0 and align_pos < 0:
+            chosen_sign = -1
+            chosen_samples = candidate_neg
+            chosen_metrics = neg_metrics
+        elif align_pos > 0 and align_neg < 0:
+            chosen_sign = 1
+            chosen_samples = candidate_pos
+            chosen_metrics = pos_metrics
+
+        if current_count >= 2:
+            predicted_ns = current_intercept + current_slope * t_local_ns
+            pos_residual = abs(predicted_ns - candidate_pos[-1][1])
+            neg_residual = abs(predicted_ns - candidate_neg[-1][1])
+            if neg_residual + 1e-6 < pos_residual * 0.8:
+                chosen_sign = -1
+                chosen_samples = candidate_neg
+                chosen_metrics = neg_metrics
+            elif pos_residual + 1e-6 < neg_residual * 0.8:
+                chosen_sign = 1
+                chosen_samples = candidate_pos
+                chosen_metrics = pos_metrics
+            elif current_sign < 0 and neg_residual + 1e-6 < pos_residual * 1.05:
+                chosen_sign = -1
+                chosen_samples = candidate_neg
+                chosen_metrics = neg_metrics
+            elif current_sign > 0 and pos_residual + 1e-6 < neg_residual * 1.05:
+                chosen_sign = 1
+                chosen_samples = candidate_pos
+                chosen_metrics = pos_metrics
+
+        if pos_metrics is None and neg_metrics is not None:
+            chosen_sign = -1
+            chosen_samples = candidate_neg
+            chosen_metrics = neg_metrics
+        elif pos_metrics is not None and neg_metrics is not None:
+            pos_rms = pos_metrics[2]
+            neg_rms = neg_metrics[2]
+            if neg_rms + 1e-9 < pos_rms * 0.8:
+                chosen_sign = -1
+                chosen_samples = candidate_neg
+                chosen_metrics = neg_metrics
+            elif pos_rms + 1e-9 < neg_rms * 0.8:
+                chosen_sign = 1
+                chosen_samples = candidate_pos
+                chosen_metrics = pos_metrics
+            else:
+                chosen_sign = current_sign
+                chosen_samples = candidate_pos if current_sign >= 0 else candidate_neg
+                chosen_metrics = pos_metrics if current_sign >= 0 else neg_metrics
+        elif pos_metrics is None and neg_metrics is None:
+            chosen_sign = current_sign
+            chosen_samples = candidate_pos if current_sign >= 0 else candidate_neg
+            chosen_metrics = None
+
+        with self._state_lock:
+            state = self._player_states[player]
+            if chosen_sign != state.offset_sign:
+                state.offset_sign = chosen_sign
+                log.warning(
+                    "Offset semantics inverted for %s (sign=%+d)",
+                    player,
+                    chosen_sign,
+                )
+            state.raw_offsets = deque(raw_candidates, maxlen=self._window_size)
+            state.samples = deque(chosen_samples, maxlen=self._window_size)
+            samples_list = list(state.samples)
+
+        self._recompute_model_from_samples(player, samples_list)
+
+    def _trimmed_raw_samples(
+        self, base: list[Tuple[int, int]], sample: Tuple[int, int]
+    ) -> list[Tuple[int, int]]:
+        samples = list(base)
+        samples.append(sample)
+        if len(samples) > self._window_size:
+            samples = samples[-self._window_size :]
+        return samples
+
+    def _raw_to_samples(
+        self, raw: list[Tuple[int, int]], sign: int
+    ) -> list[Tuple[int, int]]:
+        result: list[Tuple[int, int]] = []
+        for t_local_ns, offset_ns in raw:
+            device_ns = t_local_ns + sign * offset_ns
+            result.append((t_local_ns, device_ns))
+        return result
+
+    def _offset_residual(
+        self,
+        raw: list[Tuple[int, int]],
+        intercept: float,
+        slope: float,
+        sign: int,
+    ) -> float:
+        if not raw:
+            return float("inf")
+        residuals = []
+        for t_local_ns, measured_offset in raw:
+            predicted_device = intercept + slope * t_local_ns
+            predicted_raw = sign * (predicted_device - t_local_ns)
+            residuals.append(predicted_raw - measured_offset)
+        mean_square = sum(value * value for value in residuals) / len(residuals)
+        return math.sqrt(mean_square)
+
+    def _offset_alignment(
+        self, raw: list[Tuple[int, int]], intercept: float, slope: float, sign: int
+    ) -> float:
+        if not raw:
+            return 0.0
+        alignment = 0.0
+        for t_local_ns, measured_offset in raw:
+            predicted_device = intercept + slope * t_local_ns
+            predicted_raw = sign * (predicted_device - t_local_ns)
+            alignment += predicted_raw * measured_offset
+        return alignment / len(raw)
+
+    def _evaluate_candidate(
+        self, samples: list[Tuple[int, int]]
+    ) -> Optional[Tuple[float, float, float]]:
+        if len(samples) < 2:
+            return None
+        return self._huber_fit(samples)
 
     def _recompute_model_from_samples(
         self, player: str, samples: list[Tuple[int, int]]
     ) -> bool:
-        if len(samples) < 2:
+        changed = False
+        intercept: float
+        slope: float
+        rms_ns: float
+        confidence: float
+        mapping_version: int
+        sample_count = len(samples)
+        if sample_count < 2:
+            with self._state_lock:
+                state = self._player_states[player]
+                state.sample_count = sample_count
+                state.last_update = time.monotonic()
             return False
+
         intercept, slope, rms_ns = self._huber_fit(samples)
         confidence = self._confidence_from_rms(rms_ns)
+
         with self._state_lock:
             state = self._player_states[player]
             delta_intercept = abs(state.intercept_ns - intercept)
@@ -219,34 +384,57 @@ class TimeReconciler:
             changed = (
                 delta_intercept > self._intercept_epsilon_ns
                 or delta_slope > self._slope_epsilon
+                or state.sample_count != sample_count
             )
             state.intercept_ns = intercept
             state.slope = slope
             state.rms_ns = rms_ns
             state.confidence = confidence
+            state.sample_count = sample_count
             state.last_update = time.monotonic()
-            if changed:
-                state.mapping_version = self._bump_mapping_version_locked()
-            else:
-                state.mapping_version = max(state.mapping_version, self._mapping_version)
-            self._update_global_model_locked()
-            version = self._mapping_version
+            if changed or state.mapping_version == 0:
+                state.mapping_version += 1
+            mapping_version = state.mapping_version
+            offset_sign = state.offset_sign
+
+        log_fn = log.info if changed else log.debug
+        log_fn(
+            "Mapping update %s: a=%.0fns b=%.9f rms=%.3fms conf=%.3f samples=%d v%s sign=%+d",
+            player,
+            intercept,
+            slope,
+            rms_ns / 1_000_000.0,
+            confidence,
+            sample_count,
+            mapping_version,
+            offset_sign,
+        )
+
         if changed:
-            self._refine_all_pending(version)
+            self._refine_all_pending_for_player(player, mapping_version)
         return changed
 
-    def _refine_all_pending(self, version: int) -> None:
-        event_ids: list[str]
+    def _refine_all_pending_for_player(self, player: str, version: int) -> None:
+        pending: list[Tuple[str, int]] = []
         with self._state_lock:
-            event_ids = list(self._known_events.keys())
-        for event_id in event_ids:
-            self._refine_single_event(event_id, version_hint=version)
+            for event_id, (t_local_ns, versions) in self._known_events.items():
+                last_version = versions.get(player, 0)
+                if version > last_version:
+                    pending.append((event_id, t_local_ns))
+        for event_id, t_local_ns in pending:
+            self._refine_event_for_player(
+                player, event_id, t_local_ns, version_hint=version
+            )
 
     def _process_event(self, event_id: str, t_local_ns: int) -> None:
         with self._state_lock:
             previous = self._known_events.get(event_id)
-            last_version = previous[1] if previous else 0
-            self._known_events[event_id] = (t_local_ns, last_version)
+            versions: Dict[str, int]
+            if previous is None:
+                versions = {}
+            else:
+                _, versions = previous
+            self._known_events[event_id] = (t_local_ns, dict(versions))
             self._event_order.append(event_id)
             while len(self._event_order) > self._event_retention:
                 stale = self._event_order.popleft()
@@ -260,49 +448,106 @@ class TimeReconciler:
     ) -> None:
         with self._state_lock:
             entry = self._known_events.get(event_id)
-            model = self._global_model
-        if entry is None or model is None:
+        if entry is None:
             return
-        t_local_ns, last_version = entry
-        intercept, slope, confidence, rms_ns, version = model
-        effective_version = version_hint or version
+        t_local_ns, _ = entry
+        players = set(self._connected_players_snapshot())
+        with self._state_lock:
+            players.update(self._player_states.keys())
+        for player in sorted(players):
+            self._refine_event_for_player(
+                player, event_id, t_local_ns, version_hint=version_hint
+            )
+
+    def _refine_event_for_player(
+        self,
+        player: str,
+        event_id: str,
+        t_local_ns: int,
+        version_hint: Optional[int] = None,
+    ) -> None:
+        with self._state_lock:
+            state = self._player_states.get(player)
+            entry = self._known_events.get(event_id)
+            if state is None or entry is None:
+                return
+            _, version_by_player = entry
+            last_version = version_by_player.get(player, 0)
+            mapping_version = state.mapping_version
+            intercept = state.intercept_ns
+            slope = state.slope
+            confidence = state.confidence
+            rms_ns = state.rms_ns
+            sample_count = state.sample_count
+            offset_sign = state.offset_sign
+            effective_version = version_hint or mapping_version
         if effective_version <= last_version:
+            return
+        if sample_count < 2:
+            log.debug(
+                "Skipping refinement for %s (event %s): insufficient samples %d",
+                player,
+                event_id,
+                sample_count,
+            )
+            return
+        if confidence < self._conf_min:
+            log.debug(
+                "Skipping refinement for %s (event %s): low confidence %.3f < %.3f",
+                player,
+                event_id,
+                confidence,
+                self._conf_min,
+            )
             return
         t_ref_ns = int(intercept + slope * t_local_ns)
         extra = {
             "rms_error_ns": int(rms_ns),
             "heartbeat_count": self._heartbeat_count,
+            "samples": sample_count,
+            "offset_sign": offset_sign,
         }
         queue_size, queue_capacity = self._bridge.event_queue_load()
         extra["queue"] = {"size": queue_size, "capacity": queue_capacity}
-        players = self._connected_players_snapshot()
-        for player in players:
-            try:
-                self._bridge.refine_event(
-                    player,
-                    event_id,
-                    t_ref_ns,
-                    confidence=confidence,
-                    mapping_version=effective_version,
-                    extra=dict(extra),
-                )
-            except Exception:
-                log.exception("Refinement dispatch failed for %s (%s)", event_id, player)
         try:
-            self._logger.record_refinement(event_id, t_ref_ns, effective_version, confidence)
+            self._bridge.refine_event(
+                player,
+                event_id,
+                t_ref_ns,
+                confidence=confidence,
+                mapping_version=effective_version,
+                extra=dict(extra),
+            )
         except Exception:
-            log.exception("Persisting refinement failed for %s", event_id)
-        log.info(
-            "event %s provisional -> refined (t_ref=%d, v%s, conf=%.3f, queue=%s/%s)",
-            event_id,
-            t_ref_ns,
-            effective_version,
-            confidence,
-            queue_size,
-            queue_capacity,
-        )
-        with self._state_lock:
-            self._known_events[event_id] = (t_local_ns, effective_version)
+            log.exception("Refinement dispatch failed for %s (%s)", event_id, player)
+            return
+        try:
+            self._logger.upsert_refinement(
+                event_id,
+                player,
+                t_ref_ns,
+                effective_version,
+                confidence,
+            )
+        except Exception:
+            log.exception("Persisting refinement failed for %s (%s)", event_id, player)
+        else:
+            log.info(
+                "event %s refined for %s (t_local=%d, t_ref=%d, v%s, conf=%.3f)",
+                event_id,
+                player,
+                t_local_ns,
+                t_ref_ns,
+                effective_version,
+                confidence,
+            )
+            with self._state_lock:
+                entry = self._known_events.get(event_id)
+                if entry is not None:
+                    t_ns, version_by_player = entry
+                    version_by_player = dict(version_by_player)
+                    version_by_player[player] = effective_version
+                    self._known_events[event_id] = (t_ns, version_by_player)
 
     # ------------------------------------------------------------------
     def _connected_players_snapshot(self) -> list[str]:
@@ -357,25 +602,6 @@ class TimeReconciler:
         rms_ms = rms_ns / 1_000_000.0
         # Map 0ms -> 1.0, 5ms -> ~0.37, >=20ms -> ~0.018
         return max(0.0, min(1.0, math.exp(-rms_ms / 5.0)))
-
-    def _bump_mapping_version_locked(self) -> int:
-        self._mapping_version += 1
-        return self._mapping_version
-
-    def _update_global_model_locked(self) -> None:
-        states = [state for state in self._player_states.values() if state.samples]
-        if not states:
-            self._global_model = None
-            return
-        weights = [max(0.1, state.confidence or 0.1) for state in states]
-        total = sum(weights)
-        intercept = sum(w * state.intercept_ns for w, state in zip(weights, states)) / total
-        slope = sum(w * state.slope for w, state in zip(weights, states)) / total
-        rms_ns = math.sqrt(
-            sum((state.rms_ns or 0.0) ** 2 for state in states) / len(states)
-        )
-        confidence = max(state.confidence for state in states)
-        self._global_model = (intercept, slope, confidence, rms_ns, self._mapping_version)
 
 
 __all__ = ["TimeReconciler"]

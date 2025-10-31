@@ -187,6 +187,7 @@ class PupilBridge:
         self._event_batch_window = 0.02
         self._last_queue_log = 0.0
         self._last_send_log = 0.0
+        self._offset_semantics_warned: set[str] = set()
         if not self._low_latency_disabled:
             self._event_queue = queue.Queue(maxsize=self._event_queue_maxsize)
             self._sender_thread = threading.Thread(
@@ -1426,7 +1427,14 @@ class PupilBridge:
 
     # ------------------------------------------------------------------
     def estimate_time_offset(self, player: str) -> Optional[float]:
-        """Return the estimated time offset between host and device if available."""
+        """Return device_time - host_time in seconds if available.
+
+        The realtime API does not document the polarity of the returned
+        offset.  We assume the value expresses how far the device clock is
+        ahead of the host (device_time - host_time).  If this assumption is
+        wrong the reconciler will flip the sign and log a warning.  Until
+        then we emit a warning once per player to flag the uncertainty.
+        """
 
         device = self._device_by_player.get(player)
         if device is None:
@@ -1435,6 +1443,12 @@ class PupilBridge:
         if not callable(estimator):
             return None
         try:
+            if player not in self._offset_semantics_warned:
+                log.warning(
+                    "Assuming estimate_time_offset for %s returns device_time - host_time",
+                    player,
+                )
+                self._offset_semantics_warned.add(player)
             return float(estimator())
         except Exception as exc:  # pragma: no cover - hardware dependent
             log.exception("Failed to estimate time offset for %s: %s", player, exc)
