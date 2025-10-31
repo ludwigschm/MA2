@@ -1340,7 +1340,7 @@ class PupilBridge:
         mapping_version: int,
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Submit a refinement update for an existing event annotation.""""
+        """Submit a refinement update for an existing event annotation."""
 
         payload: Dict[str, Any] = {
             "event_id": event_id,
