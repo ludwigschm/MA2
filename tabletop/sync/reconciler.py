@@ -5,25 +5,46 @@ from __future__ import annotations
 import logging
 import math
 import queue
+import statistics
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 from tabletop.engine import EventLogger
 from tabletop.pupil_bridge import PupilBridge
 
 log = logging.getLogger(__name__)
 
+RECENCY_TAU_SECONDS = 180.0
+SLOPE_FREEZE_CONFIDENCE = 0.90
+SLOPE_FREEZE_PPM = 20e-6
+SLOPE_CLAMP_PPM = 50e-6
+SLOPE_CLAMP_MIN = 1.0 - SLOPE_CLAMP_PPM
+SLOPE_CLAMP_MAX = 1.0 + SLOPE_CLAMP_PPM
+RMS_LOCK_THRESHOLD_MS = 2.0
+SIGN_STABILITY_COUNT = 3
+SIGN_WEIGHT_THRESHOLD_NS = 1_000_000.0
+CONF_GATE_HIGH_RMS_MS = 3.0
+CONF_GATE_LOW_RMS_MS = 1.0
+CONF_GATE_HIGH = 0.90
+CONF_GATE_LOW = 0.70
+CONF_GATE_DEFAULT = 0.80
+MICRO_REFINE_HORIZON_S = 600.0
+MICRO_REFINE_OFFSET_MS = 1.0
+REREFINE_EVENT_WINDOW = 200
+REREFINE_RATE_LIMIT_S = 120.0
+REREFINE_RMS_IMPROVEMENT_MS = 1.0
+REREFINE_CONF_IMPROVEMENT = 0.10
 
 @dataclass
 class _PlayerState:
     """Calibration state for a single player/device."""
 
     player: str
-    samples: Deque[Tuple[int, int]] = field(default_factory=deque)
-    raw_offsets: Deque[Tuple[int, int]] = field(default_factory=deque)
+    samples: Deque[Tuple[int, int, float]] = field(default_factory=deque)
+    raw_offsets: Deque[Tuple[int, int, float]] = field(default_factory=deque)
     intercept_ns: float = 0.0
     slope: float = 1.0
     rms_ns: float = 0.0
@@ -32,6 +53,30 @@ class _PlayerState:
     sample_count: int = 0
     offset_sign: int = 1
     last_update: float = field(default_factory=time.monotonic)
+    offset_sign_locked: bool = False
+    sign_streak: int = 0
+    rms_history_ms: Deque[float] = field(
+        default_factory=lambda: deque(maxlen=SIGN_STABILITY_COUNT)
+    )
+    mad_ns: float = 0.0
+    slope_raw: float = 1.0
+    slope_mode: str = "free"
+    weights_last3: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    confidence_gate: float = CONF_GATE_DEFAULT
+    last_rerefine_ts: float = 0.0
+    weighted_offset_sign: int = 0
+
+
+@dataclass
+class _FitMetrics:
+    intercept_ns: float
+    intercept_raw_ns: float
+    slope_raw: float
+    slope_applied: float
+    rms_ns: float
+    mad_ns: float
+    weights: List[float]
+    slope_mode: str
 
 
 class TimeReconciler:
@@ -50,7 +95,6 @@ class TimeReconciler:
         self._window_size = max(3, int(window_size))
         self._state_lock = threading.Lock()
         self._player_states: Dict[str, _PlayerState] = {}
-        self._conf_min = float(self.CONF_MIN)
         self._task_queue: queue.Queue[Tuple[str, Tuple[Any, ...]]] = queue.Queue(
             maxsize=2000
         )
@@ -62,8 +106,14 @@ class TimeReconciler:
         self._event_retention = max(2000, self._window_size * 200)
         self._heartbeat_count = 0
         self._intercept_epsilon_ns = 5_000.0
-        self._slope_epsilon = 1e-9
+        self._slope_epsilon = 5e-6
         self._huber_delta_ns = 5_000_000.0
+        self._recency_tau = RECENCY_TAU_SECONDS
+        self._micro_refine_horizon_s = MICRO_REFINE_HORIZON_S
+        self._micro_refine_offset_ms = MICRO_REFINE_OFFSET_MS
+        self._micro_refine_slope_max = self._slope_epsilon
+        self._rerefine_window = REREFINE_EVENT_WINDOW
+        self._rerefine_rate_limit_s = REREFINE_RATE_LIMIT_S
 
     # ------------------------------------------------------------------
     @property
@@ -124,6 +174,8 @@ class TimeReconciler:
                     self._process_marker(str(args[0]), int(args[1]))
                 elif kind == "event":
                     self._process_event(str(args[0]), int(args[1]))
+                elif kind == "rerefine":
+                    self._perform_rerefine(str(args[0]))
             except Exception:
                 log.exception("Error processing %s task", kind)
             finally:
@@ -138,8 +190,10 @@ class TimeReconciler:
                 try:
                     if kind == "marker":
                         self._process_marker(str(args[0]), int(args[1]))
-                    else:
+                    elif kind == "event":
                         self._process_event(str(args[0]), int(args[1]))
+                    elif kind == "rerefine":
+                        self._perform_rerefine(str(args[0]))
                 except Exception:
                     log.exception("Error processing %s during shutdown", kind)
             self._task_queue.task_done()
@@ -175,7 +229,7 @@ class TimeReconciler:
         )
 
     def _ingest_marker(self, player: str, t_local_ns: int, offset_ns: int) -> None:
-        base_samples: list[Tuple[int, int]]
+        ingest_ts = time.monotonic()
         with self._state_lock:
             state = self._player_states.get(player)
             if state is None:
@@ -193,8 +247,11 @@ class TimeReconciler:
             current_intercept = state.intercept_ns
             current_slope = state.slope
             current_count = state.sample_count
+            previous_samples = list(state.samples)
 
-        raw_candidates = self._trimmed_raw_samples(raw_samples, (t_local_ns, offset_ns))
+        raw_candidates = self._trimmed_raw_samples(
+            raw_samples, (t_local_ns, offset_ns, ingest_ts)
+        )
 
         candidate_pos = self._raw_to_samples(raw_candidates, 1)
         candidate_neg = self._raw_to_samples(raw_candidates, -1)
@@ -210,19 +267,35 @@ class TimeReconciler:
         offset_residual_neg = float("inf")
         if pos_metrics is not None:
             offset_residual_pos = self._offset_residual(
-                raw_candidates, pos_metrics[0], pos_metrics[1], 1
+                raw_candidates,
+                pos_metrics.intercept_raw_ns,
+                pos_metrics.slope_raw,
+                1,
             )
         if neg_metrics is not None:
             offset_residual_neg = self._offset_residual(
-                raw_candidates, neg_metrics[0], neg_metrics[1], -1
+                raw_candidates,
+                neg_metrics.intercept_raw_ns,
+                neg_metrics.slope_raw,
+                -1,
             )
         align_pos = (
-            self._offset_alignment(raw_candidates, pos_metrics[0], pos_metrics[1], 1)
+            self._offset_alignment(
+                raw_candidates,
+                pos_metrics.intercept_raw_ns,
+                pos_metrics.slope_raw,
+                1,
+            )
             if pos_metrics is not None
             else 0.0
         )
         align_neg = (
-            self._offset_alignment(raw_candidates, neg_metrics[0], neg_metrics[1], -1)
+            self._offset_alignment(
+                raw_candidates,
+                neg_metrics.intercept_raw_ns,
+                neg_metrics.slope_raw,
+                -1,
+            )
             if neg_metrics is not None
             else 0.0
         )
@@ -269,8 +342,8 @@ class TimeReconciler:
             chosen_samples = candidate_neg
             chosen_metrics = neg_metrics
         elif pos_metrics is not None and neg_metrics is not None:
-            pos_rms = pos_metrics[2]
-            neg_rms = neg_metrics[2]
+            pos_rms = pos_metrics.rms_ns
+            neg_rms = neg_metrics.rms_ns
             if neg_rms + 1e-9 < pos_rms * 0.8:
                 chosen_sign = -1
                 chosen_samples = candidate_neg
@@ -288,24 +361,178 @@ class TimeReconciler:
             chosen_samples = candidate_pos if current_sign >= 0 else candidate_neg
             chosen_metrics = None
 
+        # Recency-weighted sign hint based on raw offsets
+        trend = 0
+        if pos_metrics is not None or neg_metrics is not None:
+            weights = self._recency_weights(raw_candidates)
+            weighted_offset = sum(
+                w * offset for (_, offset, _), w in zip(raw_candidates, weights)
+            )
+            if (
+                chosen_metrics is not None
+                and abs(weighted_offset) > SIGN_WEIGHT_THRESHOLD_NS
+            ):
+                trend = 1 if weighted_offset > 0 else -1
+                preferred_sign = None
+                if (
+                    pos_metrics is not None
+                    and weighted_offset * pos_metrics.intercept_raw_ns >= 0
+                ):
+                    preferred_sign = 1
+                if (
+                    neg_metrics is not None
+                    and weighted_offset * neg_metrics.intercept_raw_ns >= 0
+                ):
+                    if preferred_sign is None:
+                        preferred_sign = -1
+                if (
+                    preferred_sign is not None
+                    and preferred_sign != chosen_sign
+                    and (trend == 0 or preferred_sign == trend)
+                ):
+                    if preferred_sign > 0 and pos_metrics is not None:
+                        chosen_sign = 1
+                        chosen_samples = candidate_pos
+                        chosen_metrics = pos_metrics
+                    elif preferred_sign < 0 and neg_metrics is not None:
+                        chosen_sign = -1
+                        chosen_samples = candidate_neg
+                        chosen_metrics = neg_metrics
+
         with self._state_lock:
             state = self._player_states[player]
-            if chosen_sign != state.offset_sign:
-                state.offset_sign = chosen_sign
-                log.warning(
-                    "Offset semantics inverted for %s (sign=%+d)",
+            prev_sign = state.offset_sign or 1
+            prev_locked = state.offset_sign_locked
+            prev_history = list(state.rms_history_ms)
+            prev_trend = state.weighted_offset_sign
+
+            if (
+                chosen_metrics is not None
+                and trend != 0
+                and prev_trend != 0
+                and trend != prev_trend
+            ):
+                state.offset_sign_locked = False
+                prev_locked = False
+                state.sign_streak = 1
+                log.info(
+                    "offset trend change for %s (trend=%+d -> %+d)",
                     player,
-                    chosen_sign,
+                    prev_trend,
+                    trend,
                 )
-            state.raw_offsets = deque(raw_candidates, maxlen=self._window_size)
-            state.samples = deque(chosen_samples, maxlen=self._window_size)
-            samples_list = list(state.samples)
+                if trend > 0 and pos_metrics is not None:
+                    chosen_sign = 1
+                    chosen_samples = candidate_pos
+                    chosen_metrics = pos_metrics
+                elif trend < 0 and neg_metrics is not None:
+                    chosen_sign = -1
+                    chosen_samples = candidate_neg
+                    chosen_metrics = neg_metrics
+
+            if chosen_metrics is None:
+                state.raw_offsets = deque(raw_candidates, maxlen=self._window_size)
+                state.samples = deque(
+                    chosen_samples if chosen_samples else previous_samples,
+                    maxlen=self._window_size,
+                )
+                samples_list = list(state.samples)
+                state.sample_count = len(state.samples)
+                state.last_update = time.monotonic()
+                log.debug("Accumulating samples for %s (insufficient data)", player)
+            else:
+                rms_ms = chosen_metrics.rms_ns / 1_000_000.0
+                median_prev = (
+                    statistics.median(prev_history) if prev_history else None
+                )
+                allow_switch = True
+                if prev_locked:
+                    baseline_ms = max(median_prev or 0.0, 0.1)
+                    if rms_ms > 2.0 * baseline_ms:
+                        state.offset_sign_locked = False
+                        prev_locked = False
+                        log.info(
+                            "offset_sign unlock for %s (rms=%.3fms median=%.3fms)",
+                            player,
+                            rms_ms,
+                            median_prev or 0.0,
+                        )
+                    else:
+                        allow_switch = False
+                if not allow_switch:
+                    chosen_sign = prev_sign
+                    fallback_samples = (
+                        candidate_pos if prev_sign >= 0 else candidate_neg
+                    )
+                    chosen_samples = fallback_samples or previous_samples
+                    fallback_metrics = (
+                        pos_metrics if prev_sign >= 0 else neg_metrics
+                    )
+                    if fallback_metrics is not None:
+                        chosen_metrics = fallback_metrics
+                        rms_ms = chosen_metrics.rms_ns / 1_000_000.0
+                    else:
+                        chosen_metrics = None
+
+                if chosen_metrics is None:
+                    state.raw_offsets = deque(raw_candidates, maxlen=self._window_size)
+                    state.samples = deque(
+                        chosen_samples if chosen_samples else previous_samples,
+                        maxlen=self._window_size,
+                    )
+                    samples_list = list(state.samples)
+                    state.sample_count = len(state.samples)
+                    state.last_update = time.monotonic()
+                else:
+                    if chosen_sign != prev_sign and allow_switch:
+                        state.sign_streak = 1
+                    else:
+                        state.sign_streak = min(
+                            state.sign_streak + 1, SIGN_STABILITY_COUNT
+                        )
+                    if (
+                        not state.offset_sign_locked
+                        and state.sign_streak >= SIGN_STABILITY_COUNT
+                        and rms_ms < RMS_LOCK_THRESHOLD_MS
+                    ):
+                        state.offset_sign_locked = True
+                        log.info(
+                            "offset_sign lock for %s (sign=%+d rms=%.3fms)",
+                            player,
+                            chosen_sign,
+                            rms_ms,
+                        )
+                    if chosen_sign != state.offset_sign and allow_switch:
+                        log.warning(
+                            "Offset semantics inverted for %s (sign=%+d)",
+                            player,
+                            chosen_sign,
+                        )
+                    state.offset_sign = chosen_sign
+                    state.rms_history_ms.append(rms_ms)
+                    state.raw_offsets = deque(raw_candidates, maxlen=self._window_size)
+                    state.samples = deque(chosen_samples, maxlen=self._window_size)
+                    samples_list = list(state.samples)
+                    state.sample_count = len(state.samples)
+                    state.last_update = time.monotonic()
+                    log.debug(
+                        "sign decision %s: offset_sign=%+d locked=%s rms=%.3fms",
+                        player,
+                        state.offset_sign,
+                        state.offset_sign_locked,
+                        rms_ms,
+                    )
+
+            if trend != 0:
+                state.weighted_offset_sign = trend
 
         self._recompute_model_from_samples(player, samples_list)
 
     def _trimmed_raw_samples(
-        self, base: list[Tuple[int, int]], sample: Tuple[int, int]
-    ) -> list[Tuple[int, int]]:
+        self,
+        base: list[Tuple[int, int, float]],
+        sample: Tuple[int, int, float],
+    ) -> list[Tuple[int, int, float]]:
         samples = list(base)
         samples.append(sample)
         if len(samples) > self._window_size:
@@ -313,17 +540,17 @@ class TimeReconciler:
         return samples
 
     def _raw_to_samples(
-        self, raw: list[Tuple[int, int]], sign: int
-    ) -> list[Tuple[int, int]]:
-        result: list[Tuple[int, int]] = []
-        for t_local_ns, offset_ns in raw:
+        self, raw: list[Tuple[int, int, float]], sign: int
+    ) -> list[Tuple[int, int, float]]:
+        result: list[Tuple[int, int, float]] = []
+        for t_local_ns, offset_ns, ingest_ts in raw:
             device_ns = t_local_ns + sign * offset_ns
-            result.append((t_local_ns, device_ns))
+            result.append((t_local_ns, device_ns, ingest_ts))
         return result
 
     def _offset_residual(
         self,
-        raw: list[Tuple[int, int]],
+        raw: list[Tuple[int, int, float]],
         intercept: float,
         slope: float,
         sign: int,
@@ -331,7 +558,7 @@ class TimeReconciler:
         if not raw:
             return float("inf")
         residuals = []
-        for t_local_ns, measured_offset in raw:
+        for t_local_ns, measured_offset, _ in raw:
             predicted_device = intercept + slope * t_local_ns
             predicted_raw = sign * (predicted_device - t_local_ns)
             residuals.append(predicted_raw - measured_offset)
@@ -339,33 +566,31 @@ class TimeReconciler:
         return math.sqrt(mean_square)
 
     def _offset_alignment(
-        self, raw: list[Tuple[int, int]], intercept: float, slope: float, sign: int
+        self,
+        raw: list[Tuple[int, int, float]],
+        intercept: float,
+        slope: float,
+        sign: int,
     ) -> float:
         if not raw:
             return 0.0
         alignment = 0.0
-        for t_local_ns, measured_offset in raw:
+        for t_local_ns, measured_offset, _ in raw:
             predicted_device = intercept + slope * t_local_ns
             predicted_raw = sign * (predicted_device - t_local_ns)
             alignment += predicted_raw * measured_offset
         return alignment / len(raw)
 
     def _evaluate_candidate(
-        self, samples: list[Tuple[int, int]]
-    ) -> Optional[Tuple[float, float, float]]:
+        self, samples: list[Tuple[int, int, float]]
+    ) -> Optional["_FitMetrics"]:
         if len(samples) < 2:
             return None
-        return self._huber_fit(samples)
+        return self._robust_fit(samples)
 
     def _recompute_model_from_samples(
-        self, player: str, samples: list[Tuple[int, int]]
+        self, player: str, samples: list[Tuple[int, int, float]]
     ) -> bool:
-        changed = False
-        intercept: float
-        slope: float
-        rms_ns: float
-        confidence: float
-        mapping_version: int
         sample_count = len(samples)
         if sample_count < 2:
             with self._state_lock:
@@ -374,47 +599,135 @@ class TimeReconciler:
                 state.last_update = time.monotonic()
             return False
 
-        intercept, slope, rms_ns = self._huber_fit(samples)
-        confidence = self._confidence_from_rms(rms_ns)
+        metrics = self._robust_fit(samples)
+        confidence = self._confidence_from_rms(metrics.rms_ns)
+        confidence_gate = self._dynamic_conf_threshold(metrics.rms_ns)
+        now_mono = time.monotonic()
+
+        changed = False
+        micro_refine = False
+        schedule_rerefine = False
+        mapping_version = 0
+        offset_sign = 1
+        locked = False
+        weights_last3: Tuple[float, float, float]
 
         with self._state_lock:
             state = self._player_states[player]
-            delta_intercept = abs(state.intercept_ns - intercept)
-            delta_slope = abs(state.slope - slope)
+            prev_intercept = state.intercept_ns
+            prev_slope = state.slope
+            prev_confidence = state.confidence
+            prev_rms_ns = state.rms_ns
+            prev_mode = state.slope_mode
+            prev_sample_count = state.sample_count
+
+            delta_intercept = abs(prev_intercept - metrics.intercept_ns)
+            delta_slope = abs(prev_slope - metrics.slope_applied)
             changed = (
                 delta_intercept > self._intercept_epsilon_ns
                 or delta_slope > self._slope_epsilon
-                or state.sample_count != sample_count
+                or prev_sample_count != sample_count
+                or prev_mode != metrics.slope_mode
             )
-            state.intercept_ns = intercept
-            state.slope = slope
-            state.rms_ns = rms_ns
+
+            projected_offset_ms = (
+                delta_slope * self._micro_refine_horizon_s * 1_000.0
+            )
+            micro_refine = (
+                not changed
+                and delta_slope > 0.0
+                and delta_slope <= self._micro_refine_slope_max
+                and projected_offset_ms >= self._micro_refine_offset_ms
+            )
+
+            rms_improvement_ms = (prev_rms_ns - metrics.rms_ns) / 1_000_000.0
+            confidence_improvement = confidence - prev_confidence
+            if (
+                (rms_improvement_ms > REREFINE_RMS_IMPROVEMENT_MS)
+                or (confidence_improvement > REREFINE_CONF_IMPROVEMENT)
+            ) and (now_mono - state.last_rerefine_ts >= self._rerefine_rate_limit_s):
+                schedule_rerefine = True
+                state.last_rerefine_ts = now_mono
+
+            state.intercept_ns = metrics.intercept_ns
+            state.slope = metrics.slope_applied
+            state.slope_raw = metrics.slope_raw
+            state.slope_mode = metrics.slope_mode
+            state.rms_ns = metrics.rms_ns
+            state.mad_ns = metrics.mad_ns
             state.confidence = confidence
+            state.confidence_gate = confidence_gate
             state.sample_count = sample_count
-            state.last_update = time.monotonic()
+            state.last_update = now_mono
+            weights_last3 = self._tail_weights(metrics.weights, 3)
+            state.weights_last3 = weights_last3
+
             if changed or state.mapping_version == 0:
                 state.mapping_version += 1
             mapping_version = state.mapping_version
             offset_sign = state.offset_sign
+            locked = state.offset_sign_locked
 
-        log_fn = log.info if changed else log.debug
+        weights_repr = ", ".join(f"{w:.2f}" for w in weights_last3)
+        log_fn = log.info if (changed or micro_refine) else log.debug
         log_fn(
-            "Mapping update %s: a=%.0fns b=%.9f rms=%.3fms conf=%.3f samples=%d v%s sign=%+d",
+            (
+                "Mapping update %s: a=%.0fns b_raw=%.9f b=%.9f mode=%s "
+                "rms=%.3fms mad=%.3fms conf=%.3f gate=%.2f samples=%d v%s sign=%+d locked=%s weights=[%s]"
+            ),
             player,
-            intercept,
-            slope,
-            rms_ns / 1_000_000.0,
+            metrics.intercept_ns,
+            metrics.slope_raw,
+            metrics.slope_applied,
+            metrics.slope_mode,
+            metrics.rms_ns / 1_000_000.0,
+            metrics.mad_ns / 1_000_000.0,
             confidence,
+            confidence_gate,
             sample_count,
             mapping_version,
             offset_sign,
+            locked,
+            weights_repr,
         )
 
         if changed:
-            self._refine_all_pending_for_player(player, mapping_version)
+            self._refine_all_pending_for_player(
+                player, mapping_version, reason="regular"
+            )
+        elif micro_refine:
+            log.info(
+                "Micro refine trigger for %s (Δb=%.6e, proj=%.3fms)",
+                player,
+                metrics.slope_applied - prev_slope,
+                projected_offset_ms,
+            )
+            self._refine_all_pending_for_player(
+                player,
+                mapping_version,
+                force=True,
+                reason="micro",
+            )
+
+        if schedule_rerefine:
+            log.info(
+                "Scheduling re-refine for %s (Δrms=%.3fms Δconf=%.3f)",
+                player,
+                rms_improvement_ms,
+                confidence_improvement,
+            )
+            self._schedule_rerefine(player)
+
         return changed
 
-    def _refine_all_pending_for_player(self, player: str, version: int) -> None:
+    def _refine_all_pending_for_player(
+        self,
+        player: str,
+        version: int,
+        *,
+        force: bool = False,
+        reason: str = "regular",
+    ) -> None:
         pending: list[Tuple[str, int]] = []
         with self._state_lock:
             for event_id, (t_local_ns, versions) in self._known_events.items():
@@ -423,7 +736,50 @@ class TimeReconciler:
                     pending.append((event_id, t_local_ns))
         for event_id, t_local_ns in pending:
             self._refine_event_for_player(
-                player, event_id, t_local_ns, version_hint=version
+                player,
+                event_id,
+                t_local_ns,
+                version_hint=version,
+                force=force,
+                reason=reason,
+            )
+
+    def _schedule_rerefine(self, player: str) -> None:
+        self._enqueue("rerefine", player)
+
+    def _perform_rerefine(self, player: str) -> None:
+        with self._state_lock:
+            state = self._player_states.get(player)
+            if state is None:
+                return
+            mapping_version = state.mapping_version
+            event_ids = list(reversed(self._event_order))
+            selected: list[Tuple[str, int]] = []
+            for event_id in event_ids:
+                entry = self._known_events.get(event_id)
+                if entry is None:
+                    continue
+                t_local_ns, _ = entry
+                selected.append((event_id, t_local_ns))
+                if len(selected) >= self._rerefine_window:
+                    break
+        if not selected:
+            log.debug("No events available for re-refine of %s", player)
+            return
+        log.info(
+            "Re-refine batch for %s: %d events (v%s)",
+            player,
+            len(selected),
+            mapping_version,
+        )
+        for event_id, t_local_ns in selected:
+            self._refine_event_for_player(
+                player,
+                event_id,
+                t_local_ns,
+                version_hint=mapping_version,
+                force=True,
+                reason="rerefine",
             )
 
     def _process_event(self, event_id: str, t_local_ns: int) -> None:
@@ -465,6 +821,9 @@ class TimeReconciler:
         event_id: str,
         t_local_ns: int,
         version_hint: Optional[int] = None,
+        *,
+        force: bool = False,
+        reason: str = "regular",
     ) -> None:
         with self._state_lock:
             state = self._player_states.get(player)
@@ -480,8 +839,10 @@ class TimeReconciler:
             rms_ns = state.rms_ns
             sample_count = state.sample_count
             offset_sign = state.offset_sign
+            confidence_gate = state.confidence_gate
+            locked = state.offset_sign_locked
             effective_version = version_hint or mapping_version
-        if effective_version <= last_version:
+        if not force and effective_version <= last_version:
             return
         if sample_count < 2:
             log.debug(
@@ -491,13 +852,14 @@ class TimeReconciler:
                 sample_count,
             )
             return
-        if confidence < self._conf_min:
-            log.debug(
-                "Skipping refinement for %s (event %s): low confidence %.3f < %.3f",
+        if confidence < confidence_gate:
+            log.info(
+                "Refinement skipped for %s (event %s): confidence %.3f < gate %.2f (%s)",
                 player,
                 event_id,
                 confidence,
-                self._conf_min,
+                confidence_gate,
+                reason,
             )
             return
         t_ref_ns = int(intercept + slope * t_local_ns)
@@ -506,6 +868,8 @@ class TimeReconciler:
             "heartbeat_count": self._heartbeat_count,
             "samples": sample_count,
             "offset_sign": offset_sign,
+            "locked": locked,
+            "reason": reason,
         }
         queue_size, queue_capacity = self._bridge.event_queue_load()
         extra["queue"] = {"size": queue_size, "capacity": queue_capacity}
@@ -528,18 +892,20 @@ class TimeReconciler:
                 t_ref_ns,
                 effective_version,
                 confidence,
+                reason,
             )
         except Exception:
             log.exception("Persisting refinement failed for %s (%s)", event_id, player)
         else:
             log.info(
-                "event %s refined for %s (t_local=%d, t_ref=%d, v%s, conf=%.3f)",
+                "event %s refined for %s (t_local=%d, t_ref=%d, v%s, conf=%.3f, reason=%s)",
                 event_id,
                 player,
                 t_local_ns,
                 t_ref_ns,
                 effective_version,
                 confidence,
+                reason,
             )
             with self._state_lock:
                 entry = self._known_events.get(event_id)
@@ -561,15 +927,18 @@ class TimeReconciler:
                 players = list(self._player_states.keys())
         return players
 
-    def _huber_fit(self, samples: list[Tuple[int, int]]) -> Tuple[float, float, float]:
-        xs = [float(a) for a, _ in samples]
-        ys = [float(b) for _, b in samples]
-        weights = [1.0] * len(samples)
+    def _robust_fit(self, samples: list[Tuple[int, int, float]]) -> _FitMetrics:
+        xs = [float(a) for a, _, _ in samples]
+        ys = [float(b) for _, b, _ in samples]
+        recency_weights = self._recency_weights(samples)
+        weights = recency_weights[:]
         intercept = ys[0]
         slope = 1.0
-        for _ in range(5):
+        for _ in range(6):
             sum_w = sum(weights)
             if sum_w <= 0:
+                intercept = ys[0]
+                slope = 1.0
                 break
             mean_x = sum(w * x for w, x in zip(weights, xs)) / sum_w
             mean_y = sum(w * y for w, y in zip(weights, ys)) / sum_w
@@ -584,17 +953,44 @@ class TimeReconciler:
                 slope = cov / var if var else 1.0
             intercept = mean_y - slope * mean_x
             residuals = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
-            weights = [
+            huber_weights = [
                 1.0
                 if abs(r) <= self._huber_delta_ns
                 else self._huber_delta_ns / max(abs(r), 1e-9)
                 for r in residuals
             ]
-        residuals = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
-        rms_ns = 0.0
-        if residuals:
-            rms_ns = math.sqrt(sum(r ** 2 for r in residuals) / len(residuals))
-        return intercept, slope, rms_ns
+            weights = [rec * hub for rec, hub in zip(recency_weights, huber_weights)]
+
+        intercept_raw = intercept
+        residuals_raw = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
+        sum_w = sum(weights) or 1.0
+        rms_raw_ns = math.sqrt(
+            sum(w * (r ** 2) for w, r in zip(weights, residuals_raw)) / sum_w
+        )
+        confidence_raw = self._confidence_from_rms(rms_raw_ns)
+        intercept_adj, slope_applied, mode = self._apply_slope_guardrails(
+            intercept, slope, xs, ys, weights, confidence_raw
+        )
+        residuals_applied = [
+            y - (intercept_adj + slope_applied * x) for x, y in zip(xs, ys)
+        ]
+        sum_w_applied = sum(weights) or 1.0
+        rms_ns = math.sqrt(
+            sum(w * (r ** 2) for w, r in zip(weights, residuals_applied)) / sum_w_applied
+        )
+        abs_residuals = [abs(r) for r in residuals_applied]
+        mad_ns = self._weighted_median(abs_residuals, weights)
+        norm_weights = self._normalize_weights(weights)
+        return _FitMetrics(
+            intercept_adj,
+            intercept_raw,
+            slope,
+            slope_applied,
+            rms_ns,
+            mad_ns,
+            norm_weights,
+            mode,
+        )
 
     def _confidence_from_rms(self, rms_ns: float) -> float:
         if rms_ns <= 0:
@@ -602,6 +998,86 @@ class TimeReconciler:
         rms_ms = rms_ns / 1_000_000.0
         # Map 0ms -> 1.0, 5ms -> ~0.37, >=20ms -> ~0.018
         return max(0.0, min(1.0, math.exp(-rms_ms / 5.0)))
+
+    def _dynamic_conf_threshold(self, rms_ns: float) -> float:
+        rms_ms = rms_ns / 1_000_000.0
+        if rms_ms > CONF_GATE_HIGH_RMS_MS:
+            return CONF_GATE_HIGH
+        if rms_ms < CONF_GATE_LOW_RMS_MS:
+            return CONF_GATE_LOW
+        return CONF_GATE_DEFAULT
+
+    def _apply_slope_guardrails(
+        self,
+        intercept: float,
+        slope: float,
+        xs: List[float],
+        ys: List[float],
+        weights: List[float],
+        confidence_raw: float,
+    ) -> Tuple[float, float, str]:
+        slope_applied = slope
+        mode = "free"
+        delta_ppm = abs(slope - 1.0) * 1_000_000.0
+        freeze_threshold = SLOPE_FREEZE_PPM * 1_000_000.0 - 0.5
+        if (
+            confidence_raw >= SLOPE_FREEZE_CONFIDENCE
+            and delta_ppm < freeze_threshold
+        ):
+            slope_applied = 1.0
+            mode = "frozen"
+        else:
+            clamped = min(max(slope, SLOPE_CLAMP_MIN), SLOPE_CLAMP_MAX)
+            if abs(clamped - slope) > 0:
+                slope_applied = clamped
+                mode = "clamped"
+        sum_w = sum(weights) or 1.0
+        intercept_applied = (
+            sum(w * (y - slope_applied * x) for w, x, y in zip(weights, xs, ys))
+            / sum_w
+        )
+        return intercept_applied, slope_applied, mode
+
+    def _recency_weights(self, samples: list[Tuple[int, int, float]]) -> List[float]:
+        now = time.monotonic()
+        tau = max(self._recency_tau, 1e-3)
+        weights: List[float] = []
+        for _, _, ingest_ts in samples:
+            age = max(0.0, now - ingest_ts)
+            weights.append(math.exp(-age / tau))
+        return weights
+
+    @staticmethod
+    def _normalize_weights(weights: List[float]) -> List[float]:
+        total = sum(weights)
+        if total <= 0:
+            return [0.0 for _ in weights]
+        return [w / total for w in weights]
+
+    @staticmethod
+    def _weighted_median(values: Iterable[float], weights: Iterable[float]) -> float:
+        pairs = sorted(zip(values, weights), key=lambda item: item[0])
+        total = sum(weight for _, weight in pairs)
+        if total <= 0 or not pairs:
+            return 0.0
+        cumulative = 0.0
+        half = total / 2.0
+        for value, weight in pairs:
+            cumulative += weight
+            if cumulative >= half:
+                return value
+        return pairs[-1][0]
+
+    @staticmethod
+    def _tail_weights(weights: List[float], count: int) -> Tuple[float, float, float]:
+        if count <= 0:
+            return (0.0, 0.0, 0.0)
+        tail = list(weights[-count:])
+        if len(tail) < count:
+            tail = [0.0] * (count - len(tail)) + tail
+        if len(tail) < 3:
+            tail = [0.0] * (3 - len(tail)) + tail
+        return tuple(tail[-3:])  # type: ignore[return-value]
 
 
 __all__ = ["TimeReconciler"]
