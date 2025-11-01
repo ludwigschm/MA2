@@ -1429,11 +1429,11 @@ class PupilBridge:
     def estimate_time_offset(self, player: str) -> Optional[float]:
         """Return device_time - host_time in seconds if available.
 
-        The realtime API does not document the polarity of the returned
-        offset.  We assume the value expresses how far the device clock is
-        ahead of the host (device_time - host_time).  If this assumption is
-        wrong the reconciler will flip the sign and log a warning.  Until
-        then we emit a warning once per player to flag the uncertainty.
+        The reconciler consumes the value as an offset in nanoseconds
+        (device_time minus host_time, i.e. positive if the device clock
+        runs ahead of the host).  The realtime API does not document the
+        polarity, so we emit a warning once per player and let the
+        reconciler lock the sign if required.
         """
 
         device = self._device_by_player.get(player)

@@ -211,6 +211,7 @@ class EventLogger:
           t_ref_ns INTEGER,
           mapping_version INT,
           confidence REAL,
+          reason TEXT DEFAULT 'regular',
           created_utc TEXT,
           PRIMARY KEY (event_id, player)
         )"""
@@ -248,43 +249,52 @@ class EventLogger:
         cur = self.conn.cursor()
         cur.execute("PRAGMA table_info(event_refinements)")
         columns = {row[1] for row in cur.fetchall()}
-        if "player" in columns:
-            return
-        log.info("Migrating event_refinements table to include player column")
-        cur.execute("ALTER TABLE event_refinements RENAME TO event_refinements_legacy")
-        self.conn.execute(
-            """
+        if "player" not in columns:
+            log.info("Migrating event_refinements table to include player column")
+            cur.execute("ALTER TABLE event_refinements RENAME TO event_refinements_legacy")
+            self.conn.execute(
+                """
         CREATE TABLE IF NOT EXISTS event_refinements(
           event_id TEXT,
           player TEXT,
           t_ref_ns INTEGER,
           mapping_version INT,
           confidence REAL,
+          reason TEXT DEFAULT 'regular',
           created_utc TEXT,
           PRIMARY KEY (event_id, player)
         )"""
-        )
-        cur.execute(
-            "SELECT event_id, t_ref_ns, mapping_version, confidence, created_utc FROM event_refinements_legacy"
-        )
-        legacy_rows = cur.fetchall()
-        for event_id, t_ref_ns, mapping_version, confidence, created_utc in legacy_rows:
-            self.conn.execute(
-                """
-        INSERT OR REPLACE INTO event_refinements(event_id, player, t_ref_ns, mapping_version, confidence, created_utc)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-                (
-                    event_id,
-                    "GLOBAL",
-                    t_ref_ns,
-                    mapping_version,
-                    confidence,
-                    created_utc,
-                ),
             )
-        self.conn.execute("DROP TABLE event_refinements_legacy")
-        self.conn.commit()
+            cur.execute(
+                "SELECT event_id, t_ref_ns, mapping_version, confidence, created_utc FROM event_refinements_legacy"
+            )
+            legacy_rows = cur.fetchall()
+            for event_id, t_ref_ns, mapping_version, confidence, created_utc in legacy_rows:
+                self.conn.execute(
+                    """
+        INSERT OR REPLACE INTO event_refinements(event_id, player, t_ref_ns, mapping_version, confidence, reason, created_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+                    (
+                        event_id,
+                        "GLOBAL",
+                        t_ref_ns,
+                        mapping_version,
+                        confidence,
+                        "regular",
+                        created_utc,
+                    ),
+                )
+            self.conn.execute("DROP TABLE event_refinements_legacy")
+            self.conn.commit()
+            cur.execute("PRAGMA table_info(event_refinements)")
+            columns = {row[1] for row in cur.fetchall()}
+        if "reason" not in columns:
+            log.info("Adding reason column to event_refinements table")
+            self.conn.execute(
+                "ALTER TABLE event_refinements ADD COLUMN reason TEXT DEFAULT 'regular'"
+            )
+            self.conn.commit()
 
     def _writer_loop(self) -> None:
         assert self._event_queue is not None
@@ -405,13 +415,14 @@ class EventLogger:
         t_ref_ns: int,
         mapping_version: int,
         confidence: float,
+        reason: str,
     ) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._db_lock:
             self.conn.execute(
                 """
-        INSERT OR REPLACE INTO event_refinements(event_id, player, t_ref_ns, mapping_version, confidence, created_utc)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO event_refinements(event_id, player, t_ref_ns, mapping_version, confidence, reason, created_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
                 (
                     event_id,
@@ -419,6 +430,7 @@ class EventLogger:
                     int(t_ref_ns),
                     int(mapping_version),
                     float(confidence),
+                    str(reason),
                     timestamp,
                 ),
             )
@@ -431,7 +443,14 @@ class EventLogger:
         mapping_version: int,
         confidence: float,
     ) -> None:
-        self.upsert_refinement(event_id, "GLOBAL", t_ref_ns, mapping_version, confidence)
+        self.upsert_refinement(
+            event_id,
+            "GLOBAL",
+            t_ref_ns,
+            mapping_version,
+            confidence,
+            "global",
+        )
 
     def fetch_events_by_event_id(self, event_id: str) -> List[Dict[str, Any]]:
         pattern = f'%"event_id":"{event_id}"%'

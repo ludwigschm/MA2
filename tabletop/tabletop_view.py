@@ -205,7 +205,7 @@ class TabletopRoot(FloatLayout):
         self._bridge_check_interval = 0.3
         self._time_reconciler: Optional[TimeReconciler] = None
         self._heartbeat_event: Optional[Any] = None
-        self._heartbeat_interval = 60.0
+        self._heartbeat_interval = 30.0
         self._heartbeat_jitter = 5.0
         self._heartbeat_label = "sync.heartbeat"
         self._heartbeat_counter = 0

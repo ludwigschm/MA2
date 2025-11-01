@@ -64,6 +64,7 @@ class _FakeLogger:
         t_ref_ns: int,
         mapping_version: int,
         confidence: float,
+        reason: str,
     ) -> None:
         self.records.append(
             {
@@ -72,6 +73,7 @@ class _FakeLogger:
                 "t_ref_ns": t_ref_ns,
                 "mapping_version": mapping_version,
                 "confidence": confidence,
+                "reason": reason,
             }
         )
 
@@ -177,14 +179,17 @@ def test_reconciler_inverts_wrong_offset_sign(caplog: pytest.LogCaptureFixture) 
 def test_event_logger_supports_per_player_refinements(tmp_path: Path) -> None:
     db_path = tmp_path / "events.sqlite3"
     logger = EventLogger(str(db_path))
-    logger.upsert_refinement("event-1", "VP1", 100, 1, 0.9)
-    logger.upsert_refinement("event-1", "VP2", 120, 2, 0.85)
+    logger.upsert_refinement("event-1", "VP1", 100, 1, 0.9, "test")
+    logger.upsert_refinement("event-1", "VP2", 120, 2, 0.85, "test")
 
     cur = logger.conn.cursor()
     cur.execute(
-        "SELECT player, t_ref_ns, mapping_version, confidence FROM event_refinements WHERE event_id=?",
+        "SELECT player, t_ref_ns, mapping_version, confidence, reason FROM event_refinements WHERE event_id=?",
         ("event-1",),
     )
     rows = sorted(cur.fetchall())
-    assert rows == [("VP1", 100, 1, 0.9), ("VP2", 120, 2, 0.85)]
+    assert rows == [
+        ("VP1", 100, 1, 0.9, "test"),
+        ("VP2", 120, 2, 0.85, "test"),
+    ]
     logger.close()
