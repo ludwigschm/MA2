@@ -390,7 +390,12 @@ class TabletopApp(App):
         )
         root = cast(Optional[TabletopRoot], self.root)
         if root is not None:
-            root.send_bridge_event(event_name, payload)
+            marker_bridge = getattr(root, "marker_bridge", None)
+            if marker_bridge:
+                # non-blocking: moved bridge send to async enqueue
+                marker_bridge.enqueue(event_name, payload)
+            else:
+                root.send_bridge_event(event_name, payload)
             return
 
         players = self._iter_active_players()

@@ -27,6 +27,7 @@ from kivy.uix.textinput import TextInput
 
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
+from tabletop.logging import async_bridge
 from tabletop.logging.events import Events
 from tabletop.logging.round_csv import (
     close_round_log,
@@ -70,6 +71,19 @@ if TYPE_CHECKING:
 ui_widgets.ASSETS = ASSETS
 
 STATE_FIELD_NAMES = set(TabletopState.__dataclass_fields__)
+
+
+class _AsyncMarkerBridge:
+    def __init__(self, owner: "TabletopRoot") -> None:
+        self._owner = owner
+
+    def enqueue(self, name: str, payload: Dict[str, Any]) -> None:
+        payload_copy = dict(payload) if payload is not None else {}
+
+        def _dispatch() -> None:
+            self._owner.send_bridge_event(name, payload_copy)
+
+        async_bridge.enqueue(_dispatch)
 
 
 class TabletopRoot(FloatLayout):
@@ -203,6 +217,7 @@ class TabletopRoot(FloatLayout):
             maxsize=1000,
             perf_logging=self.perf_logging,
         )
+        self.marker_bridge: Optional[_AsyncMarkerBridge] = _AsyncMarkerBridge(self)
         if self.perf_logging:
             Clock.schedule_interval(self._log_async_metrics, 1.0)
         self._bridge: Optional["PupilBridge"] = None
@@ -497,7 +512,11 @@ class TabletopRoot(FloatLayout):
         payload = {"marker": "hb", "heartbeat_index": self._heartbeat_counter}
         self._heartbeat_counter += 1
         try:
-            self.send_bridge_event(self._heartbeat_label, payload)
+            if self.marker_bridge:
+                # non-blocking: moved bridge send to async enqueue
+                self.marker_bridge.enqueue(self._heartbeat_label, payload)
+            else:
+                self.send_bridge_event(self._heartbeat_label, payload)
         finally:
             self._schedule_sync_heartbeat(immediate=False)
 
@@ -590,7 +609,11 @@ class TabletopRoot(FloatLayout):
                 payload["player_role"] = role
         if extra:
             payload.update(extra)
-        self.send_bridge_event(f"button.{button}", payload)
+        if self.marker_bridge:
+            # non-blocking: moved bridge send to async enqueue
+            self.marker_bridge.enqueue(f"button.{button}", payload)
+        else:
+            self.send_bridge_event(f"button.{button}", payload)
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -1718,16 +1741,20 @@ class TabletopRoot(FloatLayout):
             payload
         )
         write_round_log(self, actor, action, payload, player)
-        self.send_bridge_event(
-            f"action.{action}",
-            {
-                "actor": actor,
-                "game_player": player,
-                "phase": self.current_engine_phase(),
-                "round_index": round_idx,
-                "payload": payload,
-            },
-        )
+        bridge_payload = {
+            "actor": actor,
+            "game_player": player,
+            "phase": self.current_engine_phase(),
+            "round_index": round_idx,
+            "payload": payload,
+        }
+        if player in (1, 2):
+            role_value = self.player_roles.get(player)
+            if role_value is not None:
+                bridge_payload["player_role"] = role_value
+        if self.marker_bridge:
+            # non-blocking: moved bridge send to async enqueue
+            self.marker_bridge.enqueue(f"action.{action}", bridge_payload)
 
     def prompt_session_number(self):
         if self.session_popup:
