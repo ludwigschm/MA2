@@ -390,10 +390,24 @@ class TabletopApp(App):
         )
         root = cast(Optional[TabletopRoot], self.root)
         if root is not None:
+            try:
+                phase_value = getattr(root, "phase", None)
+                if phase_value is not None:
+                    payload.setdefault(
+                        "phase",
+                        getattr(phase_value, "name", str(phase_value)),
+                    )
+            except Exception:
+                pass
+            try:
+                round_value = getattr(root, "round", None)
+                if isinstance(round_value, int):
+                    payload.setdefault("round_index", max(0, round_value - 1))
+            except Exception:
+                pass
             marker_bridge = getattr(root, "marker_bridge", None)
             if marker_bridge:
-                # non-blocking: moved bridge send to async enqueue
-                marker_bridge.enqueue(event_name, payload)
+                marker_bridge.enqueue(event_name, payload)  # enriched payload (non-blocking)
             else:
                 root.send_bridge_event(event_name, payload)
             return

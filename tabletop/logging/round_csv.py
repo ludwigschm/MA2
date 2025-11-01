@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:  # Optional dependency used when available.
     import pandas as _pd  # type: ignore
@@ -28,26 +28,48 @@ _PERF_LOGGING = is_perf_logging_enabled()
 _ROUND_QUEUE_MAXSIZE = 8
 _ROUND_BUFFER_MAX = 500
 _ROUND_FLUSH_INTERVAL = 1.0
-_ROUND_QUEUE: Optional[queue.Queue[Tuple[Path, List[List[Any]], bool]]] = None
+_ROUND_QUEUE: Optional[
+    queue.Queue[Tuple[Path, List[Dict[str, Any]], List[str], bool]]
+] = None
 _ROUND_QUEUE_LOCK = threading.Lock()
 _ROUND_WRITER: Optional[threading.Thread] = None
 
 
-def _write_round_rows(path: Path, rows: List[List[Any]], write_header: bool) -> None:
+def _write_round_rows(
+    path: Path,
+    rows: List[Dict[str, Any]],
+    fieldnames: List[str],
+    write_header: bool,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8", newline="") as fp:
-        writer = csv.writer(fp)
+        writer = csv.DictWriter(fp, fieldnames=fieldnames, restval="")
         if write_header:
-            writer.writerow(ROUND_LOG_HEADER)
+            writer.writeheader()
         writer.writerows(rows)
 
 
-def _round_writer_loop(queue_obj: queue.Queue[Tuple[Path, List[List[Any]], bool]]) -> None:
+def _extend_fieldnames(fieldnames: List[str], row: Dict[str, Any]) -> None:
+    for key in row.keys():
+        if key not in fieldnames:
+            fieldnames.append(key)
+
+
+def _sequence_row_to_dict(row: Sequence[Any]) -> Dict[str, Any]:
+    mapping: Dict[str, Any] = {}
+    for idx, key in enumerate(ROUND_LOG_HEADER):
+        mapping[key] = row[idx] if idx < len(row) else ""
+    return mapping
+
+
+def _round_writer_loop(
+    queue_obj: queue.Queue[Tuple[Path, List[Dict[str, Any]], List[str], bool]]
+) -> None:
     while True:
-        path, rows, write_header = queue_obj.get()
+        path, rows, fieldnames, write_header = queue_obj.get()
         start = time.perf_counter()
         try:
-            _write_round_rows(path, rows, write_header)
+            _write_round_rows(path, rows, fieldnames, write_header)
             if _PERF_LOGGING:
                 duration = (time.perf_counter() - start) * 1000.0
                 log.debug(
@@ -59,14 +81,16 @@ def _round_writer_loop(queue_obj: queue.Queue[Tuple[Path, List[List[Any]], bool]
             queue_obj.task_done()
 
 
-def _ensure_round_writer() -> queue.Queue[Tuple[Path, List[List[Any]], bool]]:
+def _ensure_round_writer() -> queue.Queue[Tuple[Path, List[Dict[str, Any]], List[str], bool]]:
     global _ROUND_QUEUE, _ROUND_WRITER
     if _ROUND_QUEUE is not None:
         return _ROUND_QUEUE
     with _ROUND_QUEUE_LOCK:
         if _ROUND_QUEUE is not None:
             return _ROUND_QUEUE
-        queue_obj: queue.Queue[Tuple[Path, List[List[Any]], bool]] = queue.Queue(
+        queue_obj: queue.Queue[
+            Tuple[Path, List[Dict[str, Any]], List[str], bool]
+        ] = queue.Queue(
             maxsize=_ROUND_QUEUE_MAXSIZE
         )
         writer_thread = threading.Thread(
@@ -111,11 +135,12 @@ def init_round_log(app: Any) -> None:
     app.round_log_path = path
     app.round_log_fp = None
     app.round_log_writer = None
-    buffer: Optional[List[List[Any]]] = getattr(app, "round_log_buffer", None)
+    buffer: Optional[List[Dict[str, Any]]] = getattr(app, "round_log_buffer", None)
     if buffer is None:
         app.round_log_buffer = []
     else:
         buffer.clear()
+    app.round_log_fieldnames = list(ROUND_LOG_HEADER)
     app.round_log_last_flush = time.monotonic()
 
 
@@ -216,27 +241,32 @@ def write_round_log(app: Any, actor: str, action: str, payload: Dict[str, Any], 
     def _card_value(val: Any) -> Any:
         return "" if val is None else val
 
-    row = [
-        app.session_id or "",
-        block_condition,
-        block_number,
-        round_in_block,
-        spieler1_vp,
-        actor_vp,
-        _card_value(vp1_cards[0]) if vp1_cards else "",
-        _card_value(vp1_cards[1]) if vp1_cards else "",
-        _card_value(vp2_cards[0]) if vp2_cards else "",
-        _card_value(vp2_cards[1]) if vp2_cards else "",
-        action_label,
-        timestamp,
-        winner_label,
-        score_vp1,
-        score_vp2,
-    ]
+    row = {
+        "Session": app.session_id or "",
+        "Bedingung": block_condition,
+        "Block": block_number,
+        "Runde im Block": round_in_block,
+        "Spieler 1": spieler1_vp,
+        "VP": actor_vp,
+        "Karte1 VP1": _card_value(vp1_cards[0]) if vp1_cards else "",
+        "Karte2 VP1": _card_value(vp1_cards[1]) if vp1_cards else "",
+        "Karte1 VP2": _card_value(vp2_cards[0]) if vp2_cards else "",
+        "Karte2 VP2": _card_value(vp2_cards[1]) if vp2_cards else "",
+        "Aktion": action_label,
+        "Zeit": timestamp,
+        "Gewinner": winner_label,
+        "Punktestand VP1": score_vp1,
+        "Punktestand VP2": score_vp2,
+    }
     buffer = getattr(app, "round_log_buffer", None)
     if buffer is None:
         buffer = []
         app.round_log_buffer = buffer
+    fieldnames = getattr(app, "round_log_fieldnames", None)
+    if fieldnames is None:
+        fieldnames = list(ROUND_LOG_HEADER)
+        app.round_log_fieldnames = fieldnames
+    _extend_fieldnames(fieldnames, row)
     buffer.append(row)
     if not hasattr(app, "round_log_last_flush"):
         app.round_log_last_flush = time.monotonic()
@@ -252,7 +282,7 @@ def flush_round_log(
 ) -> None:
     if not getattr(app, "round_log_path", None):
         return
-    buffer: Optional[List[List[Any]]] = getattr(app, "round_log_buffer", None)
+    buffer: Optional[List[Dict[str, Any]]] = getattr(app, "round_log_buffer", None)
     if not buffer:
         return
 
@@ -272,26 +302,48 @@ def flush_round_log(
     rows = list(buffer)
     buffer.clear()
     app.round_log_last_flush = now
+    fieldnames = getattr(app, "round_log_fieldnames", None)
+    if fieldnames is None:
+        fieldnames = list(ROUND_LOG_HEADER)
+    fieldnames = list(fieldnames)
+
+    dict_rows: List[Dict[str, Any]] = []
+    for entry in rows:
+        if isinstance(entry, dict):
+            row_dict = dict(entry)
+        else:
+            row_dict = _sequence_row_to_dict(entry)
+        _extend_fieldnames(fieldnames, row_dict)
+        dict_rows.append(row_dict)
+    app.round_log_fieldnames = fieldnames
 
     if _LOW_LATENCY_DISABLED:
         pd = pandas_module if pandas_module is not None else _pd
         if pd is not None:
-            df = pd.DataFrame(rows, columns=ROUND_LOG_HEADER)
-            df.to_csv(path, mode="a", header=not file_exists, index=False)
+            df = pd.DataFrame(dict_rows)
+            df = df.reindex(columns=fieldnames)
+            df.fillna("", inplace=True)
+            df.to_csv(
+                path,
+                mode="a",
+                header=not file_exists,
+                index=False,
+                columns=fieldnames,
+            )
         else:
-            _write_round_rows(path, rows, not file_exists)
+            _write_round_rows(path, dict_rows, fieldnames, not file_exists)
         return
 
     queue_obj = _ensure_round_writer()
     write_header = not file_exists
     try:
-        queue_obj.put_nowait((path, rows, write_header))
+        queue_obj.put_nowait((path, dict_rows, fieldnames, write_header))
     except queue.Full:
         log.warning(
             "Round log queue saturated – falling back to synchronous flush (%d rows)",
             len(rows),
         )
-        _write_round_rows(path, rows, write_header)
+        _write_round_rows(path, dict_rows, fieldnames, write_header)
     else:
         if _PERF_LOGGING and queue_obj.maxsize:
             load = queue_obj.qsize() / queue_obj.maxsize
@@ -309,3 +361,4 @@ def close_round_log(app: Any) -> None:
     app.round_log_writer = None
     if getattr(app, "round_log_path", None):
         app.round_log_path = None
+    app.round_log_fieldnames = list(ROUND_LOG_HEADER)

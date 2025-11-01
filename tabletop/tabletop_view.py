@@ -602,6 +602,11 @@ class TabletopRoot(FloatLayout):
         phase = getattr(self.phase, "name", None)
         if phase:
             payload["phase"] = phase
+        try:
+            round_idx = max(0, getattr(self, "round", 1) - 1)
+        except Exception:
+            round_idx = 0
+        payload["round_index"] = round_idx
         if player in (1, 2):
             payload["game_player"] = player
             role = self.player_roles.get(player)
@@ -609,9 +614,27 @@ class TabletopRoot(FloatLayout):
                 payload["player_role"] = role
         if extra:
             payload.update(extra)
+
+        actor = "SYS"
+        if player in (1, 2):
+            try:
+                actor = self._actor_label(player)
+            except Exception:
+                role = None
+                try:
+                    role = self.player_roles.get(player)
+                except Exception:
+                    role = None
+                if role == 1:
+                    actor = "P1"
+                elif role == 2:
+                    actor = "P2"
+                else:
+                    actor = "P1" if player == 1 else "P2"
+        payload["actor"] = actor
+
         if self.marker_bridge:
-            # non-blocking: moved bridge send to async enqueue
-            self.marker_bridge.enqueue(f"button.{button}", payload)
+            self.marker_bridge.enqueue(f"button.{button}", payload)  # enriched payload (non-blocking)
         else:
             self.send_bridge_event(f"button.{button}", payload)
 
@@ -1718,20 +1741,25 @@ class TabletopRoot(FloatLayout):
     def current_engine_phase(self):
         return to_engine_phase(self.phase)
 
+    def _actor_label(self, player: Optional[int]) -> str:
+        if player not in (1, 2):
+            return "SYS"
+        role = None
+        try:
+            role = self.player_roles.get(player)
+        except Exception:
+            role = None
+        if role == 1:
+            return "P1"
+        if role == 2:
+            return "P2"
+        return "P1" if player == 1 else "P2"
+
     def log_event(self, player: int, action: str, payload=None):
         if not self.logger or not self.session_configured:
             return
         payload = payload or {}
-        if player is None:
-            actor = 'SYS'
-        else:
-            role = self.player_roles.get(player)
-            if role == 1:
-                actor = 'P1'
-            elif role == 2:
-                actor = 'P2'
-            else:
-                actor = 'P1' if player == 1 else 'P2'
+        actor = self._actor_label(player)
         round_idx = max(0, self.round - 1)
         self.logger.log(
             round_idx,
