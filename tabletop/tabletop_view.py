@@ -45,6 +45,8 @@ from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
 from tabletop.engine import POINTS_PER_WIN, EventLogger
 from tabletop.sync.reconciler import TimeReconciler
+from tabletop.utils.async_tasks import AsyncCallQueue
+from tabletop.utils.input_timing import Debouncer
 from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
@@ -56,6 +58,8 @@ from tabletop.ui.assets import (
     resolve_background_texture,
 )
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
+
+Window.multitouch_on_demand = True
 
 log = logging.getLogger(__name__)
 
@@ -192,6 +196,15 @@ class TabletopRoot(FloatLayout):
         self.perf_logging = (
             bool(perf_logging) or is_perf_logging_enabled()
         ) and not self._low_latency_disabled
+        self._input_debouncer = Debouncer()
+        self._handler_log_gate: Dict[str, float] = {}
+        self._bridge_dispatcher = AsyncCallQueue(
+            "BridgeDispatch",
+            maxsize=1000,
+            perf_logging=self.perf_logging,
+        )
+        if self.perf_logging:
+            Clock.schedule_interval(self._log_async_metrics, 1.0)
         self._bridge: Optional["PupilBridge"] = None
         self._bridge_player: Optional[str] = None
         self._bridge_players: set[str] = set()
@@ -394,6 +407,24 @@ class TabletopRoot(FloatLayout):
             self._bridge_state_dirty = True
         self._next_bridge_check = now + self._bridge_check_interval
 
+    def _log_async_metrics(self, _dt: float) -> None:
+        if not self.perf_logging:
+            return
+        size, capacity = self._bridge_dispatcher.load()
+        if not capacity or size == 0:
+            return
+        log.debug("Bridge dispatch queue load: %d/%d", size, capacity)
+
+    def _record_handler_duration(self, name: str, started: float) -> None:
+        if not self.perf_logging:
+            return
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        now = time.monotonic()
+        last = self._handler_log_gate.get(name, 0.0)
+        if duration_ms >= 1.0 or now - last >= 1.0:
+            log.debug("%s completed in %.3f ms", name, duration_ms)
+            self._handler_log_gate[name] = now
+
     def stop_bridge_recordings(self) -> None:
         if not self._bridge_recordings_active:
             self._bridge_recording_block = None
@@ -507,31 +538,39 @@ class TabletopRoot(FloatLayout):
         payload_copy: Dict[str, Any] = {}
         if payload:
             payload_copy.update(payload)
-
         session_label = self.session_id
         bridge_session = self._bridge_session
         bridge_block = self._bridge_block
+        session_number = self.session_number
 
-        for player in players:
-            event_payload = self._bridge_payload_base(player=player)
-            event_payload.update(payload_copy)
-            event_payload["event_id"] = event_id
-            event_payload["t_local_ns"] = t_local_ns
-            event_payload["provisional"] = True
-            event_payload["mapping_version"] = mapping_version
-            event_payload["origin_device"] = self._origin_device_id
-            event_payload.setdefault("origin_player", player)
-            if session_label:
-                event_payload.setdefault("session_label", session_label)
-            if self.session_number is not None:
-                event_payload.setdefault("session_number", self.session_number)
-            if bridge_session is not None:
-                event_payload.setdefault("bridge_session", bridge_session)
-            if bridge_block is not None:
-                event_payload.setdefault("bridge_block", bridge_block)
-            self._bridge.send_event(name, player, event_payload)
+        def _dispatch() -> None:
+            bridge_ref = self._bridge
+            if not bridge_ref:
+                return
+            for player in players:
+                event_payload = self._bridge_payload_base(player=player)
+                event_payload.update(payload_copy)
+                event_payload["event_id"] = event_id
+                event_payload["t_local_ns"] = t_local_ns
+                event_payload["provisional"] = True
+                event_payload["mapping_version"] = mapping_version
+                event_payload["origin_device"] = self._origin_device_id
+                event_payload.setdefault("origin_player", player)
+                if session_label:
+                    event_payload.setdefault("session_label", session_label)
+                if session_number is not None:
+                    event_payload.setdefault("session_number", session_number)
+                if bridge_session is not None:
+                    event_payload.setdefault("bridge_session", bridge_session)
+                if bridge_block is not None:
+                    event_payload.setdefault("bridge_block", bridge_block)
+                try:
+                    bridge_ref.send_event(name, player, event_payload)
+                except Exception:
+                    log.exception("Bridge event dispatch failed: %s", name)
+            self._notify_event_pipeline(name, event_id, t_local_ns)
 
-        self._notify_event_pipeline(name, event_id, t_local_ns)
+        self._bridge_dispatcher.submit(_dispatch)  # non-blocking: moved to worker
 
     def _emit_button_bridge_event(
         self,
@@ -1078,46 +1117,52 @@ class TabletopRoot(FloatLayout):
             proceed()
 
     def start_pressed(self, who:int):
-        if self.session_finished and not self.in_block_pause:
-            return
-        allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
-        if not allowed_phase and not self.in_block_pause:
-            return
-        if who == 1:
-            self.p1_pressed = True
-        else:
-            self.p2_pressed = True
-        self.record_action(who, 'Play gedrückt')
-        if self.session_configured:
-            action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
-            self.log_event(who, action)
-        if self.p1_pressed and self.p2_pressed:
-            # in nächste Phase
-            self.p1_pressed = False
-            self.p2_pressed = False
-            if self.in_round_pause:
-                self.in_round_pause = False
-                self.pause_message = ''
-                self.update_pause_overlay()
-                self.prepare_next_round(start_immediately=True)
+        started = time.perf_counter()
+        try:
+            if not self._input_debouncer.allow(f"start:{who}"):
                 return
-            if self.in_block_pause:
-                self.in_block_pause = False
-                self.pause_message = ''
-                self.update_pause_overlay()
-                self.setup_round()
-                if self.session_finished:
-                    self.apply_phase()
-                    return
-                self.phase = UXPhase.WAIT_BOTH_START
-                self.apply_phase()
-                self.continue_after_start_press()
+            if self.session_finished and not self.in_block_pause:
                 return
-            elif self.phase == UXPhase.SHOWDOWN:
-                self.prepare_next_round(start_immediately=True)
+            allowed_phase = self.phase in (UXPhase.WAIT_BOTH_START, UXPhase.SHOWDOWN)
+            if not allowed_phase and not self.in_block_pause:
                 return
+            if who == 1:
+                self.p1_pressed = True
             else:
-                self.continue_after_start_press()
+                self.p2_pressed = True
+            self.record_action(who, 'Play gedrückt')
+            if self.session_configured:
+                action = 'start_click' if self.phase == UXPhase.WAIT_BOTH_START else 'next_round_click'
+                self.log_event(who, action)
+            if self.p1_pressed and self.p2_pressed:
+                # in nächste Phase
+                self.p1_pressed = False
+                self.p2_pressed = False
+                if self.in_round_pause:
+                    self.in_round_pause = False
+                    self.pause_message = ''
+                    self.update_pause_overlay()
+                    self.prepare_next_round(start_immediately=True)
+                    return
+                if self.in_block_pause:
+                    self.in_block_pause = False
+                    self.pause_message = ''
+                    self.update_pause_overlay()
+                    self.setup_round()
+                    if self.session_finished:
+                        self.apply_phase()
+                        return
+                    self.phase = UXPhase.WAIT_BOTH_START
+                    self.apply_phase()
+                    self.continue_after_start_press()
+                    return
+                elif self.phase == UXPhase.SHOWDOWN:
+                    self.prepare_next_round(start_immediately=True)
+                    return
+                else:
+                    self.continue_after_start_press()
+        finally:
+            self._record_handler_duration('start_pressed', started)
 
     def run_fixation_sequence(self, on_complete=None):
         self.fixation_runner(
@@ -1137,86 +1182,104 @@ class TabletopRoot(FloatLayout):
         self.fixation_player(self)
 
     def tap_card(self, who:int, which:str):
-        result = self.controller.tap_card(who, which)
-        button_name = f'card_{which}'
-        self._emit_button_bridge_event(
-            button_name,
-            player=who,
-            extra={
-                'allowed': bool(result.allowed),
-                'card_slot': which,
-            },
-        )
-        if not result.allowed:
-            return
-        widget = self.card_widget_for_player(who, which)
-        if widget is None:
-            return
-        widget.flip()
-        if result.record_text:
-            self.record_action(who, result.record_text)
-        if result.log_action:
-            self.log_event(who, result.log_action, result.log_payload or {})
-        if result.next_phase:
-            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+        started = time.perf_counter()
+        try:
+            if not self._input_debouncer.allow(f"tap:{who}:{which}"):
+                return
+            result = self.controller.tap_card(who, which)
+            button_name = f'card_{which}'
+            self._emit_button_bridge_event(
+                button_name,
+                player=who,
+                extra={
+                    'allowed': bool(result.allowed),
+                    'card_slot': which,
+                },
+            )
+            if not result.allowed:
+                return
+            widget = self.card_widget_for_player(who, which)
+            if widget is None:
+                return
+            widget.flip()
+            if result.record_text:
+                self.record_action(who, result.record_text)
+            if result.log_action:
+                self.log_event(who, result.log_action, result.log_payload or {})
+            if result.next_phase:
+                Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+        finally:
+            self._record_handler_duration('tap_card', started)
 
     def pick_signal(self, player:int, level:str):
-        result = self.controller.pick_signal(player, level)
-        self._emit_button_bridge_event(
-            f'signal_{level}',
-            player=player,
-            extra={
-                'accepted': bool(result.accepted),
-                'signal_level': level,
-            },
-        )
-        if not result.accepted:
-            return
-        for lvl, btn_id in self.signal_buttons.get(player, {}).items():
-            btn = self.wid_safe(btn_id)
-            if btn is None:
-                continue
-            if lvl == level:
-                btn.set_pressed_state()
-            else:
-                btn.set_live(False)
-                btn.disabled = True
-        self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
-        if result.log_payload:
-            self.log_event(player, 'signal_choice', result.log_payload)
-        self.update_user_displays()
-        if result.next_phase:
-            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+        started = time.perf_counter()
+        try:
+            if not self._input_debouncer.allow(f"signal:{player}:{level}"):
+                return
+            result = self.controller.pick_signal(player, level)
+            self._emit_button_bridge_event(
+                f'signal_{level}',
+                player=player,
+                extra={
+                    'accepted': bool(result.accepted),
+                    'signal_level': level,
+                },
+            )
+            if not result.accepted:
+                return
+            for lvl, btn_id in self.signal_buttons.get(player, {}).items():
+                btn = self.wid_safe(btn_id)
+                if btn is None:
+                    continue
+                if lvl == level:
+                    btn.set_pressed_state()
+                else:
+                    btn.set_live(False)
+                    btn.disabled = True
+            self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
+            if result.log_payload:
+                self.log_event(player, 'signal_choice', result.log_payload)
             self.update_user_displays()
+            if result.next_phase:
+                Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+                self.update_user_displays()
+        finally:
+            self._record_handler_duration('pick_signal', started)
 
     def pick_decision(self, player:int, decision:str):
-        result = self.controller.pick_decision(player, decision)
-        self._emit_button_bridge_event(
-            f'decision_{decision}',
-            player=player,
-            extra={
-                'accepted': bool(result.accepted),
-                'decision': decision,
-            },
-        )
-        if not result.accepted:
-            return
-        for choice, btn_id in self.decision_buttons.get(player, {}).items():
-            btn = self.wid_safe(btn_id)
-            if btn is None:
-                continue
-            if choice == decision:
-                btn.set_pressed_state()
-            else:
-                btn.set_live(False)
-                btn.disabled = True
-        self.record_action(player, f'Entscheidung: {decision.upper()}')
-        if result.log_payload:
-            self.log_event(player, 'call_choice', result.log_payload)
-        self.update_user_displays()
-        if result.next_phase:
-            Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+        started = time.perf_counter()
+        try:
+            if not self._input_debouncer.allow(f"decision:{player}:{decision}"):
+                return
+            result = self.controller.pick_decision(player, decision)
+            self._emit_button_bridge_event(
+                f'decision_{decision}',
+                player=player,
+                extra={
+                    'accepted': bool(result.accepted),
+                    'decision': decision,
+                },
+            )
+            if not result.accepted:
+                return
+            for choice, btn_id in self.decision_buttons.get(player, {}).items():
+                btn = self.wid_safe(btn_id)
+                if btn is None:
+                    continue
+                if choice == decision:
+                    btn.set_pressed_state()
+                else:
+                    btn.set_live(False)
+                    btn.disabled = True
+            self.record_action(player, f'Entscheidung: {decision.upper()}')
+            if result.log_payload:
+                self.log_event(player, 'call_choice', result.log_payload)
             self.update_user_displays()
+            if result.next_phase:
+                Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
+                self.update_user_displays()
+        finally:
+            self._record_handler_duration('pick_decision', started)
 
     def goto(self, phase):
         self.phase = phase
