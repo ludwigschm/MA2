@@ -136,8 +136,6 @@ def run_fixation_sequence(
     if getattr(overlay, "parent", None) is not None:
         controller.remove_widget(overlay)
     controller.add_widget(overlay)
-    _send_sync_event("sync.fixation_start")
-
     for attr in ("btn_start_p1", "btn_start_p2"):
         btn = getattr(controller, attr, None)
         if btn is not None and hasattr(btn, "set_live"):
@@ -159,7 +157,6 @@ def run_fixation_sequence(
         controller.pending_fixation_callback = None
         if callback:
             callback()
-        _send_sync_event("sync.fixation_end")
 
     def show_final_live(_dt: float) -> None:
         _set_image_source(image, live_image, fallback="cross")
@@ -167,8 +164,8 @@ def run_fixation_sequence(
 
     def show_stop_and_tone(_dt: float) -> None:
         _set_image_source(image, stop_image, fallback="blank")
-        _log_fixation_event("fixation.flash")
-        setattr(controller, "fixation_beep_callback", lambda: _log_fixation_event("fixation.beep"))
+        _log_fixation_event("fixation_flash")
+        setattr(controller, "fixation_beep_callback", lambda: _log_fixation_event("fixation_beep"))
         play_fixation_tone(controller)
         if hasattr(controller, "fixation_beep_callback"):
             controller.fixation_beep_callback = None
