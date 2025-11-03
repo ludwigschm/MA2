@@ -553,6 +553,7 @@ class TabletopRoot(FloatLayout):
             return
         event_id = str(uuid.uuid4())
         t_local_ns = time.perf_counter_ns()
+        priority = "high" if name.startswith(("sync.", "fix.")) else "normal"
         mapping_version = self._current_ab_version
         payload_copy: Dict[str, Any] = {}
         if payload:
@@ -584,7 +585,28 @@ class TabletopRoot(FloatLayout):
                 if bridge_block is not None:
                     event_payload.setdefault("bridge_block", bridge_block)
                 try:
-                    bridge_ref.send_event(name, player, event_payload)
+                    bridge_ref.send_event(
+                        name,
+                        player,
+                        event_payload,
+                        priority=priority,
+                    )
+                    if priority == "high":
+                        mirror_extra: Dict[str, Any] = {"mapping_version": mapping_version}
+                        if bridge_session is not None:
+                            mirror_extra["session"] = bridge_session
+                        if bridge_block is not None:
+                            mirror_extra["block"] = bridge_block
+                        if session_label:
+                            mirror_extra["session_label"] = session_label
+                        if session_number is not None:
+                            mirror_extra["session_number"] = session_number
+                        bridge_ref.send_host_mirror(
+                            player,
+                            event_id,
+                            t_local_ns,
+                            extra=mirror_extra,
+                        )
                 except Exception:
                     log.exception("Bridge event dispatch failed: %s", name)
             self._notify_event_pipeline(name, event_id, t_local_ns)
