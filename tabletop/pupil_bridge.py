@@ -6,6 +6,7 @@ import json
 import logging
 import queue
 import re
+import statistics
 import threading
 import time
 import uuid
@@ -198,6 +199,8 @@ class PupilBridge:
         self._last_queue_log = 0.0
         self._last_send_log = 0.0
         self._offset_semantics_warned: set[str] = set()
+        self._last_recording_start_ts: Dict[str, float] = {}
+        self._pending_recording_id: Dict[str, Optional[str]] = {}
         if not self._low_latency_disabled:
             self._event_queue = queue.Queue(maxsize=self._event_queue_maxsize)
             self._sender_thread = threading.Thread(
@@ -401,11 +404,19 @@ class PupilBridge:
         if self._active_recording.get(player):
             log.info("recording.start übersprungen (%s bereits aktiv)", player)
             return
+        now = time.monotonic()
+        last_start = self._last_recording_start_ts.get(player)
+        if last_start is not None and (now - last_start) < 0.6:
+            log.info("recording.start entprellt (%s)", player)
+            return
+        self._last_recording_start_ts[player] = now
+        self._pending_recording_id.pop(player, None)
         label = f"auto.{player.lower()}.{int(time.time())}"
         log.info("recording.start gesendet (%s, label=%s)", player, label)
         begin_info = self._send_recording_start(player, device, label)
         if begin_info is None:
             log.warning("recording.begin Timeout (%s)", player)
+            self._pending_recording_id.pop(player, None)
             return
 
         recording_id = self._extract_recording_id(begin_info)
@@ -418,6 +429,7 @@ class PupilBridge:
             "event": "auto_start",
             "recording_id": recording_id,
         }
+        self._pending_recording_id.pop(player, None)
 
     def _get_device_status(self, device: Any) -> Optional[Any]:
         for attr in ("api_status", "status", "get_status"):
@@ -837,6 +849,14 @@ class PupilBridge:
             log.debug("Recording already active for %s", player)
             return
 
+        now = time.monotonic()
+        last_start = self._last_recording_start_ts.get(player)
+        if last_start is not None and (now - last_start) < 0.6:
+            log.info("recording.start entprellt (%s)", player)
+            return
+        self._last_recording_start_ts[player] = now
+        self._pending_recording_id.pop(player, None)
+
         vp_index = self._PLAYER_INDICES.get(player, 0)
         recording_label = f"{session}.{block}.{vp_index}"
 
@@ -850,6 +870,7 @@ class PupilBridge:
         )
         if begin_info is None:
             log.warning("Timeout, retry/abort (%s)", player)
+            self._pending_recording_id.pop(player, None)
             return
 
         recording_id = self._extract_recording_id(begin_info)
@@ -865,6 +886,7 @@ class PupilBridge:
         self.send_event("session.recording_started", player, payload)
         self._active_recording[player] = True
         self._recording_metadata[player] = payload
+        self._pending_recording_id.pop(player, None)
 
     def _send_recording_start(
         self,
@@ -875,16 +897,73 @@ class PupilBridge:
         session: Optional[int] = None,
         block: Optional[int] = None,
     ) -> Optional[Any]:
-        success, _ = self._invoke_recording_start(player, device)
+        success, start_info = self._invoke_recording_start(player, device)
         if not success:
             return None
 
+        expected_id = self._extract_recording_id(start_info)
+        if expected_id is not None:
+            self._pending_recording_id[player] = expected_id
+        elif player not in self._pending_recording_id:
+            self._pending_recording_id[player] = None
+
+        already_active = self._is_already_recording_payload(start_info)
+
         self._apply_recording_label(player, device, label, session=session, block=block)
 
-        begin_info = self._wait_for_notification(device, "recording.begin")
+        if already_active:
+            metadata = self._recording_metadata.get(player)
+            if metadata:
+                return metadata
+        expected = self._pending_recording_id.get(player)
+        begin_info = self._wait_for_recording_begin(player, device, expected)
         if begin_info is None:
             return None
         return begin_info
+
+    @staticmethod
+    def _is_already_recording_payload(info: Optional[Any]) -> bool:
+        if info is None:
+            return False
+        if isinstance(info, dict):
+            status = str(info.get("status", "")).lower()
+            if "already_recording" in status:
+                return True
+            message = str(info.get("message", "")).lower()
+            if "already recording" in message:
+                return True
+        try:
+            status = str(getattr(info, "status", "")).lower()
+        except Exception:
+            status = ""
+        if status and "already" in status and "record" in status:
+            return True
+        message_attr = getattr(info, "message", None)
+        if isinstance(message_attr, str) and "already recording" in message_attr.lower():
+            return True
+        return False
+
+    @staticmethod
+    def _is_already_recording_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        if "already recording" in message:
+            return True
+        if "previous recording not completed" in message:
+            return True
+        status = getattr(exc, "status", None)
+        if isinstance(status, int) and status == 400 and "record" in message:
+            return True
+        code = getattr(exc, "code", None)
+        if isinstance(code, int) and code == 400 and "record" in message:
+            return True
+        response = getattr(exc, "response", None)
+        try:
+            status_code = getattr(response, "status_code", None)
+        except Exception:
+            status_code = None
+        if isinstance(status_code, int) and status_code == 400 and "record" in message:
+            return True
+        return False
 
     def _invoke_recording_start(
         self,
@@ -908,6 +987,13 @@ class PupilBridge:
                     exc_info=True,
                 )
             except Exception as exc:  # pragma: no cover - hardware dependent
+                if self._is_already_recording_error(exc):
+                    log.info(
+                        "recording.start bestätigt bestehende Aufnahme für %s via %s",  # noqa: E501
+                        player,
+                        method_name,
+                    )
+                    return True, {"status": "already_recording", "message": str(exc)}
                 log.exception(
                     "Failed to start recording for %s via %s: %s",
                     player,
@@ -921,6 +1007,8 @@ class PupilBridge:
             if self._handle_busy_state(player, device):
                 return self._invoke_recording_start(player, device, allow_busy_recovery=False)
             return False, None
+        if isinstance(rest_status, str) and rest_status.lower() == "already_recording":
+            return True, {"status": "already_recording", "message": rest_payload}
         if rest_status is True:
             return True, rest_payload
         log.error("No recording start method succeeded for %s", player)
@@ -967,6 +1055,9 @@ class PupilBridge:
         ):
             log.warning("Recording start busy for %s: %s", player, message)
             return "busy", None
+        if response.status_code == 400 and message and "already recording" in message.lower():
+            log.info("recording.start bestätigt bestehende Aufnahme via REST für %s", player)
+            return "already_recording", message
 
         log.error(
             "REST recording start for %s failed (%s): %s",
@@ -1010,7 +1101,7 @@ class PupilBridge:
         if not stopped:
             return False
 
-        end_info = self._wait_for_notification(device, "recording.end")
+        end_info = self._wait_for_notification_once(device, "recording.end")
         if end_info is None:
             log.warning("Timeout while waiting for recording.end (%s)", player)
         return True
@@ -1083,21 +1174,6 @@ class PupilBridge:
         if not label:
             return
 
-        response = self._post_device_api(
-            player,
-            "/api/frame_name",
-            {"frame_name": label},
-            warn=False,
-        )
-        if response is None:
-            log.warning("Setting frame_name failed for %s (no response)", player)
-        elif response.status_code != 200:
-            log.warning(
-                "Setting frame_name failed for %s (%s)",
-                player,
-                response.status_code,
-            )
-
         payload: Dict[str, Any] = {"label": label}
         if session is not None:
             payload["session"] = session
@@ -1123,7 +1199,45 @@ class PupilBridge:
         except Exception:
             log.debug("recording.label event fallback failed for %s", player, exc_info=True)
 
-    def _wait_for_notification(
+    def _wait_for_recording_begin(
+        self,
+        player: str,
+        device: Any,
+        expected_id: Optional[str],
+        timeout: float = 5.0,
+    ) -> Optional[Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                log.debug(
+                    "recording.begin Timeout (player=%s, expected_id=%s)",
+                    player,
+                    expected_id,
+                )
+                return None
+            remaining = max(0.05, deadline - now)
+            info = self._wait_for_notification_once(
+                device,
+                "recording.begin",
+                timeout=remaining,
+            )
+            if info is None:
+                continue
+            if expected_id is None:
+                return info
+            actual_id = self._extract_recording_id(info)
+            if actual_id == expected_id:
+                return info
+            log.debug(
+                "recording.begin ignoriert (%s: erwartet %s, erhalten %s)",
+                player,
+                expected_id,
+                actual_id,
+            )
+        return None
+
+    def _wait_for_notification_once(
         self, device: Any, event: str, timeout: float = 5.0
     ) -> Optional[Any]:
         waiters = ["wait_for_notification", "wait_for_event", "await_notification"]
@@ -1141,11 +1255,29 @@ class PupilBridge:
         return None
 
     def _extract_recording_id(self, info: Any) -> Optional[str]:
+        if info is None:
+            return None
         if isinstance(info, dict):
             for key in ("recording_id", "id", "uuid"):
                 value = info.get(key)
                 if value:
                     return str(value)
+            payload = info.get("payload")
+            if isinstance(payload, dict):
+                for key in ("recording_id", "id", "uuid"):
+                    value = payload.get(key)
+                    if value:
+                        return str(value)
+        for attr in ("payload", "data"):
+            container = getattr(info, attr, None)
+            if isinstance(container, dict):
+                for key in ("recording_id", "id", "uuid"):
+                    value = container.get(key)
+                    if value:
+                        return str(value)
+        candidate = getattr(info, "recording_id", None)
+        if candidate:
+            return str(candidate)
         return None
 
     def stop_recording(self, player: str) -> None:
@@ -1180,7 +1312,7 @@ class PupilBridge:
             log.exception("Failed to stop recording for %s: %s", player, exc)
             return
 
-        end_info = self._wait_for_notification(device, "recording.end")
+        end_info = self._wait_for_notification_once(device, "recording.end")
         if end_info is not None:
             recording_id = self._extract_recording_id(end_info)
             log.info("recording.end empfangen (%s, id=%s)", player, recording_id or "?")
@@ -1532,15 +1664,109 @@ class PupilBridge:
                     player,
                 )
                 self._offset_semantics_warned.add(player)
-            return float(estimator())
+            raw_estimate = estimator()
         except Exception as exc:  # pragma: no cover - hardware dependent
             log.exception("Failed to estimate time offset for %s: %s", player, exc)
             return None
+
+        seconds = self._coerce_time_offset_seconds(raw_estimate)
+        if seconds is None:
+            try:
+                seconds = float(raw_estimate)
+            except (TypeError, ValueError):
+                log.warning(
+                    "Unsupported time offset result for %s: %r", player, raw_estimate
+                )
+                return None
+        return float(seconds)
 
     def is_connected(self, player: str) -> bool:
         """Return whether the given player has an associated device."""
 
         return self._device_by_player.get(player) is not None
+
+    def _coerce_time_offset_seconds(self, estimate: Any) -> Optional[float]:
+        if estimate is None:
+            return None
+        if isinstance(estimate, dict):
+            for key in ("best_offset_ns", "offset_ns"):
+                value = estimate.get(key)
+                if value is not None:
+                    try:
+                        return float(value) / 1e9
+                    except (TypeError, ValueError):
+                        continue
+            for key in ("best_offset", "offset", "offset_seconds"):
+                value = estimate.get(key)
+                if value is not None:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        continue
+            samples = estimate.get("samples")
+            if samples:
+                offsets = [
+                    value
+                    for value in (
+                        self._coerce_time_offset_seconds(sample) for sample in samples
+                    )
+                    if value is not None
+                ]
+                if offsets:
+                    return statistics.median(offsets)
+        for attr in ("best_offset_ns", "offset_ns"):
+            value = getattr(estimate, attr, None)
+            if value is not None:
+                try:
+                    return float(value) / 1e9
+                except (TypeError, ValueError):
+                    continue
+        for attr in ("best_offset", "offset", "offset_seconds"):
+            value = getattr(estimate, attr, None)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        samples_attr = getattr(estimate, "samples", None)
+        if samples_attr:
+            offsets = [
+                value
+                for value in (
+                    self._coerce_time_offset_seconds(sample) for sample in samples_attr
+                )
+                if value is not None
+            ]
+            if offsets:
+                return statistics.median(offsets)
+        to_dict = getattr(estimate, "to_dict", None)
+        if callable(to_dict):
+            try:
+                converted = to_dict()
+            except Exception:
+                converted = None
+            if isinstance(converted, dict):
+                coerced = self._coerce_time_offset_seconds(converted)
+                if coerced is not None:
+                    return coerced
+        as_dict = getattr(estimate, "_asdict", None)
+        if callable(as_dict):
+            try:
+                converted = as_dict()
+            except Exception:
+                converted = None
+            if isinstance(converted, dict):
+                coerced = self._coerce_time_offset_seconds(converted)
+                if coerced is not None:
+                    return coerced
+        if isinstance(estimate, (int, float)):
+            return float(estimate)
+        if isinstance(estimate, str):
+            try:
+                return float(estimate)
+            except ValueError:
+                return None
+        return None
 
     # ------------------------------------------------------------------
     @staticmethod

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import csv
 import itertools
+import json
 import logging
 import os
 import random
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -211,6 +213,12 @@ class TabletopRoot(FloatLayout):
             bool(perf_logging) or is_perf_logging_enabled()
         ) and not self._low_latency_disabled
         self._input_debouncer = Debouncer()
+        self._practice_state = "idle"
+        self._practice_end_monotonic = 0.0
+        self._pause_shown_monotonic = 0.0
+        self._pause_input_blocked_until = 0.0
+        self._practice_pause_visible = False
+        self._next_block_ready_monotonic = 0.0
         self._handler_log_gate: Dict[str, float] = {}
         self._bridge_dispatcher = AsyncCallQueue(
             "BridgeDispatch",
@@ -1204,6 +1212,7 @@ class TabletopRoot(FloatLayout):
                 self.log_event(who, action)
             if self.p1_pressed and self.p2_pressed:
                 # in nächste Phase
+                now_monotonic = time.monotonic()
                 self.p1_pressed = False
                 self.p2_pressed = False
                 if self.in_round_pause:
@@ -1214,16 +1223,21 @@ class TabletopRoot(FloatLayout):
                     self.prepare_next_round(start_immediately=True)
                     return
                 if self.in_block_pause:
+                    if now_monotonic < self._pause_input_blocked_until:
+                        return
+                    practice_pause = self._practice_pause_visible
                     self.in_block_pause = False
                     self.pause_message = ''
                     self.update_pause_overlay()
                     self.setup_round()
                     if self.session_finished:
                         self.apply_phase()
+                        self._finish_block_pause(now_monotonic, practice=practice_pause)
                         return
                     self.phase = UXPhase.WAIT_BOTH_START
                     self.apply_phase()
                     self.log_round_start_if_pending()
+                    self._finish_block_pause(now_monotonic, practice=practice_pause)
                     self.continue_after_start_press()
                     return
                 elif self.phase == UXPhase.SHOWDOWN:
@@ -1357,7 +1371,73 @@ class TabletopRoot(FloatLayout):
         self.phase = phase
         self.apply_phase()
 
+    def _handle_practice_block_end(self, block_index: Optional[int]) -> None:
+        if self._practice_state in {"ended", "pause_visible", "completed"}:
+            return
+        self._practice_state = "ended"
+        self._practice_pause_visible = False
+        timestamp = time.monotonic()
+        self._practice_end_monotonic = timestamp
+        payload = {
+            "block_index": block_index,
+            "round": self.round,
+            "monotonic_s": round(timestamp, 3),
+        }
+        self._log_ui_event("PracticeEnded", payload)
+
+    def _show_block_pause(self, message: str, *, practice: bool) -> None:
+        def _apply(_dt: float) -> None:
+            self.in_block_pause = True
+            self.pause_message = message
+            self.update_pause_overlay()
+            self.update_user_displays()
+            shown = time.monotonic()
+            self._pause_shown_monotonic = shown
+            self._pause_input_blocked_until = shown + 0.3
+            self._next_block_ready_monotonic = 0.0
+            self._practice_pause_visible = practice
+            if practice:
+                self._practice_state = "pause_visible"
+            payload: Dict[str, Any] = {
+                "practice": practice,
+                "message": message,
+                "monotonic_s": round(shown, 3),
+            }
+            if practice and self._practice_end_monotonic:
+                payload["delay_since_practice_s"] = round(
+                    shown - self._practice_end_monotonic, 3
+                )
+            self._log_ui_event("PauseScreenVisible", payload)
+
+        if threading.current_thread() is threading.main_thread():
+            _apply(0.0)
+        else:
+            Clock.schedule_once(_apply, 0.0)
+
+    def _finish_block_pause(self, ready_ts: float, *, practice: bool) -> None:
+        delay_since_pause = max(0.0, ready_ts - self._pause_shown_monotonic)
+        payload: Dict[str, Any] = {
+            "practice": practice,
+            "delay_since_pause_s": round(delay_since_pause, 3),
+            "monotonic_s": round(ready_ts, 3),
+        }
+        if practice and self._practice_end_monotonic:
+            payload["delay_since_practice_s"] = round(
+                ready_ts - self._practice_end_monotonic, 3
+            )
+        self._log_ui_event("NextBlockReady", payload)
+        self._next_block_ready_monotonic = ready_ts
+        self._pause_shown_monotonic = 0.0
+        self._pause_input_blocked_until = 0.0
+        self._practice_pause_visible = False
+        if practice:
+            self._practice_state = "completed"
+
     def prepare_next_round(self, start_immediately: bool = False):
+        was_practice_block = self.is_practice_block_active()
+        previous_block_index = (
+            self.current_block_info.get('index') if was_practice_block and self.current_block_info else None
+        )
         result = self.controller.prepare_next_round(start_immediately=start_immediately)
         self.update_role_assignments()
         self._apply_round_setup(result.setup)
@@ -1370,14 +1450,17 @@ class TabletopRoot(FloatLayout):
             self.update_pause_overlay()
             self.update_user_displays()
             return
-        if result.in_block_pause:
-            self.in_block_pause = True
-            self.pause_message = self.controller.state.pause_message or (
+        practice_block_ended = was_practice_block and (result.in_block_pause or result.session_finished)
+        if practice_block_ended:
+            self._handle_practice_block_end(previous_block_index)
+
+        should_pause = result.in_block_pause or practice_block_ended
+        if should_pause:
+            message = self.controller.state.pause_message or (
                 "Dieser Block ist vorbei. Nehmen Sie sich einen Moment zum Durchatmen.\n"
                 "Wenn Sie bereit sind, klicken Sie auf Weiter."
             )
-            self.update_pause_overlay()
-            self.update_user_displays()
+            self._show_block_pause(message, practice=practice_block_ended)
             return
 
         def start_round():
@@ -1403,6 +1486,10 @@ class TabletopRoot(FloatLayout):
 
     def _apply_round_setup(self, result):
         plan = result.plan if result else None
+        block_info = self.controller.state.current_block_info
+        if plan and block_info and block_info.get('practice'):
+            if self._practice_state not in {"pause_visible", "completed"}:
+                self._practice_state = "running"
         self.set_cards_from_plan(plan)
         for card_id in ('p1_inner', 'p1_outer', 'p2_inner', 'p2_outer'):
             widget = self.wid_safe(card_id)
@@ -1569,6 +1656,10 @@ class TabletopRoot(FloatLayout):
         if winner_vp == vp:
             return 'Gewonnen'
         return 'Verloren'
+
+    def _log_ui_event(self, name: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        payload_repr = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
+        log.info("[UI] %s %s", name, payload_repr)
 
     def _result_with_score_for_vp(self, vp:int):
         base = self._result_for_vp(vp)
