@@ -1672,16 +1672,25 @@ class TabletopRoot(FloatLayout):
         active = self.in_block_pause or self.session_finished
         buttons_active = self.in_block_pause
         if active:
+            # Ensure pause_cover is the topmost regular widget
             if pause_cover.parent is None:
                 self.add_widget(pause_cover)
-                # Start-Buttons über das Overlay legen
-                self.bring_start_buttons_to_front()
+            else:
+                parent = pause_cover.parent
+                try:
+                    parent.remove_widget(pause_cover)
+                except Exception:
+                    pass
+                parent.add_widget(pause_cover)
+
+            # Start buttons should be above the overlay
+            self.bring_start_buttons_to_front()
             pause_cover.opacity = 1
             pause_cover.disabled = False
             for label_id in self.pause_labels.values():
                 lbl = self.wid_safe(label_id)
                 if lbl is not None:
-                    lbl.text = self.pause_message
+                    lbl.text = self.pause_message or ''
             for player, btn_id in getattr(self, 'pause_start_buttons', {}).items():
                 btn = self.wid_safe(btn_id)
                 if btn is None:
@@ -1705,8 +1714,8 @@ class TabletopRoot(FloatLayout):
                 btn.set_live(False)
             if pause_cover.parent is not None:
                 self.remove_widget(pause_cover)
-                # Reihenfolge der Buttons erhalten
-                self.bring_start_buttons_to_front()
+            # Keep start buttons order consistent
+            self.bring_start_buttons_to_front()
 
     def build_round_pause_message(self, next_info: Optional[Dict[str, Any]]) -> str:
         base = (
