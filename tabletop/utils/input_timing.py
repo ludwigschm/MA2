@@ -17,13 +17,16 @@ class Debouncer:
         self._last: Dict[str, float] = {}
         self._lock = threading.Lock()
 
-    def allow(self, key: str) -> bool:
+    def allow(self, key: str, interval_override_ms: float | None = None) -> bool:
         """Return True only if the previous event is outside the interval."""
 
         now = time.perf_counter()
+        interval = self._interval
+        if interval_override_ms is not None:
+            interval = max(0.0, float(interval_override_ms)) / 1000.0
         with self._lock:
             last = self._last.get(key)
-            if last is None or now - last >= self._interval:
+            if last is None or now - last >= interval:
                 self._last[key] = now
                 return True
             return False

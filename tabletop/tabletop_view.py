@@ -1187,7 +1187,7 @@ class TabletopRoot(FloatLayout):
     def start_pressed(self, who:int):
         started = time.perf_counter()
         try:
-            if not self._input_debouncer.allow(f"start:{who}"):
+            if not self._input_debouncer.allow(f"start:{who}", interval_override_ms=10.0):
                 return
             if self.session_finished and not self.in_block_pause:
                 return
@@ -1210,6 +1210,7 @@ class TabletopRoot(FloatLayout):
                     self.in_round_pause = False
                     self.pause_message = ''
                     self.update_pause_overlay()
+                    self.log_round_start_if_pending()
                     self.prepare_next_round(start_immediately=True)
                     return
                 if self.in_block_pause:
@@ -1222,12 +1223,15 @@ class TabletopRoot(FloatLayout):
                         return
                     self.phase = UXPhase.WAIT_BOTH_START
                     self.apply_phase()
+                    self.log_round_start_if_pending()
                     self.continue_after_start_press()
                     return
                 elif self.phase == UXPhase.SHOWDOWN:
+                    self.log_round_start_if_pending()
                     self.prepare_next_round(start_immediately=True)
                     return
                 else:
+                    self.log_round_start_if_pending()
                     self.continue_after_start_press()
         finally:
             self._record_handler_duration('start_pressed', started)
@@ -1802,7 +1806,7 @@ class TabletopRoot(FloatLayout):
             role_value = self.player_roles.get(player)
             if role_value is not None:
                 bridge_payload["player_role"] = role_value
-        if self.marker_bridge:
+        if self.marker_bridge and action != 'round_start':
             # non-blocking: moved bridge send to async enqueue
             self.marker_bridge.enqueue(f"action.{action}", bridge_payload)
 
