@@ -12,7 +12,7 @@ from typing import Callable
 
 _log = logging.getLogger(__name__)
 
-_q: "queue.Queue[Callable[[], None]]" = queue.Queue(maxsize=1000)
+_q: "queue.Queue[Callable[[], None]]" = queue.Queue(maxsize=10000)
 
 
 def _worker() -> None:

@@ -370,9 +370,18 @@ class EventLogger:
                 self._event_queue.put_nowait(row)
             except queue.Full:
                 log.warning(
-                    "Event queue saturated – writing synchronously (%s)", actor
+                    "Event queue saturated – dispatching overflow asynchronously (%s)",
+                    actor,
                 )
-                self._flush_rows([row])
+
+                def _overflow_flush() -> None:
+                    self._flush_rows([row])
+
+                threading.Thread(
+                    target=_overflow_flush,
+                    name="EventLoggerOverflow",
+                    daemon=True,
+                ).start()
             else:
                 if self._event_queue.maxsize and (
                     self._perf_logging

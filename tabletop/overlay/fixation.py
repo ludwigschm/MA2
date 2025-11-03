@@ -48,13 +48,22 @@ def play_fixation_tone(controller: Any) -> None:
 
     sample_rate = getattr(controller, "fixation_tone_fs", 44100)
     tone_data = tone.copy()
+    beep_callback = getattr(controller, "fixation_beep_callback", None)
 
     def _play():
         try:
             sd.play(tone_data, sample_rate)
+            if callable(beep_callback):
+                try:
+                    beep_callback()
+                except Exception:  # pragma: no cover - defensive callback guard
+                    pass
             sd.wait()
         except Exception as exc:  # pragma: no cover - audio hardware dependent
             print(f"Warnung: Ton konnte nicht abgespielt werden: {exc}")
+        finally:
+            if hasattr(controller, "fixation_beep_callback"):
+                controller.fixation_beep_callback = None
 
     threading.Thread(target=_play, daemon=True).start()
 
@@ -127,8 +136,6 @@ def run_fixation_sequence(
     if getattr(overlay, "parent", None) is not None:
         controller.remove_widget(overlay)
     controller.add_widget(overlay)
-
-    _log_fixation_event("fixation_start")
     _send_sync_event("sync.fixation_start")
 
     for attr in ("btn_start_p1", "btn_start_p2"):
@@ -152,7 +159,6 @@ def run_fixation_sequence(
         controller.pending_fixation_callback = None
         if callback:
             callback()
-        _log_fixation_event("fixation_end")
         _send_sync_event("sync.fixation_end")
 
     def show_final_live(_dt: float) -> None:
@@ -161,8 +167,11 @@ def run_fixation_sequence(
 
     def show_stop_and_tone(_dt: float) -> None:
         _set_image_source(image, stop_image, fallback="blank")
+        _log_fixation_event("fixation.flash")
+        setattr(controller, "fixation_beep_callback", lambda: _log_fixation_event("fixation.beep"))
         play_fixation_tone(controller)
-        _log_fixation_event("fixation_beep")
+        if hasattr(controller, "fixation_beep_callback"):
+            controller.fixation_beep_callback = None
         _send_sync_event("sync.flash_beep")
         schedule_once(show_final_live, 0.2)
 
