@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Union
+from typing import Any, Dict, Iterable, Literal, Optional, Union
 
 try:  # pragma: no cover - optional dependency
     from pupil_labs.realtime_api.simple import Device, discover_devices
@@ -27,6 +27,8 @@ except Exception:  # pragma: no cover - optional dependency
 log = logging.getLogger(__name__)
 
 from tabletop.utils.runtime import (
+    event_batch_size_override,
+    event_batch_window_override,
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
@@ -86,6 +88,16 @@ class NeonDeviceConfig:
             port_display = str(self.port) if self.port is not None else "-"
         id_display = self.device_id or "-"
         return f"{self.player}(ip={ip_display}, port={port_display}, id={id_display})"
+
+
+@dataclass
+class _QueuedEvent:
+    name: str
+    player: str
+    payload: Optional[Dict[str, Any]]
+    priority: Literal["high", "normal"]
+    t_ui_ns: int
+    t_enqueue_ns: int
 
 
 def _load_device_config(path: Path) -> Dict[str, NeonDeviceConfig]:
@@ -179,12 +191,10 @@ class PupilBridge:
         self._event_queue_drop = 0
         self._queue_sentinel: object = object()
         self._sender_stop = threading.Event()
-        self._event_queue: Optional[
-            queue.Queue[tuple[str, str, Optional[Dict[str, Any]]]]
-        ] = None
+        self._event_queue: Optional[queue.Queue[object]] = None
         self._sender_thread: Optional[threading.Thread] = None
-        self._event_batch_size = 10
-        self._event_batch_window = 0.02
+        self._event_batch_size = event_batch_size_override(4)
+        self._event_batch_window = event_batch_window_override(0.005)
         self._last_queue_log = 0.0
         self._last_send_log = 0.0
         self._offset_semantics_warned: set[str] = set()
@@ -1204,7 +1214,10 @@ class PupilBridge:
             if item is self._queue_sentinel or self._sender_stop.is_set():
                 self._event_queue.task_done()
                 break
-            batch: list[tuple[str, str, Optional[Dict[str, Any]]]] = [item]
+            if not isinstance(item, _QueuedEvent):
+                self._event_queue.task_done()
+                continue
+            batch: list[_QueuedEvent] = [item]
             deadline = time.perf_counter() + self._event_batch_window
             while len(batch) < self._event_batch_size:
                 remaining = deadline - time.perf_counter()
@@ -1221,7 +1234,8 @@ class PupilBridge:
                 if self._sender_stop.is_set():
                     self._event_queue.task_done()
                     break
-                batch.append(next_item)
+                if isinstance(next_item, _QueuedEvent):
+                    batch.append(next_item)
             self._flush_event_batch(batch)
             for _ in batch:
                 self._event_queue.task_done()
@@ -1233,22 +1247,17 @@ class PupilBridge:
                 item = self._event_queue.get_nowait()
             except queue.Empty:
                 break
-            if item is not self._queue_sentinel:
+            if item is not self._queue_sentinel and isinstance(item, _QueuedEvent):
                 self._flush_event_batch([item])
             self._event_queue.task_done()
 
-    def _flush_event_batch(
-        self, batch: list[tuple[str, str, Optional[Dict[str, Any]]]]
-    ) -> None:
+    def _flush_event_batch(self, batch: list[_QueuedEvent]) -> None:
         """Send a batch of queued events sequentially."""
         if not batch:
             return
         start = time.perf_counter()
-        for name, player, payload in batch:
-            try:
-                self._dispatch_event(name, player, payload)
-            except Exception:  # pragma: no cover - hardware dependent
-                log.exception("Failed to send event %s for %s", name, player)
+        for event in batch:
+            self._dispatch_with_metrics(event)
         if self._perf_logging:
             duration = (time.perf_counter() - start) * 1000.0
             if time.monotonic() - self._last_send_log >= 1.0:
@@ -1297,22 +1306,71 @@ class PupilBridge:
             return (0, 0)
         return (self._event_queue.qsize(), self._event_queue_maxsize)
 
+    def _dispatch_with_metrics(self, event: _QueuedEvent) -> None:
+        try:
+            self._dispatch_event(event.name, event.player, event.payload)
+        finally:
+            t_dispatch_ns = time.perf_counter_ns()
+            self._log_dispatch_latency(event, t_dispatch_ns)
+
+    def _log_dispatch_latency(
+        self, event: _QueuedEvent, t_dispatch_ns: int
+    ) -> None:
+        if not self._perf_logging:
+            return
+        log.debug(
+            "bridge latency %s/%s priority=%s t_ui=%d t_enqueue=%d t_dispatch=%d",
+            event.player,
+            event.name,
+            event.priority,
+            event.t_ui_ns,
+            event.t_enqueue_ns,
+            t_dispatch_ns,
+        )
+
     def send_event(
         self,
         name: str,
         player: str,
         payload: Optional[Dict[str, Any]] = None,
+        *,
+        priority: Literal["high", "normal"] = "normal",
     ) -> None:
         """Send an event to the player's device, encoding payload as JSON suffix."""
 
         prepared_payload = self._normalise_event_payload(payload)
 
-        if self._low_latency_disabled or self._event_queue is None:
-            self._dispatch_event(name, player, prepared_payload)
+        try:
+            t_ui_ns = int(prepared_payload.get("t_local_ns", 0))
+        except Exception:
+            t_ui_ns = time.perf_counter_ns()
+            prepared_payload["t_local_ns"] = t_ui_ns
+        event_priority: Literal["high", "normal"]
+        if priority == "high" or name.startswith(("sync.", "fix.")):
+            event_priority = "high"
+        else:
+            event_priority = "normal"
+
+        enqueue_ns = time.perf_counter_ns()
+        event = _QueuedEvent(
+            name=name,
+            player=player,
+            payload=prepared_payload,
+            priority=event_priority,
+            t_ui_ns=int(t_ui_ns),
+            t_enqueue_ns=enqueue_ns,
+        )
+
+        if (
+            self._low_latency_disabled
+            or self._event_queue is None
+            or event_priority == "high"
+        ):
+            self._dispatch_with_metrics(event)
             return
 
         try:
-            self._event_queue.put_nowait((name, player, prepared_payload))
+            self._event_queue.put_nowait(event)
         except queue.Full:
             self._event_queue_drop += 1
             log.warning(
@@ -1321,7 +1379,7 @@ class PupilBridge:
                 player,
                 self._event_queue_drop,
             )
-            self._dispatch_event(name, player, prepared_payload)
+            self._dispatch_with_metrics(event)
         else:
             if self._perf_logging and self._event_queue.maxsize:
                 load = self._event_queue.qsize() / self._event_queue.maxsize
@@ -1330,6 +1388,31 @@ class PupilBridge:
                         "Pupil event queue at %.0f%% capacity", load * 100.0
                     )
                     self._last_queue_log = time.monotonic()
+
+    def send_host_mirror(
+        self,
+        player: str,
+        event_id: str,
+        t_host_ns: int,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit a host-side timestamp mirror event for sync diagnostics."""
+
+        payload: Dict[str, Any] = {
+            "event_id": event_id,
+            "t_host_ns": int(t_host_ns),
+            "t_local_ns": int(t_host_ns),
+            "origin_player": player,
+            "origin_device": "host_mirror",
+        }
+        if extra:
+            payload.update(extra)
+        self.send_event(
+            "sync.host_ns",
+            player,
+            payload,
+            priority="high",
+        )
 
     def refine_event(
         self,

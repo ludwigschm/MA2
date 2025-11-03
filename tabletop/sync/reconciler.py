@@ -39,12 +39,27 @@ REREFINE_RMS_IMPROVEMENT_MS = 1.0
 REREFINE_CONF_IMPROVEMENT = 0.10
 
 @dataclass
+class _DeviceMarkerEvent:
+    device_ns: int
+    name: str
+    payload: Dict[str, Any]
+    ingest_ts: float
+
+
+@dataclass
+class _HostMirrorEvent:
+    host_ns: int
+    ingest_ts: float
+    payload: Dict[str, Any]
+
+
+@dataclass
 class _PlayerState:
     """Calibration state for a single player/device."""
 
     player: str
-    samples: Deque[Tuple[int, int, float]] = field(default_factory=deque)
-    raw_offsets: Deque[Tuple[int, int, float]] = field(default_factory=deque)
+    samples: Deque[Tuple[int, int, float, float]] = field(default_factory=deque)
+    raw_offsets: Deque[Tuple[int, int, float, float]] = field(default_factory=deque)
     intercept_ns: float = 0.0
     slope: float = 1.0
     rms_ns: float = 0.0
@@ -89,6 +104,11 @@ class TimeReconciler:
         bridge: PupilBridge,
         logger: EventLogger,
         window_size: int = 10,
+        *,
+        micro_refine_horizon_s: float = MICRO_REFINE_HORIZON_S,
+        micro_refine_offset_ms: float = MICRO_REFINE_OFFSET_MS,
+        marker_pair_weight: float = 2.5,
+        pending_pair_limit: int = 200,
     ) -> None:
         self._bridge = bridge
         self._logger = logger
@@ -109,11 +129,15 @@ class TimeReconciler:
         self._slope_epsilon = 5e-6
         self._huber_delta_ns = 5_000_000.0
         self._recency_tau = RECENCY_TAU_SECONDS
-        self._micro_refine_horizon_s = MICRO_REFINE_HORIZON_S
-        self._micro_refine_offset_ms = MICRO_REFINE_OFFSET_MS
+        self._micro_refine_horizon_s = float(micro_refine_horizon_s)
+        self._micro_refine_offset_ms = float(micro_refine_offset_ms)
         self._micro_refine_slope_max = self._slope_epsilon
         self._rerefine_window = REREFINE_EVENT_WINDOW
         self._rerefine_rate_limit_s = REREFINE_RATE_LIMIT_S
+        self._marker_pair_weight = max(0.5, float(marker_pair_weight))
+        self._pending_pair_limit = max(1, int(pending_pair_limit))
+        self._pending_device_markers: Dict[str, Dict[str, _DeviceMarkerEvent]] = {}
+        self._pending_host_mirrors: Dict[str, Dict[str, _HostMirrorEvent]] = {}
 
     # ------------------------------------------------------------------
     @property
@@ -149,6 +173,21 @@ class TimeReconciler:
     def on_event(self, event_id: str, t_local_ns: int) -> None:
         self._enqueue("event", event_id, int(t_local_ns))
 
+    def register_device_event(
+        self,
+        player: str,
+        name: str,
+        t_device_ns: int,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._enqueue(
+            "device_event",
+            player,
+            name,
+            int(t_device_ns),
+            dict(payload or {}),
+        )
+
     # ------------------------------------------------------------------
     def _enqueue(self, kind: str, *args: Any) -> None:
         try:
@@ -176,6 +215,14 @@ class TimeReconciler:
                     self._process_event(str(args[0]), int(args[1]))
                 elif kind == "rerefine":
                     self._perform_rerefine(str(args[0]))
+                elif kind == "device_event":
+                    payload = dict(args[3]) if len(args) > 3 else {}
+                    self._process_device_event(
+                        str(args[0]),
+                        str(args[1]),
+                        int(args[2]),
+                        payload,
+                    )
             except Exception:
                 log.exception("Error processing %s task", kind)
             finally:
@@ -194,6 +241,14 @@ class TimeReconciler:
                         self._process_event(str(args[0]), int(args[1]))
                     elif kind == "rerefine":
                         self._perform_rerefine(str(args[0]))
+                    elif kind == "device_event":
+                        payload = dict(args[3]) if len(args) > 3 else {}
+                        self._process_device_event(
+                            str(args[0]),
+                            str(args[1]),
+                            int(args[2]),
+                            payload,
+                        )
                 except Exception:
                     log.exception("Error processing %s during shutdown", kind)
             self._task_queue.task_done()
@@ -228,8 +283,101 @@ class TimeReconciler:
             len(offsets_ns),
         )
 
-    def _ingest_marker(self, player: str, t_local_ns: int, offset_ns: int) -> None:
-        ingest_ts = time.monotonic()
+    def _process_device_event(
+        self,
+        player: str,
+        name: str,
+        t_device_ns: int,
+        payload: Dict[str, Any],
+    ) -> None:
+        event_id_raw = payload.get("event_id") or payload.get("id")
+        if not event_id_raw:
+            return
+        event_id = str(event_id_raw)
+        now = time.monotonic()
+        if name == "sync.host_ns":
+            host_candidate = payload.get("t_host_ns", payload.get("t_local_ns"))
+            try:
+                host_ns = int(host_candidate)
+            except Exception:
+                return
+            with self._state_lock:
+                device_events = self._pending_device_markers.setdefault(player, {})
+                device_entry = device_events.pop(event_id, None)
+                if device_entry is None:
+                    mirrors = self._pending_host_mirrors.setdefault(player, {})
+                    mirrors[event_id] = _HostMirrorEvent(
+                        host_ns=host_ns,
+                        ingest_ts=now,
+                        payload=dict(payload),
+                    )
+                    self._prune_pending(mirrors)
+                    return
+            ingest_ts = min(now, device_entry.ingest_ts)
+            self._ingest_sync_pair(
+                player,
+                host_ns,
+                device_entry.device_ns,
+                weight=self._marker_pair_weight,
+                ingest_ts=ingest_ts,
+            )
+        elif name.startswith(("sync.", "fix.")):
+            with self._state_lock:
+                mirrors = self._pending_host_mirrors.setdefault(player, {})
+                mirror_entry = mirrors.pop(event_id, None)
+                if mirror_entry is None:
+                    device_events = self._pending_device_markers.setdefault(player, {})
+                    device_events[event_id] = _DeviceMarkerEvent(
+                        device_ns=int(t_device_ns),
+                        name=name,
+                        payload=dict(payload),
+                        ingest_ts=now,
+                    )
+                    self._prune_pending(device_events)
+                    return
+            ingest_ts = min(now, mirror_entry.ingest_ts)
+            self._ingest_sync_pair(
+                player,
+                mirror_entry.host_ns,
+                int(t_device_ns),
+                weight=self._marker_pair_weight,
+                ingest_ts=ingest_ts,
+            )
+
+    def _ingest_sync_pair(
+        self,
+        player: str,
+        t_host_ns: int,
+        t_device_ns: int,
+        *,
+        weight: float,
+        ingest_ts: Optional[float] = None,
+    ) -> None:
+        offset_ns = int(t_device_ns - t_host_ns)
+        self._ingest_marker(
+            player,
+            int(t_host_ns),
+            offset_ns,
+            weight=weight,
+            ingest_ts=ingest_ts,
+        )
+
+    def _prune_pending(self, mapping: Dict[str, Any]) -> None:
+        while len(mapping) > self._pending_pair_limit:
+            oldest_key = next(iter(mapping))
+            mapping.pop(oldest_key, None)
+
+    def _ingest_marker(
+        self,
+        player: str,
+        t_local_ns: int,
+        offset_ns: int,
+        *,
+        weight: float = 1.0,
+        ingest_ts: Optional[float] = None,
+    ) -> None:
+        ingest_ts = ingest_ts if ingest_ts is not None else time.monotonic()
+        sample_weight = max(float(weight), 0.001)
         with self._state_lock:
             state = self._player_states.get(player)
             if state is None:
@@ -250,7 +398,7 @@ class TimeReconciler:
             previous_samples = list(state.samples)
 
         raw_candidates = self._trimmed_raw_samples(
-            raw_samples, (t_local_ns, offset_ns, ingest_ts)
+            raw_samples, (int(t_local_ns), int(offset_ns), ingest_ts, sample_weight)
         )
 
         candidate_pos = self._raw_to_samples(raw_candidates, 1)
@@ -365,9 +513,12 @@ class TimeReconciler:
         trend = 0
         if pos_metrics is not None or neg_metrics is not None:
             weights = self._recency_weights(raw_candidates)
-            weighted_offset = sum(
-                w * offset for (_, offset, _), w in zip(raw_candidates, weights)
-            )
+            weighted_offset = 0.0
+            for ( _, offset, _, sample_weight), rec_weight in zip(
+                raw_candidates, weights
+            ):
+                combined = rec_weight * sample_weight
+                weighted_offset += combined * offset
             if (
                 chosen_metrics is not None
                 and abs(weighted_offset) > SIGN_WEIGHT_THRESHOLD_NS
@@ -530,9 +681,9 @@ class TimeReconciler:
 
     def _trimmed_raw_samples(
         self,
-        base: list[Tuple[int, int, float]],
-        sample: Tuple[int, int, float],
-    ) -> list[Tuple[int, int, float]]:
+        base: list[Tuple[int, int, float, float]],
+        sample: Tuple[int, int, float, float],
+    ) -> list[Tuple[int, int, float, float]]:
         samples = list(base)
         samples.append(sample)
         if len(samples) > self._window_size:
@@ -540,34 +691,39 @@ class TimeReconciler:
         return samples
 
     def _raw_to_samples(
-        self, raw: list[Tuple[int, int, float]], sign: int
-    ) -> list[Tuple[int, int, float]]:
-        result: list[Tuple[int, int, float]] = []
-        for t_local_ns, offset_ns, ingest_ts in raw:
+        self, raw: list[Tuple[int, int, float, float]], sign: int
+    ) -> list[Tuple[int, int, float, float]]:
+        result: list[Tuple[int, int, float, float]] = []
+        for t_local_ns, offset_ns, ingest_ts, weight in raw:
             device_ns = t_local_ns + sign * offset_ns
-            result.append((t_local_ns, device_ns, ingest_ts))
+            result.append((t_local_ns, device_ns, ingest_ts, weight))
         return result
 
     def _offset_residual(
         self,
-        raw: list[Tuple[int, int, float]],
+        raw: list[Tuple[int, int, float, float]],
         intercept: float,
         slope: float,
         sign: int,
     ) -> float:
         if not raw:
             return float("inf")
-        residuals = []
-        for t_local_ns, measured_offset, _ in raw:
+        weighted_error = 0.0
+        total_weight = 0.0
+        for t_local_ns, measured_offset, _, weight in raw:
             predicted_device = intercept + slope * t_local_ns
             predicted_raw = sign * (predicted_device - t_local_ns)
-            residuals.append(predicted_raw - measured_offset)
-        mean_square = sum(value * value for value in residuals) / len(residuals)
+            residual = predicted_raw - measured_offset
+            weighted_error += weight * (residual ** 2)
+            total_weight += weight
+        if total_weight <= 0:
+            return float("inf")
+        mean_square = weighted_error / total_weight
         return math.sqrt(mean_square)
 
     def _offset_alignment(
         self,
-        raw: list[Tuple[int, int, float]],
+        raw: list[Tuple[int, int, float, float]],
         intercept: float,
         slope: float,
         sign: int,
@@ -575,14 +731,18 @@ class TimeReconciler:
         if not raw:
             return 0.0
         alignment = 0.0
-        for t_local_ns, measured_offset, _ in raw:
+        total_weight = 0.0
+        for t_local_ns, measured_offset, _, weight in raw:
             predicted_device = intercept + slope * t_local_ns
             predicted_raw = sign * (predicted_device - t_local_ns)
-            alignment += predicted_raw * measured_offset
-        return alignment / len(raw)
+            alignment += weight * predicted_raw * measured_offset
+            total_weight += weight
+        if total_weight <= 0:
+            return 0.0
+        return alignment / total_weight
 
     def _evaluate_candidate(
-        self, samples: list[Tuple[int, int, float]]
+        self, samples: list[Tuple[int, int, float, float]]
     ) -> Optional["_FitMetrics"]:
         if len(samples) < 2:
             return None
@@ -673,7 +833,8 @@ class TimeReconciler:
         log_fn(
             (
                 "Mapping update %s: a=%.0fns b_raw=%.9f b=%.9f mode=%s "
-                "rms=%.3fms mad=%.3fms conf=%.3f gate=%.2f samples=%d v%s sign=%+d locked=%s weights=[%s]"
+                "rms=%.3fms rms_ns=%.0f mad=%.3fms conf=%.3f gate=%.2f "
+                "samples=%d v%s sign=%+d locked=%s weights=[%s]"
             ),
             player,
             metrics.intercept_ns,
@@ -681,6 +842,7 @@ class TimeReconciler:
             metrics.slope_applied,
             metrics.slope_mode,
             metrics.rms_ns / 1_000_000.0,
+            metrics.rms_ns,
             metrics.mad_ns / 1_000_000.0,
             confidence,
             confidence_gate,
@@ -927,11 +1089,14 @@ class TimeReconciler:
                 players = list(self._player_states.keys())
         return players
 
-    def _robust_fit(self, samples: list[Tuple[int, int, float]]) -> _FitMetrics:
-        xs = [float(a) for a, _, _ in samples]
-        ys = [float(b) for _, b, _ in samples]
+    def _robust_fit(self, samples: list[Tuple[int, int, float, float]]) -> _FitMetrics:
+        xs = [float(a) for a, _, _, _ in samples]
+        ys = [float(b) for _, b, _, _ in samples]
         recency_weights = self._recency_weights(samples)
-        weights = recency_weights[:]
+        base_weights = [max(weight, 0.0) for _, _, _, weight in samples]
+        weights = [bw * rw for bw, rw in zip(base_weights, recency_weights)]
+        if not any(weights):
+            weights = recency_weights[:] or [1.0 for _ in samples]
         intercept = ys[0]
         slope = 1.0
         for _ in range(6):
@@ -959,7 +1124,10 @@ class TimeReconciler:
                 else self._huber_delta_ns / max(abs(r), 1e-9)
                 for r in residuals
             ]
-            weights = [rec * hub for rec, hub in zip(recency_weights, huber_weights)]
+            weights = [
+                rec * hub * base
+                for rec, hub, base in zip(recency_weights, huber_weights, base_weights)
+            ]
 
         intercept_raw = intercept
         residuals_raw = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
@@ -1038,11 +1206,13 @@ class TimeReconciler:
         )
         return intercept_applied, slope_applied, mode
 
-    def _recency_weights(self, samples: list[Tuple[int, int, float]]) -> List[float]:
+    def _recency_weights(
+        self, samples: list[Tuple[int, int, float, float]]
+    ) -> List[float]:
         now = time.monotonic()
         tau = max(self._recency_tau, 1e-3)
         weights: List[float] = []
-        for _, _, ingest_ts in samples:
+        for _, _, ingest_ts, _ in samples:
             age = max(0.0, now - ingest_ts)
             weights.append(math.exp(-age / tau))
         return weights

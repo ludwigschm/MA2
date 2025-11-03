@@ -176,6 +176,51 @@ def test_reconciler_inverts_wrong_offset_sign(caplog: pytest.LogCaptureFixture) 
     assert any("Offset semantics inverted" in record.getMessage() for record in caplog.records)
 
 
+def test_reconciler_pairs_host_mirror_samples() -> None:
+    players = ["VP1"]
+    model = {"VP1": (15_000_000.0, 1.00002)}
+    bridge = _FakeBridge(players)
+    logger = _FakeLogger()
+    reconciler = TimeReconciler(
+        bridge,
+        logger,
+        window_size=25,
+        marker_pair_weight=3.0,
+    )
+
+    start_ns = 5_000_000_000
+    for index in range(30):
+        t_local_ns = start_ns + index * 40_000_000
+        _inject_marker(reconciler, bridge, players, model, t_local_ns)
+
+    for index in range(5):
+        event_id = f"sync{index}"
+        t_host_ns = start_ns + 500_000_000 + index * 10_000_000
+        intercept_ns, slope = model["VP1"]
+        device_ns = int(intercept_ns + slope * t_host_ns)
+        reconciler._process_device_event(
+            "VP1",
+            "sync.flash_start",
+            device_ns,
+            {"event_id": event_id},
+        )
+        reconciler._process_device_event(
+            "VP1",
+            "sync.host_ns",
+            device_ns + 1_000,
+            {"event_id": event_id, "t_host_ns": t_host_ns},
+        )
+
+    state = reconciler._player_states["VP1"]
+    assert state.sample_count >= 2
+    assert state.raw_offsets, "expected raw offsets from host mirror pairs"
+    last_weight = state.raw_offsets[-1][3]
+    assert pytest.approx(last_weight, rel=0.0, abs=1e-6) == reconciler._marker_pair_weight
+    expected_intercept = model["VP1"][0]
+    assert abs(state.intercept_ns - expected_intercept) < 5_000_000
+    assert state.confidence >= TimeReconciler.CONF_MIN
+
+
 def test_event_logger_supports_per_player_refinements(tmp_path: Path) -> None:
     db_path = tmp_path / "events.sqlite3"
     logger = EventLogger(str(db_path))
