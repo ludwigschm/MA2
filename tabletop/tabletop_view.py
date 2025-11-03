@@ -1372,8 +1372,12 @@ class TabletopRoot(FloatLayout):
             return
         if result.in_block_pause:
             self.in_block_pause = True
-            self.pause_message = self.controller.state.pause_message or ''
+            self.pause_message = self.controller.state.pause_message or (
+                "Dieser Block ist vorbei. Nehmen Sie sich einen Moment zum Durchatmen.\n"
+                "Wenn Sie bereit sind, klicken Sie auf Weiter."
+            )
             self.update_pause_overlay()
+            self.update_user_displays()
             return
 
         def start_round():
@@ -1665,10 +1669,7 @@ class TabletopRoot(FloatLayout):
         pause_cover = self.wid_safe('pause_cover')
         if pause_cover is None:
             return
-        active = (
-            self.in_block_pause
-            or self.session_finished
-        ) and bool(self.pause_message)
+        active = self.in_block_pause or self.session_finished
         buttons_active = self.in_block_pause
         if active:
             if pause_cover.parent is None:
