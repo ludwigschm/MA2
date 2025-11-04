@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import queue
@@ -12,6 +13,12 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Literal, Optional, Union
+
+from core.capabilities import CapabilityRegistry, DeviceCapabilities
+from core.device_registry import DeviceRegistry
+from core.event_router import EventRouter, UIEvent
+from core.recording import DeviceClient, RecordingController, RecordingHttpError
+from core.time_sync import TimeSyncManager
 
 try:  # pragma: no cover - optional dependency
     from pupil_labs.realtime_api.simple import Device, discover_devices
@@ -99,6 +106,74 @@ class _QueuedEvent:
     t_ui_ns: int
     t_enqueue_ns: int
 
+
+class _BridgeDeviceClient(DeviceClient):
+    """Adapter exposing async recording operations for :class:`RecordingController`."""
+
+    def __init__(
+        self,
+        bridge: "PupilBridge",
+        player: str,
+        device: Any,
+        cfg: NeonDeviceConfig,
+    ) -> None:
+        self._bridge = bridge
+        self._player = player
+        self._device = device
+        self._cfg = cfg
+
+    async def recording_start(self, *, label: str | None = None) -> None:
+        def _start() -> None:
+            if self._bridge._active_recording.get(self._player):
+                raise RecordingHttpError(400, "Already recording!")
+            success, _ = self._bridge._invoke_recording_start(
+                self._player, self._device
+            )
+            if not success:
+                raise RecordingHttpError(503, "recording start failed", transient=True)
+            if label:
+                self._bridge._apply_recording_label(
+                    self._player,
+                    self._device,
+                    label,
+                )
+            self._bridge._active_recording[self._player] = True
+
+        await asyncio.to_thread(_start)
+
+    async def recording_begin(self) -> None:
+        def _begin() -> None:
+            info = self._bridge._wait_for_notification(
+                self._device, "recording.begin", timeout=0.5
+            )
+            if info is None:
+                raise asyncio.TimeoutError()
+
+        await asyncio.to_thread(_begin)
+
+    async def recording_stop(self) -> None:
+        def _stop() -> None:
+            stopped = False
+            stop_fn = getattr(self._device, "recording_stop", None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                    stopped = True
+                except Exception:
+                    stopped = False
+            if not stopped:
+                self._bridge._post_device_api(
+                    self._player,
+                    "/api/recording",
+                    {"action": "STOP"},
+                    warn=False,
+                )
+            self._bridge._active_recording[self._player] = False
+
+        await asyncio.to_thread(_stop)
+
+    async def is_recording(self) -> bool:
+        return bool(self._bridge._active_recording.get(self._player))
 
 def _load_device_config(path: Path) -> Dict[str, NeonDeviceConfig]:
     configs: Dict[str, NeonDeviceConfig] = {
@@ -198,6 +273,28 @@ class PupilBridge:
         self._last_queue_log = 0.0
         self._last_send_log = 0.0
         self._offset_semantics_warned: set[str] = set()
+        self._device_registry = DeviceRegistry()
+        self._capabilities = CapabilityRegistry()
+        self._time_sync: Dict[str, TimeSyncManager] = {}
+        self._time_sync_tasks: Dict[str, asyncio.Future[None]] = {}
+        self._recording_controllers: Dict[str, RecordingController] = {}
+        self._active_router_player: Optional[str] = None
+        self._player_device_id: Dict[str, str] = {}
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._async_loop.run_forever,
+            name="PupilBridgeAsync",
+            daemon=True,
+        )
+        self._async_thread.start()
+        self._event_router = EventRouter(
+            self._on_routed_event,
+            batch_interval_s=self._event_batch_window,
+            max_batch=self._event_batch_size,
+            multi_route=False,
+        )
+        self._event_router.set_active_player("VP1")
+        self._active_router_player = "VP1"
         if not self._low_latency_disabled:
             self._event_queue = queue.Queue(maxsize=self._event_queue_maxsize)
             self._sender_thread = threading.Thread(
@@ -276,6 +373,7 @@ class PupilBridge:
                 cfg.port,
                 actual_id,
             )
+            self._on_device_connected(player, device, cfg, actual_id)
             self._auto_start_recording(player, device)
 
         if "VP1" in configured_players and self._device_by_player.get("VP1") is None:
@@ -402,22 +500,136 @@ class PupilBridge:
             log.info("recording.start übersprungen (%s bereits aktiv)", player)
             return
         label = f"auto.{player.lower()}.{int(time.time())}"
-        log.info("recording.start gesendet (%s, label=%s)", player, label)
-        begin_info = self._send_recording_start(player, device, label)
-        if begin_info is None:
-            log.warning("recording.begin Timeout (%s)", player)
-            return
+        controller = self._recording_controllers.get(player)
+        if controller is None:
+            cfg = self._device_config.get(player)
+            if cfg is None:
+                return
+            controller = self._build_recording_controller(player, device, cfg)
+            self._recording_controllers[player] = controller
 
-        recording_id = self._extract_recording_id(begin_info)
-        log.info("recording.begin bestätigt (%s, id=%s)", player, recording_id or "?")
+        async def orchestrate() -> None:
+            await controller.ensure_started(label=label)
+            await controller.begin_segment()
+
+        future = asyncio.run_coroutine_threadsafe(orchestrate(), self._async_loop)
+        try:
+            future.result(timeout=max(1.0, self._connect_timeout))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Auto recording start failed for %s: %s", player, exc)
+            return
 
         self._active_recording[player] = True
         self._recording_metadata[player] = {
             "player": player,
             "recording_label": label,
             "event": "auto_start",
-            "recording_id": recording_id,
+            "recording_id": None,
         }
+
+    def _on_device_connected(
+        self,
+        player: str,
+        device: Any,
+        cfg: NeonDeviceConfig,
+        device_id: str,
+    ) -> None:
+        endpoint = cfg.address or ""
+        if endpoint:
+            self._device_registry.confirm(endpoint, device_id)
+        self._player_device_id[player] = device_id
+        self._event_router.register_player(player)
+        if self._active_router_player is None:
+            self._event_router.set_active_player(player)
+            self._active_router_player = player
+        self._setup_time_sync(player, device_id, device)
+        self._recording_controllers[player] = self._build_recording_controller(
+            player, device, cfg
+        )
+        self._probe_capabilities(player, cfg, device_id)
+
+    def _setup_time_sync(self, player: str, device_id: str, device: Any) -> None:
+        async def measure(samples: int, timeout: float) -> list[float]:
+            estimator = getattr(device, "estimate_time_offset", None)
+            if not callable(estimator):
+                return []
+            offsets: list[float] = []
+            for _ in range(samples):
+                try:
+                    value = await asyncio.wait_for(
+                        asyncio.to_thread(estimator), timeout
+                    )
+                except asyncio.TimeoutError:
+                    break
+                except Exception:
+                    break
+                else:
+                    try:
+                        offsets.append(float(value))
+                    except Exception:
+                        continue
+            return offsets
+
+        manager = TimeSyncManager(
+            device_id=device_id or player,
+            measure_fn=measure,
+            max_samples=20,
+            sample_timeout=0.25,
+        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                manager.initial_sync(), self._async_loop
+            )
+            future.result(timeout=self._connect_timeout)
+        except Exception as exc:
+            log.warning("Initial time sync failed for %s: %s", player, exc)
+        self._time_sync[player] = manager
+        self._schedule_periodic_resync(player)
+
+    def _schedule_periodic_resync(self, player: str) -> None:
+        existing = self._time_sync_tasks.get(player)
+        if existing is not None:
+            existing.cancel()
+
+        manager = self._time_sync.get(player)
+        if manager is None:
+            return
+
+        async def periodic() -> None:
+            while True:
+                await asyncio.sleep(manager.resync_interval_s)
+                try:
+                    await manager.maybe_resync()
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.debug("time_sync resync failed for %s: %s", player, exc)
+
+        task = asyncio.run_coroutine_threadsafe(periodic(), self._async_loop)
+        self._time_sync_tasks[player] = task
+
+    def _build_recording_controller(
+        self, player: str, device: Any, cfg: NeonDeviceConfig
+    ) -> RecordingController:
+        client = _BridgeDeviceClient(self, player, device, cfg)
+        logger = logging.getLogger(f"{__name__}.recording.{player.lower()}")
+        return RecordingController(client, logger)
+
+    def _probe_capabilities(
+        self, player: str, cfg: NeonDeviceConfig, device_id: str
+    ) -> None:
+        identifier = device_id or player
+        supported = False
+        if requests is not None and cfg.ip and cfg.port is not None:
+            url = f"http://{cfg.ip}:{cfg.port}/api/frame_name"
+            try:
+                response = requests.options(url, timeout=self._http_timeout)
+            except Exception:
+                supported = False
+            else:
+                supported = response.status_code in {200, 204}
+        caps = DeviceCapabilities(frame_name_supported=supported)
+        self._capabilities.set(identifier, caps)
+        if not supported:
+            log.info("frame_name skipped (unsupported) device=%s", player)
 
     def _get_device_status(self, device: Any) -> Optional[Any]:
         for attr in ("api_status", "status", "get_status"):
@@ -755,6 +967,7 @@ class PupilBridge:
                     cfg.port,
                     actual_id,
                 )
+                self._on_device_connected(player, prepared, cfg, actual_id)
                 self._auto_start_recording(player, prepared)
             except Exception as exc:  # pragma: no cover - hardware dependent
                 log.warning("Gerät %s konnte nicht verbunden werden: %s", device_id, exc)
@@ -769,6 +982,34 @@ class PupilBridge:
     def close(self) -> None:
         """Close all connected devices if necessary."""
 
+        self._event_router.flush_all()
+        for future in list(self._time_sync_tasks.values()):
+            future.cancel()
+            try:
+                future.result()
+            except Exception:
+                pass
+        self._time_sync_tasks.clear()
+        self._time_sync.clear()
+        if self._async_loop.is_running():
+            async def _cancel_all() -> None:
+                for task in asyncio.all_tasks():
+                    if task is not asyncio.current_task():
+                        task.cancel()
+
+            stopper = asyncio.run_coroutine_threadsafe(_cancel_all(), self._async_loop)
+            try:
+                stopper.result()
+            except Exception:
+                pass
+        if self._async_loop.is_running():
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+        if self._async_thread.is_alive():
+            self._async_thread.join(timeout=1.0)
+        try:
+            self._async_loop.close()
+        except RuntimeError:
+            pass
         if self._event_queue is not None:
             self._sender_stop.set()
             try:
@@ -840,31 +1081,55 @@ class PupilBridge:
         vp_index = self._PLAYER_INDICES.get(player, 0)
         recording_label = f"{session}.{block}.{vp_index}"
 
-        log.info("recording.start gesendet (%s, label=%s)", player, recording_label)
-        begin_info = self._send_recording_start(
-            player,
-            device,
-            recording_label,
-            session=session,
-            block=block,
-        )
-        if begin_info is None:
-            log.warning("Timeout, retry/abort (%s)", player)
-            return
+        controller = self._recording_controllers.get(player)
+        if controller is None:
+            cfg = self._device_config.get(player)
+            if cfg is None:
+                log.info("recording.start übersprungen (%s ohne Konfig)", player)
+                return
+            controller = self._build_recording_controller(player, device, cfg)
+            self._recording_controllers[player] = controller
 
-        recording_id = self._extract_recording_id(begin_info)
-        log.info("recording.begin (%s, id=%s)", player, recording_id or "?")
+        log.info(
+            "recording start requested player=%s label=%s session=%s block=%s",
+            player,
+            recording_label,
+            session,
+            block,
+        )
+
+        async def orchestrate() -> None:
+            await controller.ensure_started(label=recording_label)
+            await controller.begin_segment()
+
+        future = asyncio.run_coroutine_threadsafe(orchestrate(), self._async_loop)
+        try:
+            future.result(timeout=max(1.0, self._connect_timeout))
+        except RecordingHttpError as exc:
+            log.warning(
+                "recording start failed player=%s status=%s msg=%s",
+                player,
+                exc.status,
+                exc.message,
+            )
+            return
+        except asyncio.TimeoutError:
+            log.warning("recording start timeout player=%s", player)
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("recording start error player=%s error=%s", player, exc)
+            return
 
         payload = {
             "session": session,
             "block": block,
             "player": player,
             "recording_label": recording_label,
-            "recording_id": recording_id,
+            "recording_id": None,
         }
-        self.send_event("session.recording_started", player, payload)
         self._active_recording[player] = True
         self._recording_metadata[player] = payload
+        self.send_event("session.recording_started", player, payload)
 
     def _send_recording_start(
         self,
@@ -1083,20 +1348,25 @@ class PupilBridge:
         if not label:
             return
 
-        response = self._post_device_api(
-            player,
-            "/api/frame_name",
-            {"frame_name": label},
-            warn=False,
-        )
-        if response is None:
-            log.warning("Setting frame_name failed for %s (no response)", player)
-        elif response.status_code != 200:
-            log.warning(
-                "Setting frame_name failed for %s (%s)",
+        identifier = self._player_device_id.get(player, "") or player
+        caps = self._capabilities.get(identifier)
+        if caps.frame_name_supported:
+            response = self._post_device_api(
                 player,
-                response.status_code,
+                "/api/frame_name",
+                {"frame_name": label},
+                warn=False,
             )
+            if response is None:
+                log.warning("Setting frame_name failed for %s (no response)", player)
+            elif response.status_code != 200:
+                log.warning(
+                    "Setting frame_name failed for %s (%s)",
+                    player,
+                    response.status_code,
+                )
+        else:
+            log.debug("frame_name skipped (unsupported) device=%s", player)
 
         payload: Dict[str, Any] = {"label": label}
         if session is not None:
@@ -1313,6 +1583,52 @@ class PupilBridge:
             t_dispatch_ns = time.perf_counter_ns()
             self._log_dispatch_latency(event, t_dispatch_ns)
 
+    def _on_routed_event(self, player: str, event: UIEvent) -> None:
+        payload_dict = dict(event.payload or {})
+        prepared_payload = self._normalise_event_payload(payload_dict)
+        try:
+            t_ui_ns = int(prepared_payload.get("t_local_ns", 0))
+        except Exception:
+            t_ui_ns = time.perf_counter_ns()
+            prepared_payload["t_local_ns"] = t_ui_ns
+        event_priority: Literal["high", "normal"]
+        if event.priority == "high" or event.name.startswith(("sync.", "fix.")):
+            event_priority = "high"
+        else:
+            event_priority = "normal"
+        enqueue_ns = time.perf_counter_ns()
+        queued = _QueuedEvent(
+            name=event.name,
+            player=player,
+            payload=prepared_payload,
+            priority=event_priority,
+            t_ui_ns=int(t_ui_ns),
+            t_enqueue_ns=enqueue_ns,
+        )
+        if self._low_latency_disabled or self._event_queue is None or event_priority == "high":
+            self._dispatch_with_metrics(queued)
+            return
+        try:
+            self._event_queue.put_nowait(queued)
+        except queue.Full:
+            self._event_queue_drop += 1
+            log.warning(
+                "Dropping Pupil event %s for %s – queue full (%d drops)",
+                event.name,
+                player,
+                self._event_queue_drop,
+            )
+            self._dispatch_with_metrics(queued)
+        else:
+            if self._perf_logging and self._event_queue.maxsize:
+                load = self._event_queue.qsize() / self._event_queue.maxsize
+                if load >= 0.8 and time.monotonic() - self._last_queue_log >= 1.0:
+                    log.warning(
+                        "Pupil event queue at %.0f%% capacity",
+                        load * 100.0,
+                    )
+                    self._last_queue_log = time.monotonic()
+
     def _log_dispatch_latency(
         self, event: _QueuedEvent, t_dispatch_ns: int
     ) -> None:
@@ -1338,56 +1654,18 @@ class PupilBridge:
     ) -> None:
         """Send an event to the player's device, encoding payload as JSON suffix."""
 
-        prepared_payload = self._normalise_event_payload(payload)
-
-        try:
-            t_ui_ns = int(prepared_payload.get("t_local_ns", 0))
-        except Exception:
-            t_ui_ns = time.perf_counter_ns()
-            prepared_payload["t_local_ns"] = t_ui_ns
-        event_priority: Literal["high", "normal"]
-        if priority == "high" or name.startswith(("sync.", "fix.")):
-            event_priority = "high"
-        else:
-            event_priority = "normal"
-
-        enqueue_ns = time.perf_counter_ns()
-        event = _QueuedEvent(
-            name=name,
-            player=player,
-            payload=prepared_payload,
-            priority=event_priority,
-            t_ui_ns=int(t_ui_ns),
-            t_enqueue_ns=enqueue_ns,
+        event_payload = dict(payload or {})
+        event_priority: Literal["high", "normal"] = (
+            "high" if priority == "high" else "normal"
         )
-
-        if (
-            self._low_latency_disabled
-            or self._event_queue is None
-            or event_priority == "high"
-        ):
-            self._dispatch_with_metrics(event)
-            return
-
-        try:
-            self._event_queue.put_nowait(event)
-        except queue.Full:
-            self._event_queue_drop += 1
-            log.warning(
-                "Dropping Pupil event %s for %s – queue full (%d drops)",
-                name,
-                player,
-                self._event_queue_drop,
-            )
-            self._dispatch_with_metrics(event)
-        else:
-            if self._perf_logging and self._event_queue.maxsize:
-                load = self._event_queue.qsize() / self._event_queue.maxsize
-                if load >= 0.8 and time.monotonic() - self._last_queue_log >= 1.0:
-                    log.warning(
-                        "Pupil event queue at %.0f%% capacity", load * 100.0
-                    )
-                    self._last_queue_log = time.monotonic()
+        ui_event = UIEvent(
+            name=name,
+            payload=event_payload,
+            target=player,
+            priority=event_priority,
+        )
+        self._event_router.register_player(player)
+        self._event_router.route(ui_event)
 
     def send_host_mirror(
         self,
@@ -1519,23 +1797,23 @@ class PupilBridge:
         reconciler lock the sign if required.
         """
 
-        device = self._device_by_player.get(player)
-        if device is None:
-            return None
-        estimator = getattr(device, "estimate_time_offset", None)
-        if not callable(estimator):
-            return None
+        manager = self._time_sync.get(player)
+        if manager is None:
+            device = self._device_by_player.get(player)
+            if device is None:
+                return None
+            device_id = self._player_device_id.get(player, "") or player
+            self._setup_time_sync(player, device_id, device)
+            manager = self._time_sync.get(player)
+            if manager is None:
+                return None
         try:
-            if player not in self._offset_semantics_warned:
-                log.warning(
-                    "Assuming estimate_time_offset for %s returns device_time - host_time",
-                    player,
-                )
-                self._offset_semantics_warned.add(player)
-            return float(estimator())
-        except Exception as exc:  # pragma: no cover - hardware dependent
-            log.exception("Failed to estimate time offset for %s: %s", player, exc)
-            return None
+            asyncio.run_coroutine_threadsafe(
+                manager.maybe_resync(), self._async_loop
+            )
+        except Exception:
+            pass
+        return manager.get_offset_s()
 
     def is_connected(self, player: str) -> bool:
         """Return whether the given player has an associated device."""

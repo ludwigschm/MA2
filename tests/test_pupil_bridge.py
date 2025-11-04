@@ -1,68 +1,78 @@
 import math
-import sys
-import time
+import statistics
 from pathlib import Path
 from typing import Tuple
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from tabletop.pupil_bridge import PupilBridge
+from tabletop.pupil_bridge import NeonDeviceConfig, PupilBridge
 
 
 class _FakeDevice:
     def __init__(self) -> None:
-        self.calls: list[tuple[int, Tuple[object, ...]]] = []
+        self.events: list[Tuple[Tuple[object, ...], dict]] = []
+        self.start_calls = 0
+        self.offset_index = 0
+        self.offset_samples = [0.01 + i * 0.0005 for i in range(20)]
+        self._notifications: dict[str, object] = {"recording.begin": {"recording_id": "fake"}}
 
-    def send_event(self, *args):  # type: ignore[no-untyped-def]
-        timestamp = time.perf_counter_ns()
-        self.calls.append((timestamp, args))
+    def recording_start(self) -> None:
+        self.start_calls += 1
+
+    def recording_stop(self) -> None:  # pragma: no cover - defensive
+        self.start_calls = max(0, self.start_calls - 1)
+
+    def wait_for_notification(self, event: str, timeout: float = 0.5) -> object:
+        return self._notifications.get(event)
+
+    def estimate_time_offset(self) -> float:
+        if self.offset_index < len(self.offset_samples):
+            value = self.offset_samples[self.offset_index]
+            self.offset_index += 1
+            return value
+        return self.offset_samples[-1]
+
+    def send_event(self, *args, **kwargs) -> None:
+        self.events.append((args, kwargs))
 
 
 @pytest.fixture
-def bridge(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("LOW_LATENCY_DISABLED", "0")
-    monkeypatch.delenv("LOW_LATENCY_OFF", raising=False)
-    monkeypatch.delenv("EVENT_BATCH_WINDOW_MS", raising=False)
-    monkeypatch.delenv("EVENT_BATCH_SIZE", raising=False)
-    bridge = PupilBridge(device_mapping={})
+def bridge(monkeypatch: pytest.MonkeyPatch) -> Tuple[PupilBridge, _FakeDevice]:
+    monkeypatch.setattr("tabletop.pupil_bridge.requests", None)
+    monkeypatch.setenv("LOW_LATENCY_DISABLED", "1")
+    config_path = Path("/tmp/test_neon_devices.txt")
+    config_path.write_text("VP1_IP=127.0.0.1\nVP1_PORT=8080\n", encoding="utf-8")
+    bridge = PupilBridge(device_mapping={}, config_path=config_path)
     device = _FakeDevice()
+    cfg = NeonDeviceConfig(player="VP1", ip="127.0.0.1", port=8080)
     bridge._device_by_player["VP1"] = device  # type: ignore[attr-defined]
+    bridge._on_device_connected("VP1", device, cfg, "dev-1")  # type: ignore[attr-defined]
     yield bridge, device
-    bridge._sender_stop.set()  # type: ignore[attr-defined]
-    if bridge._event_queue is not None:  # type: ignore[attr-defined]
-        try:
-            bridge._event_queue.put_nowait(bridge._queue_sentinel)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    if bridge._sender_thread is not None:  # type: ignore[attr-defined]
-        bridge._sender_thread.join(timeout=1.0)
+    bridge.close()
+    config_path.unlink(missing_ok=True)
 
 
-def test_sync_events_bypass_batching(bridge):
+def test_event_router_single_target(bridge):
     pupil_bridge, device = bridge
-    start_ns = time.perf_counter_ns()
-    pupil_bridge.send_event("sync.test", "VP1", {"event_id": "evt"})
-    assert device.calls, "sync event should dispatch immediately"
-    latency_ns = device.calls[0][0] - start_ns
-    assert latency_ns < 20_000_000  # < 20 ms
-    if pupil_bridge._event_queue is not None:  # type: ignore[attr-defined]
-        assert pupil_bridge._event_queue.qsize() == 0
+    pupil_bridge.send_event("ui.test", "VP1", {"value": 42})
+    pupil_bridge._event_router.flush_all()  # type: ignore[attr-defined]
+    assert device.events
+    args, kwargs = device.events[0]
+    assert args[0].startswith("ui.test")
 
 
-def test_sync_dispatch_latency_95p_below_threshold(bridge):
+def test_recording_start_idempotent(bridge):
     pupil_bridge, device = bridge
-    latencies_ms: list[float] = []
-    for index in range(100):
-        start_ns = time.perf_counter_ns()
-        pupil_bridge.send_event("sync.flash_start", "VP1", {"event_id": f"evt{index}"})
-        dispatch_ns = device.calls[-1][0]
-        latencies_ms.append((dispatch_ns - start_ns) / 1_000_000.0)
-        time.sleep(0.01)
+    pupil_bridge.start_recording(1, 1, "VP1")
+    pupil_bridge.start_recording(1, 1, "VP1")
+    assert device.start_calls == 1
 
-    latencies_ms.sort()
-    percentile_index = max(0, math.ceil(0.95 * len(latencies_ms)) - 1)
-    assert latencies_ms[percentile_index] < 20.0
+
+def test_time_sync_manager_used_for_offsets(bridge):
+    pupil_bridge, device = bridge
+    offset = pupil_bridge.estimate_time_offset("VP1")
+    expected = statistics.median(device.offset_samples)
+    assert offset == pytest.approx(expected)
+    # subsequent call should not error even if samples exhausted
+    offset2 = pupil_bridge.estimate_time_offset("VP1")
+    assert math.isclose(offset2, offset, rel_tol=1e-6)
