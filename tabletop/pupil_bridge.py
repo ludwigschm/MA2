@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Literal, Optional, Union
+from typing import Any, Callable, Dict, Iterable, Literal, Optional
 
 from core.capabilities import CapabilityRegistry, DeviceCapabilities
 from core.device_registry import DeviceRegistry
@@ -458,10 +458,16 @@ class PupilBridge:
                 log.error(message)
                 success = False
                 continue
+            device = self._connect_device_with_retries(player, cfg)
+            if device is None:
+                if player == "VP1":
+                    raise RuntimeError("VP1 konnte nicht verbunden werden: Verbindungsfehler")
+                success = False
+                continue
             try:
-                device = self._connect_device_with_retries(player, cfg)
                 actual_id = self._validate_device_identity(device, cfg)
             except Exception as exc:  # pragma: no cover - hardware dependent
+                self._close_device(device)
                 if player == "VP1":
                     raise RuntimeError(f"VP1 konnte nicht verbunden werden: {exc}") from exc
                 log.error("Verbindung zu VP2 fehlgeschlagen: %s", exc)
@@ -488,20 +494,34 @@ class PupilBridge:
             raise RuntimeError("VP1 ist konfiguriert, konnte aber nicht verbunden werden.")
         return success and (self._device_by_player.get("VP1") is not None)
 
-    def _connect_device_with_retries(self, player: str, cfg: NeonDeviceConfig) -> Any:
+    def _connect_device_with_retries(self, player: str, cfg: NeonDeviceConfig) -> Optional[Any]:
         delays = [1.0, 1.5, 2.0]
+        if not self._preflight_status(cfg):
+            log.error(
+                "Preflight to %s:%s failed (no /api/status). Skip connect.",
+                cfg.ip,
+                cfg.port,
+            )
+            return None
+
         last_error: Optional[BaseException] = None
         for attempt in range(1, 4):
             log.info("Verbinde mit ip=%s, port=%s (Versuch %s/3)", cfg.ip, cfg.port, attempt)
             try:
-                device = self._connect_device_once(cfg)
-                return self._ensure_device_connection(device)
+                return self._connect_device_once(cfg)
             except Exception as exc:
                 last_error = exc
-                log.error("Verbindungsversuch %s/3 für %s fehlgeschlagen: %s", attempt, player, exc)
+                log.error(
+                    "Verbindungsversuch %s/3 für %s fehlgeschlagen: %s",
+                    attempt,
+                    player,
+                    exc,
+                )
                 if attempt < 3:
                     time.sleep(delays[attempt - 1])
-        raise last_error if last_error else RuntimeError("Unbekannter Verbindungsfehler")
+        if last_error:
+            log.error("Verbindung für %s endgültig fehlgeschlagen: %s", player, last_error)
+        return None
 
     def _connect_device_once(self, cfg: NeonDeviceConfig) -> Any:
         assert Device is not None  # guarded by caller
@@ -510,33 +530,58 @@ class PupilBridge:
 
         ip = cfg.ip
         port = int(cfg.port)
-        first_error: Optional[BaseException] = None
+        device: Any = self._create_device(cfg)
         try:
-            return Device(ip, port)
-        except Exception as exc:
-            first_error = exc
-            log.error(
-                "Device(ip, port) fehlgeschlagen (%s) – versuche Keyword-Signatur.",
-                exc,
-            )
-
-        try:
-            return Device(ip=ip, port=port)
-        except Exception as exc:
-            if first_error:
-                raise RuntimeError(
-                    f"Device konnte nicht initialisiert werden: {first_error}; {exc}"
-                ) from exc
+            return self._ensure_device_connection(device)
+        except Exception:
+            self._close_device(device)
             raise
 
     def _ensure_device_connection(self, device: Any) -> Any:
-        connect_fn = getattr(device, "connect", None)
-        if callable(connect_fn):
+        for attr in ("connect", "open"):
+            fn = getattr(device, attr, None)
+            if not callable(fn):
+                continue
             try:
-                connect_fn()
+                fn()
             except TypeError:
-                connect_fn(device)
+                fn(device)
         return device
+
+    def _preflight_status(self, cfg: NeonDeviceConfig, timeout: float = 1.5) -> bool:
+        if requests is None:
+            return True
+        if not cfg.ip or cfg.port is None:
+            return False
+        url = f"http://{cfg.ip}:{cfg.port}/api/status"
+        try:
+            response = requests.get(url, timeout=timeout)
+        except Exception:
+            return False
+        return response.status_code == 200
+
+    def _create_device(self, cfg: NeonDeviceConfig) -> Any:
+        assert Device is not None  # guarded by caller
+        if not cfg.ip or cfg.port is None:
+            raise RuntimeError("IP oder Port fehlen für den Verbindungsaufbau")
+
+        attempts = (
+            ((cfg.ip, int(cfg.port)), {}),
+            ((cfg.ip,), {"port": int(cfg.port)}),
+            ((), {"address": cfg.ip, "port": int(cfg.port)}),
+            ((f"http://{cfg.ip}:{int(cfg.port)}",), {}),
+        )
+
+        collected: list[str] = []
+        for args, kwargs in attempts:
+            try:
+                return Device(*args, **kwargs)
+            except TypeError as exc:
+                collected.append(str(exc))
+                continue
+        raise TypeError(
+            "Device constructor does not support any known signature: " + "; ".join(collected)
+        )
 
     def _close_device(self, device: Any) -> None:
         for attr in ("disconnect", "close"):
@@ -690,19 +735,23 @@ class PupilBridge:
                     start_fn(device)
                 except Exception:
                     log.debug(
-                        "Eye tracker start via %s failed for %s", method_name, player, exc_info=True
+                        "Eye tracker start via %s failed for %s",
+                        method_name,
+                        player,
+                        exc_info=True,
                     )
                 else:
-                    log.debug(
-                        "Eye tracker started via %s for %s", method_name, player
-                    )
+                    log.info("Eye tracker started via %s for %s", method_name, player)
                     return True
             except Exception:
                 log.debug(
-                    "Eye tracker start via %s failed for %s", method_name, player, exc_info=True
+                    "Eye tracker start via %s failed for %s",
+                    method_name,
+                    player,
+                    exc_info=True,
                 )
             else:
-                log.debug("Eye tracker started via %s for %s", method_name, player)
+                log.info("Eye tracker started via %s for %s", method_name, player)
                 return True
 
         command_fn = getattr(device, "send_command", None)
@@ -715,7 +764,7 @@ class PupilBridge:
                         "Eye tracker command %s failed for %s", command, player, exc_info=True
                     )
                 else:
-                    log.debug("Eye tracker command %s acknowledged for %s", command, player)
+                    log.info("Eye tracker command %s acknowledged for %s", command, player)
                     return True
 
         notif = getattr(device, "notifications", None)
@@ -893,9 +942,41 @@ class PupilBridge:
         device = self._device_by_player.get(player)
         if device is None:
             return
-        self._auto_start_recording(player, device, allow_continuous=True)
-        if self._active_recording.get(player):
-            self._continuous_recording_players.add(player)
+        cfg = self._device_config.get(player)
+        if cfg is None:
+            log.warning("Continuous recording not configured for %s", player)
+            return
+
+        self.wait_for_time_sync_ready(player, timeout_s=1.0)
+
+        started, payload = self._start_recording_via_rest(cfg)
+        if not started:
+            log.warning("Continuous recording start failed for %s", player)
+            return
+
+        recording_id = self._extract_recording_id(payload) if payload else None
+        label = None
+        if payload:
+            label = (
+                str(payload.get("label") or payload.get("name") or payload.get("recording"))
+                if isinstance(payload, dict)
+                else None
+            )
+        if not label:
+            label = f"continuous.{player.lower()}"
+        metadata: Dict[str, Any] = {
+            "player": player,
+            "recording_label": label,
+            "recording_id": recording_id,
+            "mode": "continuous",
+        }
+        if payload:
+            metadata["recording_payload"] = payload
+
+        self._active_recording[player] = True
+        self._recording_metadata[player] = metadata
+        self._continuous_recording_players.add(player)
+        self.send_event("session.recording_started", player, metadata)
 
     def _schedule_periodic_resync(self, player: str) -> None:
         existing = self._time_sync_tasks.get(player)
@@ -1679,28 +1760,32 @@ class PupilBridge:
                 )
                 return False, None
 
-        rest_status, rest_payload = self._start_recording_via_rest(player)
-        if rest_status == "busy" and allow_busy_recovery:
-            if self._handle_busy_state(player, device):
-                return self._invoke_recording_start(player, device, allow_busy_recovery=False)
-            return False, None
-        if rest_status == "already_recording" and allow_busy_recovery:
-            if self._recover_from_already_recording(player, device):
-                return self._invoke_recording_start(player, device, allow_busy_recovery=False)
-            return False, None
-        if rest_status is True:
+        cfg = self._device_config.get(player)
+        rest_success = False
+        rest_payload: Optional[Any] = None
+        if cfg is not None and cfg.ip and cfg.port is not None:
+            rest_success, rest_payload = self._start_recording_via_rest(cfg)
+        elif cfg is None:
+            log.debug("REST recording start skipped (%s: keine Konfiguration)", player)
+        else:
+            log.debug("REST recording start übersprungen (%s: fehlende IP/Port)", player)
+
+        if rest_success:
             return True, rest_payload
         log.error("No recording start method succeeded for %s", player)
         return False, None
 
-    def _start_recording_via_rest(self, player: str) -> tuple[Optional[Union[str, bool]], Optional[Any]]:
+    def _start_recording_via_rest(
+        self, cfg: NeonDeviceConfig
+    ) -> tuple[bool, Optional[Dict[str, Any]]]:
         if requests is None:
-            log.debug("requests not available – cannot start recording via REST (%s)", player)
-            return False, None
-        cfg = self._device_config.get(player)
-        if cfg is None or not cfg.ip or cfg.port is None:
-            log.debug("REST recording start skipped (%s: no IP/port)", player)
-            return False, None
+            log.debug(
+                "requests not available – cannot start recording via REST (%s)", cfg.player
+            )
+            return (False, None)
+        if not cfg.ip or cfg.port is None:
+            log.debug("REST recording start skipped (%s: no IP/port)", cfg.player)
+            return (False, None)
 
         base_url = f"http://{cfg.ip}:{cfg.port}"
         candidates: tuple[tuple[str, Optional[Dict[str, Any]]], ...] = (
@@ -1712,67 +1797,48 @@ class PupilBridge:
         )
 
         last_status: Optional[int] = None
-        last_message: Optional[str] = None
+        last_body: Optional[str] = None
 
         for path, payload in candidates:
             url = f"{base_url}{path}"
-            json_payload = payload or {}
+            body = payload or {}
             try:
-                response = requests.post(
-                    url,
-                    json=json_payload,
-                    timeout=self._http_timeout,
-                )
+                response = requests.post(url, json=body, timeout=self._http_timeout)
             except Exception:
                 log.debug(
-                    "REST recording start via %s failed for %s", path, player, exc_info=True
+                    "REST recording start via %s failed for %s", path, cfg.player, exc_info=True
                 )
                 continue
 
             if response.status_code in (200, 204):
-                meta: Optional[Any]
+                metadata: Optional[Dict[str, Any]]
                 if response.status_code == 204:
-                    meta = None
+                    metadata = None
                 else:
                     try:
-                        meta = response.json()
+                        parsed = response.json()
                     except ValueError:
-                        meta = None
+                        metadata = None
+                    else:
+                        metadata = parsed if isinstance(parsed, dict) else None
                 log.info("Recording start OK via %s", path)
-                return True, meta
-
-            message: Optional[str] = None
-            try:
-                data = response.json()
-                if isinstance(data, dict):
-                    message = str(data.get("message") or data.get("error") or "")
-            except ValueError:
-                text = response.text.strip()
-                message = text or None
-
-            if message:
-                lowered = message.lower()
-                if "previous recording not completed" in lowered:
-                    log.warning("Recording start busy for %s: %s", player, message)
-                    return "busy", None
-                if "already recording" in lowered:
-                    log.warning("Already recording! (%s) %s", player, message)
-                    return "already_recording", None
+                return True, metadata
 
             last_status = response.status_code
-            last_message = message or response.text
+            last_body = response.text.strip()
 
         log.warning(
-            "Recording start FAILED for %s:%s (no compatible REST dialect found)",
+            "Recording start FAILED for %s:%s (no compatible REST dialect)",
             cfg.ip,
             cfg.port,
         )
         if last_status is not None:
             log.debug(
-                "Last REST response for %s: status=%s body=%r",
-                player,
+                "Last REST response for %s:%s status=%s body=%r",
+                cfg.ip,
+                cfg.port,
                 last_status,
-                last_message,
+                last_body,
             )
         return False, None
 
