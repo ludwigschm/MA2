@@ -53,7 +53,7 @@ from tabletop.utils.runtime import (
 CONFIG_TEMPLATE = """# Neon Geräte-Konfiguration
 
 VP1_ID=
-VP1_IP=192.168.137.121
+VP1_IP=
 VP1_PORT=8080
 
 VP2_ID=
@@ -497,12 +497,11 @@ class PupilBridge:
     def _connect_device_with_retries(self, player: str, cfg: NeonDeviceConfig) -> Optional[Any]:
         delays = [1.0, 1.5, 2.0]
         if not self._preflight_status(cfg):
-            log.error(
-                "Preflight to %s:%s failed (no /api/status). Skip connect.",
+            log.warning(
+                "Preflight to %s:%s failed (no /api/status). Will try direct connect.",
                 cfg.ip,
                 cfg.port,
             )
-            return None
 
         last_error: Optional[BaseException] = None
         for attempt in range(1, 4):
@@ -553,12 +552,19 @@ class PupilBridge:
             return True
         if not cfg.ip or cfg.port is None:
             return False
-        url = f"http://{cfg.ip}:{cfg.port}/api/status"
-        try:
-            response = requests.get(url, timeout=timeout)
-        except Exception:
-            return False
-        return response.status_code == 200
+        urls = [
+            f"http://{cfg.ip}:{cfg.port}/api/status",
+            f"http://{cfg.ip}:{cfg.port}/status",
+        ]
+        for url in urls:
+            try:
+                response = requests.get(url, timeout=timeout)
+            except Exception:
+                continue
+            if response.status_code == 200:
+                return True
+        log.debug("Preflight status endpoints not reachable for %s:%s", cfg.ip, cfg.port)
+        return False
 
     def _create_device(self, cfg: NeonDeviceConfig) -> Any:
         assert Device is not None  # guarded by caller
@@ -608,12 +614,17 @@ class PupilBridge:
                 response.raise_for_status()
                 status = response.json()
             except Exception as exc:
-                log.error("HTTP-Statusabfrage %s fehlgeschlagen: %s", url, exc)
+                log.debug("HTTP-Statusabfrage %s fehlgeschlagen: %s", url, exc, exc_info=True)
 
         if status is None:
-            raise RuntimeError("/api/status konnte nicht abgerufen werden")
-
-        device_id, module_serial = self._extract_identity_fields(status)
+            self._warn_device_id_once(
+                f"status_unavailable::{cfg.player}",
+                "Status-Endpoint nicht erreichbar; validiere nur über Konfiguration/IP.",
+            )
+            device_id = ""
+            module_serial = ""
+        else:
+            device_id, module_serial = self._extract_identity_fields(status)
         expected_raw = (cfg.device_id or "").strip()
         expected_hex = self._extract_hex_device_id(expected_raw)
 
