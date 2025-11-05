@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import asyncio
 import json
 import logging
@@ -295,6 +296,9 @@ class PupilBridge:
         self._active_router_player: Optional[str] = None
         self._player_device_id: Dict[str, str] = {}
         self._time_sync_ready: set[str] = set()
+        self._eye_tracker_started: Dict[str, bool] = {"VP1": False, "VP2": False}
+        self._continuous_recording_players: set[str] = set()
+        self._atexit_registered = False
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(
             target=self._async_loop.run_forever,
@@ -302,6 +306,9 @@ class PupilBridge:
             daemon=True,
         )
         self._async_thread.start()
+        if CONTINUOUS_RECORDING_MODE:
+            log.info("Continuous recording mode active – recording runs until shutdown.")
+            self._register_shutdown_hook()
         self._event_router = EventRouter(
             self._on_routed_event,
             batch_interval_s=self._event_batch_window,
@@ -330,6 +337,78 @@ class PupilBridge:
         if configured_players:
             return self._connect_from_config(configured_players)
         return self._connect_via_discovery()
+
+    def _register_shutdown_hook(self) -> None:
+        if self._atexit_registered:
+            return
+
+        def shutdown_session() -> None:
+            for player, device in list(self._device_by_player.items()):
+                if device is None:
+                    continue
+                try:
+                    self._send_shutdown_commands(player, device)
+                except Exception:
+                    log.debug(
+                        "Shutdown command dispatch failed for %s", player, exc_info=True
+                    )
+                time.sleep(0.1)
+
+        atexit.register(shutdown_session)
+        self._atexit_registered = True
+
+    def _send_shutdown_commands(self, player: str, device: Any) -> None:
+        command_fn = getattr(device, "send_command", None)
+        command_success = False
+        if callable(command_fn):
+            for command in ("stop_recording", "save_recording"):
+                try:
+                    command_fn(command)
+                except TypeError:
+                    try:
+                        command_fn(command, None)
+                    except Exception:
+                        log.debug(
+                            "send_command %s failed for %s", command, player, exc_info=True
+                        )
+                    else:
+                        command_success = True
+                except Exception:
+                    log.debug(
+                        "send_command %s failed for %s", command, player, exc_info=True
+                    )
+                else:
+                    command_success = True
+
+        if not command_success:
+            stop_fn = getattr(device, "recording_stop_and_save", None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                    command_success = True
+                except Exception:
+                    log.debug(
+                        "recording_stop_and_save failed for %s", player, exc_info=True
+                    )
+
+        if not command_success:
+            for action in ("STOP", "SAVE"):
+                response = self._post_device_api(
+                    player,
+                    "/api/recording",
+                    {"action": action},
+                    warn=False,
+                )
+                if response is not None and getattr(response, "status_code", None) == 200:
+                    command_success = True
+                else:
+                    status = getattr(response, "status_code", None) if response is not None else None
+                    log.debug(
+                        "REST %s command failed for %s (status=%s)",
+                        action,
+                        player,
+                        status,
+                    )
 
     def _validate_config(self) -> None:
         vp1 = self._device_config.get("VP1")
@@ -390,6 +469,8 @@ class PupilBridge:
             )
             self._on_device_connected(player, device, cfg, actual_id)
             self._auto_start_recording(player, device)
+
+        self._auto_start_eye_trackers()
 
         if "VP1" in configured_players and self._device_by_player.get("VP1") is None:
             raise RuntimeError("VP1 ist konfiguriert, konnte aber nicht verbunden werden.")
@@ -510,7 +591,9 @@ class PupilBridge:
 
         return module_serial or ""
 
-    def _auto_start_recording(self, player: str, device: Any) -> None:
+    def _auto_start_recording(self, player: str, device: Any, *, allow_continuous: bool = False) -> None:
+        if CONTINUOUS_RECORDING_MODE and not allow_continuous:
+            return
         if self._active_recording.get(player):
             log.info("recording.start übersprungen (%s bereits aktiv)", player)
             return
@@ -543,6 +626,74 @@ class PupilBridge:
             "event": "auto_start",
             "recording_id": None,
         }
+
+    def _auto_start_eye_trackers(self) -> None:
+        if not AUTO_START_EYETRACKER:
+            return
+
+        attempted = False
+        started_any = False
+        for player, device in self._device_by_player.items():
+            if device is None:
+                continue
+            if self._eye_tracker_started.get(player):
+                continue
+            attempted = True
+            if self._start_eye_tracker_for_device(player, device):
+                self._eye_tracker_started[player] = True
+                started_any = True
+        if attempted and started_any:
+            log.info("Eye-Tracker auto-started on all connected devices.")
+
+    def _start_eye_tracker_for_device(self, player: str, device: Any) -> bool:
+        start_methods = (
+            "start_eye_tracker",
+            "start_eye_tracking",
+            "start_eye_streams",
+            "start_eye_stream",
+            "start_eye",
+        )
+        for method_name in start_methods:
+            start_fn = getattr(device, method_name, None)
+            if not callable(start_fn):
+                continue
+            try:
+                start_fn()
+            except TypeError:
+                try:
+                    start_fn(device)
+                except Exception:
+                    log.debug(
+                        "Eye tracker start via %s failed for %s", method_name, player, exc_info=True
+                    )
+                else:
+                    log.debug(
+                        "Eye tracker started via %s for %s", method_name, player
+                    )
+                    return True
+            except Exception:
+                log.debug(
+                    "Eye tracker start via %s failed for %s", method_name, player, exc_info=True
+                )
+            else:
+                log.debug("Eye tracker started via %s for %s", method_name, player)
+                return True
+
+        command_fn = getattr(device, "send_command", None)
+        if callable(command_fn):
+            for command in ("start_eye_tracker", "start_eye_tracking", "eye_process.should_start"):
+                try:
+                    command_fn(command)
+                except Exception:
+                    log.debug(
+                        "Eye tracker command %s failed for %s", command, player, exc_info=True
+                    )
+                else:
+                    log.debug("Eye tracker command %s acknowledged for %s", command, player)
+                    return True
+
+        log.warning("Eye tracker auto-start not supported for %s", player)
+        return False
 
     def _on_device_connected(
         self,
@@ -601,7 +752,19 @@ class PupilBridge:
         except Exception as exc:
             log.warning("Initial time sync failed for %s: %s", player, exc)
         self._time_sync[player] = manager
+        if self._time_sync_manager_ready(manager):
+            if player not in self._time_sync_ready:
+                self._time_sync_ready.add(player)
+                self._on_time_sync_ready(player)
         self._schedule_periodic_resync(player)
+
+    def _time_sync_manager_ready(self, manager: TimeSyncManager) -> bool:
+        state = getattr(manager, "_state", None)
+        if not state:
+            return False
+        sample_count = getattr(state, "sample_count", 0)
+        last_sync = getattr(state, "last_sync_ts", 0.0)
+        return bool(sample_count and last_sync)
 
     def wait_for_time_sync_ready(
         self, player: str, timeout_s: float = 5.0, poll_ms: int = 100
@@ -621,11 +784,10 @@ class PupilBridge:
                     self._setup_time_sync(player, device_id, device)
                     manager = self._time_sync.get(player)
             if manager is not None:
-                state = getattr(manager, "_state", None)
-                sample_count = getattr(state, "sample_count", 0) if state else 0
-                last_sync = getattr(state, "last_sync_ts", 0.0) if state else 0.0
-                if sample_count and last_sync:
-                    self._time_sync_ready.add(player)
+                if self._time_sync_manager_ready(manager):
+                    if player not in self._time_sync_ready:
+                        self._time_sync_ready.add(player)
+                        self._on_time_sync_ready(player)
                     return True
                 try:
                     future = asyncio.run_coroutine_threadsafe(
@@ -641,6 +803,22 @@ class PupilBridge:
             "time_sync readiness timeout player=%s after %.1fs", player, timeout_s
         )
         return False
+
+    def _on_time_sync_ready(self, player: str) -> None:
+        if CONTINUOUS_RECORDING_MODE:
+            self._ensure_continuous_recording(player)
+
+    def _ensure_continuous_recording(self, player: str) -> None:
+        if not CONTINUOUS_RECORDING_MODE:
+            return
+        if player in self._continuous_recording_players:
+            return
+        device = self._device_by_player.get(player)
+        if device is None:
+            return
+        self._auto_start_recording(player, device, allow_continuous=True)
+        if self._active_recording.get(player):
+            self._continuous_recording_players.add(player)
 
     def _schedule_periodic_resync(self, player: str) -> None:
         existing = self._time_sync_tasks.get(player)
@@ -1028,6 +1206,8 @@ class PupilBridge:
             except Exception as exc:  # pragma: no cover - hardware dependent
                 log.warning("Gerät %s konnte nicht verbunden werden: %s", device_id, exc)
 
+        self._auto_start_eye_trackers()
+
         missing_players = [player for player, device in self._device_by_player.items() if device is None]
         if missing_players:
             log.warning(
@@ -1091,6 +1271,9 @@ class PupilBridge:
         for player in list(self._active_recording):
             self._active_recording[player] = False
         self._recording_metadata.clear()
+        for player in list(self._eye_tracker_started):
+            self._eye_tracker_started[player] = False
+        self._continuous_recording_players.clear()
 
     # ------------------------------------------------------------------
     # Recording helpers
@@ -1130,6 +1313,12 @@ class PupilBridge:
 
     def start_recording(self, session: int, block: int, player: str) -> None:
         """Start a recording for the given player using the agreed label schema."""
+
+        if CONTINUOUS_RECORDING_MODE:
+            log.debug(
+                "start_recording ignored for %s (continuous recording mode)", player
+            )
+            return
 
         device = self._device_by_player.get(player)
         if device is None:
@@ -1607,6 +1796,12 @@ class PupilBridge:
 
     def stop_recording(self, player: str) -> None:
         """Stop the active recording for the player if possible."""
+
+        if CONTINUOUS_RECORDING_MODE:
+            log.debug(
+                "stop_recording ignored for %s (continuous recording mode)", player
+            )
+            return
 
         device = self._device_by_player.get(player)
         if device is None:
