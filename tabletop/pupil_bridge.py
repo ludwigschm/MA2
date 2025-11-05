@@ -133,8 +133,12 @@ class _BridgeDeviceClient(DeviceClient):
 
     async def recording_start(self, *, label: str | None = None) -> None:
         def _start() -> None:
-            if self._bridge._active_recording.get(self._player):
-                raise RecordingHttpError(400, "Already recording!")
+            self._bridge.wait_for_time_sync_ready(self._player)
+            if self._bridge._device_is_recording(self._player, self._device):
+                if not self._bridge._recover_from_already_recording(
+                    self._player, self._device
+                ):
+                    raise RecordingHttpError(400, "Already recording!")
             success, _ = self._bridge._invoke_recording_start(
                 self._player, self._device
             )
@@ -290,6 +294,7 @@ class PupilBridge:
         self._recording_controllers: Dict[str, RecordingController] = {}
         self._active_router_player: Optional[str] = None
         self._player_device_id: Dict[str, str] = {}
+        self._time_sync_ready: set[str] = set()
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(
             target=self._async_loop.run_forever,
@@ -520,7 +525,9 @@ class PupilBridge:
 
         async def orchestrate() -> None:
             await controller.ensure_started(label=label)
-            await controller.begin_segment()
+            await controller.begin_segment(
+                deadline_ms=RECORDING_BEGIN_TIMEOUT_MS
+            )
 
         future = asyncio.run_coroutine_threadsafe(orchestrate(), self._async_loop)
         try:
@@ -595,6 +602,45 @@ class PupilBridge:
             log.warning("Initial time sync failed for %s: %s", player, exc)
         self._time_sync[player] = manager
         self._schedule_periodic_resync(player)
+
+    def wait_for_time_sync_ready(
+        self, player: str, timeout_s: float = 5.0, poll_ms: int = 100
+    ) -> bool:
+        if player in self._time_sync_ready:
+            return True
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        poll_s = max(0.01, float(poll_ms) / 1000.0)
+
+        while time.monotonic() < deadline:
+            manager = self._time_sync.get(player)
+            if manager is None:
+                device = self._device_by_player.get(player)
+                if device is not None:
+                    device_id = self._player_device_id.get(player, "") or player
+                    self._setup_time_sync(player, device_id, device)
+                    manager = self._time_sync.get(player)
+            if manager is not None:
+                state = getattr(manager, "_state", None)
+                sample_count = getattr(state, "sample_count", 0) if state else 0
+                last_sync = getattr(state, "last_sync_ts", 0.0) if state else 0.0
+                if sample_count and last_sync:
+                    self._time_sync_ready.add(player)
+                    return True
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        manager.maybe_resync(), self._async_loop
+                    )
+                    remaining = max(0.05, deadline - time.monotonic())
+                    future.result(timeout=min(remaining, 0.5))
+                except Exception:
+                    pass
+            time.sleep(poll_s)
+
+        log.info(
+            "time_sync readiness timeout player=%s after %.1fs", player, timeout_s
+        )
+        return False
 
     def _schedule_periodic_resync(self, player: str) -> None:
         existing = self._time_sync_tasks.get(player)
@@ -1001,6 +1047,7 @@ class PupilBridge:
                 pass
         self._time_sync_tasks.clear()
         self._time_sync.clear()
+        self._time_sync_ready.clear()
         if self._async_loop.is_running():
             async def _cancel_all() -> None:
                 for task in asyncio.all_tasks():
@@ -1070,7 +1117,12 @@ class PupilBridge:
             return set()
 
         started: set[str] = set()
-        for player in target_players:
+        ordered_players = sorted(
+            target_players, key=lambda p: self._PLAYER_INDICES.get(p, 99)
+        )
+        for index, player in enumerate(ordered_players):
+            if index:
+                time.sleep(0.2)
             self.start_recording(self._auto_session, self._auto_block, player)
             if self._active_recording.get(player):
                 started.add(player)
@@ -1110,7 +1162,9 @@ class PupilBridge:
 
         async def orchestrate() -> None:
             await controller.ensure_started(label=recording_label)
-            await controller.begin_segment()
+            await controller.begin_segment(
+                deadline_ms=RECORDING_BEGIN_TIMEOUT_MS
+            )
 
         future = asyncio.run_coroutine_threadsafe(orchestrate(), self._async_loop)
         try:
@@ -1196,6 +1250,10 @@ class PupilBridge:
             if self._handle_busy_state(player, device):
                 return self._invoke_recording_start(player, device, allow_busy_recovery=False)
             return False, None
+        if rest_status == "already_recording" and allow_busy_recovery:
+            if self._recover_from_already_recording(player, device):
+                return self._invoke_recording_start(player, device, allow_busy_recovery=False)
+            return False, None
         if rest_status is True:
             return True, rest_payload
         log.error("No recording start method succeeded for %s", player)
@@ -1243,6 +1301,14 @@ class PupilBridge:
             log.warning("Recording start busy for %s: %s", player, message)
             return "busy", None
 
+        if (
+            response.status_code == 400
+            and message
+            and "already recording" in message.lower()
+        ):
+            log.warning("Already recording! (%s) %s", player, message)
+            return "already_recording", None
+
         log.error(
             "REST recording start for %s failed (%s): %s",
             player,
@@ -1288,6 +1354,48 @@ class PupilBridge:
         end_info = self._wait_for_notification(device, "recording.end")
         if end_info is None:
             log.warning("Timeout while waiting for recording.end (%s)", player)
+        return True
+
+    def _recover_from_already_recording(self, player: str, device: Any) -> bool:
+        log.warning("Already recording! (%s)", player)
+        stopped = False
+        stop_fn = getattr(device, "recording_stop_and_save", None)
+        if callable(stop_fn):
+            try:
+                stop_fn()
+                stopped = True
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                log.warning(
+                    "recording_stop_and_save failed for %s: %s",
+                    player,
+                    exc,
+                )
+
+        if not stopped:
+            response = self._post_device_api(
+                player,
+                "/api/recording",
+                {"action": "STOP"},
+                warn=False,
+            )
+            if response is not None and response.status_code == 200:
+                stopped = True
+            elif response is not None:
+                log.warning(
+                    "REST recording STOP for %s failed (%s)",
+                    player,
+                    response.status_code,
+                )
+
+        if not stopped:
+            return False
+
+        end_info = self._wait_for_notification(device, "recording.end")
+        if end_info is None:
+            log.info("recording.end nicht bestätigt (%s)", player)
+        self._active_recording[player] = False
+        self._recording_metadata.pop(player, None)
+        time.sleep(0.4)
         return True
 
     def _post_device_api(
@@ -1345,6 +1453,25 @@ class PupilBridge:
                     time.sleep(delay)
                     delay *= 2
         return None
+
+    def _fetch_status_via_http(self, player: str) -> Optional[Any]:
+        if requests is None:
+            return None
+
+        cfg = self._device_config.get(player)
+        if cfg is None or not cfg.ip or cfg.port is None:
+            return None
+
+        url = f"http://{cfg.ip}:{cfg.port}/api/status"
+        try:
+            response = requests.get(url, timeout=self._connect_timeout)
+            response.raise_for_status()
+        except Exception:
+            return None
+        try:
+            return response.json()
+        except ValueError:
+            return None
 
     def _apply_recording_label(
         self,
@@ -1433,6 +1560,50 @@ class PupilBridge:
                 if value:
                     return str(value)
         return None
+
+    def _device_is_recording(self, player: str, device: Any) -> bool:
+        def resolve_state(value: Any) -> Optional[bool]:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                if value in {0, 1}:
+                    return bool(value)
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"recording", "running", "active", "true", "yes"}:
+                    return True
+                if lowered in {"stopped", "idle", "false", "no", "ready"}:
+                    return False
+            return None
+
+        def scan_status(payload: Any) -> Optional[bool]:
+            if isinstance(payload, dict):
+                candidates = [
+                    payload.get("recording"),
+                    self._dig(payload, ("recording", "status")),
+                    self._dig(payload, ("recording", "state")),
+                    self._dig(payload, ("recording", "active")),
+                    payload.get("is_recording"),
+                ]
+                for candidate in candidates:
+                    state = resolve_state(candidate)
+                    if state is not None:
+                        return state
+            if isinstance(payload, (list, tuple)):
+                for item in payload:
+                    state = scan_status(item)
+                    if state is not None:
+                        return state
+            return None
+
+        status = self._get_device_status(device)
+        if status is None:
+            status = self._fetch_status_via_http(player)
+
+        state = scan_status(status)
+        if state is None:
+            return bool(self._active_recording.get(player))
+        return state
 
     def stop_recording(self, player: str) -> None:
         """Stop the active recording for the player if possible."""
