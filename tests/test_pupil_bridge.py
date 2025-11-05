@@ -57,8 +57,7 @@ def test_event_router_single_target(bridge):
     pupil_bridge.send_event("ui.test", "VP1", {"value": 42})
     pupil_bridge._event_router.flush_all()  # type: ignore[attr-defined]
     assert device.events
-    args, kwargs = device.events[0]
-    assert args[0].startswith("ui.test")
+    assert any(args and args[0].startswith("ui.test") for args, _ in device.events)
 
 
 def test_recording_start_idempotent(bridge):

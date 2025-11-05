@@ -9,6 +9,16 @@ sounddevice
 
 pip install kivy pandas numpy opencv-contrib-python sounddevice
 
+### Optional env vars (Windows/PowerShell)
+
+```
+setx FORCE_EVENT_LABELS "1"
+setx RECORDING_BEGIN_TIMEOUT_MS "3000"
+setx WS_PING_INTERVAL_SEC "12"
+setx AUTO_START_EYETRACKER "1"
+setx CONTINUOUS_RECORDING_MODE "1"
+```
+
 ## Event-Zeitmodell & Refinement
 
 Die Tabletop-App vergibt jetzt für jedes UI-Ereignis sofort eine eindeutige
