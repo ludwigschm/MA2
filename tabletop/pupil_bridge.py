@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -32,6 +33,14 @@ except Exception:  # pragma: no cover - optional dependency
     requests = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
+
+FORCE_EVENT_LABELS = os.getenv("FORCE_EVENT_LABELS", "0") == "1"
+RECORDING_BEGIN_TIMEOUT_MS = int(os.getenv("RECORDING_BEGIN_TIMEOUT_MS", "3000"))
+WS_PING_INTERVAL_SEC = int(os.getenv("WS_PING_INTERVAL_SEC", "12"))
+WS_READ_TIMEOUT_SEC = WS_PING_INTERVAL_SEC * 2
+LOG_ONCE_SESSION_DEVICE_ID_WARN = os.getenv("LOG_ONCE_SESSION_DEVICE_ID_WARN", "1") == "1"
+AUTO_START_EYETRACKER = os.getenv("AUTO_START_EYETRACKER", "1") == "1"
+CONTINUOUS_RECORDING_MODE = os.getenv("CONTINUOUS_RECORDING_MODE", "1") == "1"
 
 from tabletop.utils.runtime import (
     event_batch_size_override,
