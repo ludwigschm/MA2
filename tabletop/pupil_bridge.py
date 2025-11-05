@@ -284,6 +284,7 @@ class PupilBridge:
         self._offset_semantics_warned: set[str] = set()
         self._device_registry = DeviceRegistry()
         self._capabilities = CapabilityRegistry()
+        self._force_event_labels_notice_logged = False
         self._time_sync: Dict[str, TimeSyncManager] = {}
         self._time_sync_tasks: Dict[str, asyncio.Future[None]] = {}
         self._recording_controllers: Dict[str, RecordingController] = {}
@@ -627,7 +628,7 @@ class PupilBridge:
     ) -> None:
         identifier = device_id or player
         supported = False
-        if requests is not None and cfg.ip and cfg.port is not None:
+        if not FORCE_EVENT_LABELS and requests is not None and cfg.ip and cfg.port is not None:
             url = f"http://{cfg.ip}:{cfg.port}/api/frame_name"
             try:
                 response = requests.options(url, timeout=self._http_timeout)
@@ -1368,6 +1369,8 @@ class PupilBridge:
             )
             if response is None:
                 log.warning("Setting frame_name failed for %s (no response)", player)
+            elif response.status_code == 404:
+                log.info("Setting frame_name failed for %s (404)", player)
             elif response.status_code != 200:
                 log.warning(
                     "Setting frame_name failed for %s (%s)",
@@ -1376,6 +1379,10 @@ class PupilBridge:
                 )
         else:
             log.debug("frame_name skipped (unsupported) device=%s", player)
+
+        if FORCE_EVENT_LABELS and not self._force_event_labels_notice_logged:
+            log.info("FORCE_EVENT_LABELS=1 → using event labels only")
+            self._force_event_labels_notice_logged = True
 
         payload: Dict[str, Any] = {"label": label}
         if session is not None:
