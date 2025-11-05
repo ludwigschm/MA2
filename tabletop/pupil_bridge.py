@@ -477,7 +477,10 @@ class PupilBridge:
                 actual_id,
             )
             self._on_device_connected(player, device, cfg, actual_id)
-            self._auto_start_recording(player, device)
+            if CONTINUOUS_RECORDING_MODE:
+                self._ensure_continuous_recording(player)
+            else:
+                self._auto_start_recording(player, device)
 
         self._auto_start_eye_trackers()
 
@@ -668,6 +671,7 @@ class PupilBridge:
             log.info("Eye-Tracker auto-started on all connected devices.")
 
     def _start_eye_tracker_for_device(self, player: str, device: Any) -> bool:
+        cfg = self._device_config.get(player)
         start_methods = (
             "start_eye_tracker",
             "start_eye_tracking",
@@ -712,6 +716,47 @@ class PupilBridge:
                     )
                 else:
                     log.debug("Eye tracker command %s acknowledged for %s", command, player)
+                    return True
+
+        notif = getattr(device, "notifications", None)
+        publish = getattr(notif, "publish", None)
+        if callable(publish):
+            try:
+                publish("eye_process.should_start", True)
+            except Exception:
+                log.debug(
+                    "Eye tracker notification fallback failed for %s", player, exc_info=True
+                )
+            else:
+                log.info("Eye tracker started via notifications for %s", player)
+                return True
+
+        if (
+            requests is not None
+            and cfg is not None
+            and cfg.ip
+            and cfg.port is not None
+        ):
+            base_url = f"http://{cfg.ip}:{cfg.port}"
+            rest_candidates = (
+                ("/api/eye", {"action": "START"}),
+                (
+                    "/api/command",
+                    {"command": "eye_process.should_start", "value": True},
+                ),
+            )
+            for path, body in rest_candidates:
+                try:
+                    response = requests.post(
+                        f"{base_url}{path}", json=body, timeout=self._http_timeout
+                    )
+                except Exception:
+                    log.debug(
+                        "Eye tracker REST start via %s failed for %s", path, player, exc_info=True
+                    )
+                    continue
+                if response.status_code in (200, 204):
+                    log.info("Eye tracker REST start OK via %s for %s", path, player)
                     return True
 
         log.warning("Eye tracker auto-start not supported for %s", player)
@@ -796,7 +841,11 @@ class PupilBridge:
         if player in self._time_sync_ready:
             return True
 
-        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        timeout = float(timeout_s)
+        if CONTINUOUS_RECORDING_MODE:
+            timeout = min(timeout, 1.0)
+
+        deadline = time.monotonic() + max(0.0, timeout)
         poll_s = max(0.01, float(poll_ms) / 1000.0)
 
         while time.monotonic() < deadline:
@@ -823,8 +872,12 @@ class PupilBridge:
                     pass
             time.sleep(poll_s)
 
+        suffix = " (proceeding without ready)" if CONTINUOUS_RECORDING_MODE else ""
         log.info(
-            "time_sync readiness timeout player=%s after %.1fs", player, timeout_s
+            "time_sync readiness timeout player=%s after %.1fs%s",
+            player,
+            timeout,
+            suffix,
         )
         return False
 
@@ -1649,53 +1702,78 @@ class PupilBridge:
             log.debug("REST recording start skipped (%s: no IP/port)", player)
             return False, None
 
-        url = f"http://{cfg.ip}:{cfg.port}/api/recording"
-        try:
-            response = requests.post(
-                url,
-                json={"action": "START"},
-                timeout=self._http_timeout,
-            )
-        except Exception as exc:  # pragma: no cover - network dependent
-            log.error("REST recording start failed for %s: %s", player, exc)
-            return False, None
-
-        if response.status_code == 200:
-            try:
-                return True, response.json()
-            except ValueError:
-                return True, None
-
-        message: Optional[str] = None
-        try:
-            data = response.json()
-            if isinstance(data, dict):
-                message = str(data.get("message") or data.get("error") or "")
-        except ValueError:
-            message = response.text
-
-        if (
-            response.status_code == 400
-            and message
-            and "previous recording not completed" in message.lower()
-        ):
-            log.warning("Recording start busy for %s: %s", player, message)
-            return "busy", None
-
-        if (
-            response.status_code == 400
-            and message
-            and "already recording" in message.lower()
-        ):
-            log.warning("Already recording! (%s) %s", player, message)
-            return "already_recording", None
-
-        log.error(
-            "REST recording start for %s failed (%s): %s",
-            player,
-            response.status_code,
-            message or response.text,
+        base_url = f"http://{cfg.ip}:{cfg.port}"
+        candidates: tuple[tuple[str, Optional[Dict[str, Any]]], ...] = (
+            ("/api/recording", {"action": "START"}),
+            ("/api/recording", {"action": "start"}),
+            ("/api/recording", {"action": "New"}),
+            ("/api/recording/start", None),
+            ("/api/recording", {"mode": "start"}),
         )
+
+        last_status: Optional[int] = None
+        last_message: Optional[str] = None
+
+        for path, payload in candidates:
+            url = f"{base_url}{path}"
+            json_payload = payload or {}
+            try:
+                response = requests.post(
+                    url,
+                    json=json_payload,
+                    timeout=self._http_timeout,
+                )
+            except Exception:
+                log.debug(
+                    "REST recording start via %s failed for %s", path, player, exc_info=True
+                )
+                continue
+
+            if response.status_code in (200, 204):
+                meta: Optional[Any]
+                if response.status_code == 204:
+                    meta = None
+                else:
+                    try:
+                        meta = response.json()
+                    except ValueError:
+                        meta = None
+                log.info("Recording start OK via %s", path)
+                return True, meta
+
+            message: Optional[str] = None
+            try:
+                data = response.json()
+                if isinstance(data, dict):
+                    message = str(data.get("message") or data.get("error") or "")
+            except ValueError:
+                text = response.text.strip()
+                message = text or None
+
+            if message:
+                lowered = message.lower()
+                if "previous recording not completed" in lowered:
+                    log.warning("Recording start busy for %s: %s", player, message)
+                    return "busy", None
+                if "already recording" in lowered:
+                    log.warning("Already recording! (%s) %s", player, message)
+                    return "already_recording", None
+
+            last_status = response.status_code
+            last_message = message or response.text
+
+        log.warning(
+            "Recording start FAILED for %s:%s (no compatible REST dialect found)",
+            cfg.ip,
+            cfg.port,
+        )
+        if last_status is not None:
+            log.debug(
+                "Last REST response for %s: status=%s body=%r",
+                player,
+                last_status,
+                last_message,
+            )
         return False, None
 
     def _handle_busy_state(self, player: str, device: Any) -> bool:
