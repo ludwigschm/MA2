@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Literal, Optional, Union
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Union
 
 from core.capabilities import CapabilityRegistry, DeviceCapabilities
 from core.device_registry import DeviceRegistry
@@ -298,6 +298,15 @@ class PupilBridge:
         self._time_sync_ready: set[str] = set()
         self._eye_tracker_started: Dict[str, bool] = {"VP1": False, "VP2": False}
         self._continuous_recording_players: set[str] = set()
+        self._notification_clients: Dict[str, Any] = {}
+        self._notification_connected: Dict[str, bool] = {
+            player: False for player in self._device_by_player
+        }
+        self._notification_subscriptions: Dict[str, list[tuple[str, Callable[..., None]]]] = {
+            player: [] for player in self._device_by_player
+        }
+        self._notification_lock = threading.Lock()
+        self._session_warning_flags: set[str] = set()
         self._atexit_registered = False
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(
@@ -535,6 +544,13 @@ class PupilBridge:
                 except Exception:
                     log.debug("%s() schlug fehl beim Aufräumen", attr, exc_info=True)
 
+    def _warn_device_id_once(self, key: str, message: str, *args: Any) -> None:
+        if LOG_ONCE_SESSION_DEVICE_ID_WARN and key in self._session_warning_flags:
+            return
+        log.warning(message, *args)
+        if LOG_ONCE_SESSION_DEVICE_ID_WARN:
+            self._session_warning_flags.add(key)
+
     def _validate_device_identity(self, device: Any, cfg: NeonDeviceConfig) -> str:
         status = self._get_device_status(device)
         if status is None and requests is not None and cfg.ip and cfg.port is not None:
@@ -554,13 +570,16 @@ class PupilBridge:
         expected_hex = self._extract_hex_device_id(expected_raw)
 
         if not expected_raw:
-            log.warning(
+            self._warn_device_id_once(
+                f"cfg_missing::{cfg.player}",
                 "Keine device_id für %s in der Konfiguration gesetzt – Validierung nur über Statusdaten.",
                 cfg.player,
             )
         elif not expected_hex:
-            log.warning(
-                "Konfigurierte device_id %s enthält keine gültige Hex-ID.", expected_raw
+            self._warn_device_id_once(
+                f"cfg_invalid::{cfg.player}",
+                "Konfigurierte device_id %s enthält keine gültige Hex-ID.",
+                expected_raw,
             )
 
         cfg_display = expected_hex or (expected_raw or "-")
@@ -579,14 +598,17 @@ class PupilBridge:
         if module_serial:
             log.info("Kein device_id im Status, nutze module_serial=%s (cfg=%s)", module_serial, cfg_display)
         else:
-            log.warning(
+            self._warn_device_id_once(
+                f"status_missing::{cfg.player}",
                 "device_id not present in status; proceeding based on IP/port only (cfg=%s)",
                 cfg_display,
             )
 
         if expected_hex and not device_id:
-            log.warning(
-                "Konfigurierte device_id %s konnte nicht bestätigt werden.", expected_hex
+            self._warn_device_id_once(
+                f"unconfirmed::{cfg.player}::{expected_hex}",
+                "Konfigurierte device_id %s konnte nicht bestätigt werden.",
+                expected_hex,
             )
 
         return module_serial or ""
@@ -715,6 +737,8 @@ class PupilBridge:
             player, device, cfg
         )
         self._probe_capabilities(player, cfg, device_id)
+        self._ensure_notification_client(player, device)
+        self._restore_notification_subscriptions(player, device)
 
     def _setup_time_sync(self, player: str, device_id: str, device: Any) -> None:
         async def measure(samples: int, timeout: float) -> list[float]:
@@ -864,6 +888,168 @@ class PupilBridge:
         self._capabilities.set(identifier, caps)
         if not supported:
             log.info("frame_name skipped (unsupported) device=%s", player)
+
+    # ------------------------------------------------------------------
+    # Notification/WebSocket helpers
+    def _ensure_notification_client(self, player: str, device: Any) -> Optional[Any]:
+        with self._notification_lock:
+            notifications = getattr(device, "notifications", None)
+            if notifications is None:
+                return None
+
+            self._notification_clients[player] = notifications
+            if self._notification_connected.get(player):
+                return notifications
+
+            connect_fn = getattr(notifications, "connect", None)
+            if not callable(connect_fn):
+                self._notification_connected[player] = True
+                self._register_notification_disconnect(player, notifications)
+                return notifications
+
+            attempts = [
+                {"ping_interval": WS_PING_INTERVAL_SEC, "read_timeout": WS_READ_TIMEOUT_SEC},
+                {"ping_interval": WS_PING_INTERVAL_SEC},
+                {},
+            ]
+            for attempt in attempts:
+                try:
+                    connect_fn(**attempt)
+                except TypeError as exc:
+                    message = str(exc).lower()
+                    if "unexpected" in message or "positional" in message:
+                        continue
+                    self._log_notification_exception(player, "connect", exc)
+                    break
+                except Exception as exc:  # pragma: no cover - network dependent
+                    self._log_notification_exception(player, "connect", exc)
+                    break
+                else:
+                    self._notification_connected[player] = True
+                    self._register_notification_disconnect(player, notifications)
+                    return notifications
+
+            if not self._notification_connected.get(player):
+                self._notification_clients.pop(player, None)
+                return None
+
+            return notifications
+
+    def _register_notification_disconnect(self, player: str, notifications: Any) -> None:
+        callback = lambda *args, **kwargs: self._handle_notification_disconnect(player)
+        registered = False
+        for attr in (
+            "register_disconnect_callback",
+            "add_disconnect_callback",
+            "set_disconnect_callback",
+        ):
+            fn = getattr(notifications, attr, None)
+            if callable(fn):
+                try:
+                    fn(callback)
+                except TypeError:
+                    try:
+                        fn(callback, player)
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+                else:
+                    registered = True
+                    break
+
+        if not registered:
+            handler = getattr(notifications, "on_disconnect", None)
+            if callable(handler):
+                try:
+                    handler(callback)
+                except Exception:
+                    pass
+                else:
+                    registered = True
+
+        if not registered and hasattr(notifications, "on_disconnect"):
+            try:
+                setattr(notifications, "on_disconnect", callback)
+            except Exception:
+                pass
+
+    def _handle_notification_disconnect(self, player: str) -> None:
+        with self._notification_lock:
+            self._notification_connected[player] = False
+        device = self._device_by_player.get(player)
+        if device is None:
+            return
+        notifications = self._ensure_notification_client(player, device)
+        if notifications is None:
+            return
+        self._restore_notification_subscriptions(player, device)
+
+    def subscribe_notifications(
+        self, player: str, topic: str, callback: Callable[..., None]
+    ) -> bool:
+        entry = (topic, callback)
+        with self._notification_lock:
+            entries = self._notification_subscriptions.setdefault(player, [])
+            if not any(t == topic and c is callback for t, c in entries):
+                entries.append(entry)
+        device = self._device_by_player.get(player)
+        if device is None:
+            return False
+        notifications = self._ensure_notification_client(player, device)
+        if notifications is None:
+            return False
+        return self._apply_notification_subscription(player, notifications, topic, callback)
+
+    def _restore_notification_subscriptions(self, player: str, device: Any) -> None:
+        with self._notification_lock:
+            entries = list(self._notification_subscriptions.get(player, ()))
+        if not entries:
+            return
+        notifications = self._ensure_notification_client(player, device)
+        if notifications is None:
+            return
+        for topic, callback in entries:
+            self._apply_notification_subscription(player, notifications, topic, callback)
+
+    def _apply_notification_subscription(
+        self, player: str, notifications: Any, topic: str, callback: Callable[..., None]
+    ) -> bool:
+        method_names = (
+            "subscribe_topic",
+            "subscribe_to_topic",
+            "subscribe",
+            "add_listener",
+            "register",
+        )
+        for name in method_names:
+            fn = getattr(notifications, name, None)
+            if not callable(fn):
+                continue
+            try:
+                fn(topic, callback)
+            except TypeError:
+                try:
+                    fn(callback, topic)
+                except TypeError:
+                    continue
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    self._log_notification_exception(player, f"subscribe:{name}", exc)
+                    return False
+            except Exception as exc:  # pragma: no cover - network dependent
+                self._log_notification_exception(player, f"subscribe:{name}", exc)
+                return False
+            else:
+                return True
+        log.debug("No compatible subscription API found for %s", player)
+        return False
+
+    def _log_notification_exception(self, player: str, action: str, exc: BaseException) -> None:
+        message = str(exc).lower()
+        if "connection closed" in message or "connection reset" in message:
+            log.warning("notifications %s failed for %s: %s", action, player, exc)
+        else:
+            log.error("notifications %s failed for %s: %s", action, player, exc)
 
     def _get_device_status(self, device: Any) -> Optional[Any]:
         for attr in ("api_status", "status", "get_status"):
@@ -1274,6 +1460,12 @@ class PupilBridge:
         for player in list(self._eye_tracker_started):
             self._eye_tracker_started[player] = False
         self._continuous_recording_players.clear()
+        with self._notification_lock:
+            self._notification_clients.clear()
+            for player in self._notification_connected:
+                self._notification_connected[player] = False
+            for player in self._notification_subscriptions:
+                self._notification_subscriptions[player] = []
 
     # ------------------------------------------------------------------
     # Recording helpers
@@ -2109,7 +2301,8 @@ class PupilBridge:
         except Exception:  # pragma: no cover - network dependent
             log.debug("Refinement REST call failed for %s", player, exc_info=True)
 
-        if response is not None and getattr(response, "status_code", None) in {200, 204}:
+        status_code = getattr(response, "status_code", None)
+        if response is not None and status_code in {200, 204}:
             log.debug(
                 "Refinement acknowledged via REST for %s (event %s, v%s)",
                 player,
@@ -2117,6 +2310,18 @@ class PupilBridge:
                 mapping_version,
             )
             return
+
+        if status_code == 404:
+            log.info(
+                "Refinement REST endpoint not available for %s – falling back to realtime",
+                player,
+            )
+        elif status_code is not None:
+            log.warning(
+                "Refinement REST call for %s returned %s – using realtime fallback",
+                player,
+                status_code,
+            )
 
         log.debug(
             "Falling back to realtime refine event for %s (event %s, v%s)",
