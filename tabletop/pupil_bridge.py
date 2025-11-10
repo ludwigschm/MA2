@@ -1076,6 +1076,7 @@ class PupilBridge:
 
         if self._active_recording.get(player):
             log.debug("Recording already active for %s", player)
+            self.update_recording_segment(session, block, player)
             return
 
         vp_index = self._PLAYER_INDICES.get(player, 0)
@@ -1130,6 +1131,65 @@ class PupilBridge:
         self._active_recording[player] = True
         self._recording_metadata[player] = payload
         self.send_event("session.recording_started", player, payload)
+
+    def update_recording_segment(self, session: int, block: int, player: str) -> None:
+        """Update the metadata of an active recording and mark a new segment."""
+
+        device = self._device_by_player.get(player)
+        if device is None:
+            log.debug("recording.segment übersprungen (%s nicht verbunden)", player)
+            return
+
+        if not self._active_recording.get(player):
+            log.debug("No active recording to update for %s", player)
+            return
+
+        controller = self._recording_controllers.get(player)
+        if controller is None:
+            log.debug("No recording controller registered for %s", player)
+            return
+
+        vp_index = self._PLAYER_INDICES.get(player, 0)
+        recording_label = f"{session}.{block}.{vp_index}"
+
+        async def orchestrate() -> None:
+            await controller.begin_segment()
+
+        future = asyncio.run_coroutine_threadsafe(orchestrate(), self._async_loop)
+        try:
+            future.result(timeout=max(1.0, self._connect_timeout))
+        except asyncio.TimeoutError:
+            log.warning("recording segment timeout player=%s", player)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("recording segment error player=%s error=%s", player, exc)
+
+        self._apply_recording_label(
+            player,
+            device,
+            recording_label,
+            session=session,
+            block=block,
+        )
+
+        metadata = self._recording_metadata.get(player)
+        if metadata is None:
+            metadata = {"player": player}
+            self._recording_metadata[player] = metadata
+        metadata.update(
+            {
+                "session": session,
+                "block": block,
+                "recording_label": recording_label,
+            }
+        )
+
+        log.info(
+            "recording segment updated player=%s label=%s session=%s block=%s",
+            player,
+            recording_label,
+            session,
+            block,
+        )
 
     def _send_recording_start(
         self,
