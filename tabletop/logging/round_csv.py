@@ -168,7 +168,15 @@ def round_log_action_label(app: Any, action: str, payload: Dict[str, Any]) -> st
     return action
 
 
-def write_round_log(app: Any, actor: str, action: str, payload: Dict[str, Any], player: int) -> None:
+def write_round_log(
+    app: Any,
+    actor: str,
+    action: str,
+    payload: Dict[str, Any],
+    player: int,
+    *,
+    action_label: Optional[str] = None,
+) -> None:
     if not getattr(app, "round_log_path", None):
         return
     is_showdown = action == "showdown"
@@ -215,7 +223,8 @@ def write_round_log(app: Any, actor: str, action: str, payload: Dict[str, Any], 
         if vp_player1 in (1, 2):
             spieler1_vp = f"VP{vp_player1}"
 
-    action_label = round_log_action_label(app, action, payload)
+    if action_label is None:
+        action_label = round_log_action_label(app, action, payload)
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
     winner_label = ""

@@ -1798,10 +1798,71 @@ class TabletopRoot(FloatLayout):
             return "P2"
         return "P1" if player == 1 else "P2"
 
+    def _build_cloud_button_event(
+        self,
+        *,
+        player: Optional[int],
+        button_label: str,
+    ) -> Optional[Dict[str, Any]]:
+        if player not in (1, 2):
+            return None
+        session_id = self.session_id
+        if not session_id:
+            return None
+        vp_num = self.role_by_physical.get(player)
+        if vp_num not in (1, 2):
+            return None
+        round_value: Optional[int] = None
+        block_info = self.current_block_info
+        if isinstance(block_info, dict):
+            idx = block_info.get("index")
+            try:
+                if idx is not None:
+                    round_value = int(idx)
+            except (TypeError, ValueError):
+                round_value = None
+        if round_value is None:
+            try:
+                round_value = int(self.round)
+            except Exception:
+                round_value = None
+        if round_value is None:
+            try:
+                round_value = int(self.controller.compute_global_round())
+            except Exception:
+                round_value = 1
+        if round_value <= 0:
+            round_value = 1
+        try:
+            trial_candidate = int(self.round_in_block)
+        except Exception:
+            trial_candidate = 0
+        if trial_candidate <= 0:
+            trial_candidate = round_value
+        trial_value = trial_candidate if isinstance(trial_candidate, int) else round_value
+        event_payload: Dict[str, Any] = {
+            "session": str(session_id),
+            "round": round_value,
+            "trial": trial_value,
+            "player": int(player),
+            "vp": f"VP{vp_num}",
+            "button": button_label,
+        }
+        return event_payload
+
     def log_event(self, player: int, action: str, payload=None):
-        if not self.logger or not self.session_configured:
+        if not self.session_configured:
             return
         payload = payload or {}
+        action_label = round_log_action_label(self, action, payload)
+        cloud_event = self._build_cloud_button_event(
+            player=player,
+            button_label=action_label,
+        )
+        if cloud_event:
+            push_async(cloud_event)
+        if not self.logger:
+            return
         actor = self._actor_label(player)
         round_idx = max(0, self.round - 1)
         self.logger.log(
@@ -1811,7 +1872,14 @@ class TabletopRoot(FloatLayout):
             action,
             payload
         )
-        write_round_log(self, actor, action, payload, player)
+        write_round_log(
+            self,
+            actor,
+            action,
+            payload,
+            player,
+            action_label=action_label,
+        )
         bridge_payload = {
             "event_id": payload.get("event_id") if isinstance(payload, dict) else None,
             "actor": actor,
@@ -1824,7 +1892,6 @@ class TabletopRoot(FloatLayout):
             role_value = self.player_roles.get(player)
             if role_value is not None:
                 bridge_payload["player_role"] = role_value
-        push_async(bridge_payload)
         if self.marker_bridge and action != 'round_start':
             # non-blocking: moved bridge send to async enqueue
             self.marker_bridge.enqueue(f"action.{action}", bridge_payload)

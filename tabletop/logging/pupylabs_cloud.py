@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 from typing import Any, Dict
 
 try:  # pragma: no cover - optional dependency
@@ -33,7 +32,6 @@ class PupylabsCloudLogger:
         """Send *event* to the ingestion endpoint with retry handling."""
 
         payload = dict(event) if event is not None else {}
-        payload.setdefault("event_id", str(uuid.uuid4()))
         url = f"{self.base_url}/v1/events/ingest"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
