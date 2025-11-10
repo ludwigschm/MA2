@@ -1273,11 +1273,11 @@ class TabletopRoot(FloatLayout):
             widget = self.card_widget_for_player(who, which)
             if widget is None:
                 return
+            if result.log_action:
+                self.log_event(who, result.log_action, result.log_payload or {})
             widget.flip()
             if result.record_text:
                 self.record_action(who, result.record_text)
-            if result.log_action:
-                self.log_event(who, result.log_action, result.log_payload or {})
             if result.next_phase:
                 Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
         finally:
@@ -1299,6 +1299,8 @@ class TabletopRoot(FloatLayout):
             )
             if not result.accepted:
                 return
+            if result.log_payload:
+                self.log_event(player, 'signal_choice', result.log_payload)
             for lvl, btn_id in self.signal_buttons.get(player, {}).items():
                 btn = self.wid_safe(btn_id)
                 if btn is None:
@@ -1309,8 +1311,6 @@ class TabletopRoot(FloatLayout):
                     btn.set_live(False)
                     btn.disabled = True
             self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
-            if result.log_payload:
-                self.log_event(player, 'signal_choice', result.log_payload)
             self.update_user_displays()
             if result.next_phase:
                 Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
@@ -1334,6 +1334,8 @@ class TabletopRoot(FloatLayout):
             )
             if not result.accepted:
                 return
+            if result.log_payload:
+                self.log_event(player, 'call_choice', result.log_payload)
             for choice, btn_id in self.decision_buttons.get(player, {}).items():
                 btn = self.wid_safe(btn_id)
                 if btn is None:
@@ -1344,8 +1346,6 @@ class TabletopRoot(FloatLayout):
                     btn.set_live(False)
                     btn.disabled = True
             self.record_action(player, f'Entscheidung: {decision.upper()}')
-            if result.log_payload:
-                self.log_event(player, 'call_choice', result.log_payload)
             self.update_user_displays()
             if result.next_phase:
                 Clock.schedule_once(lambda *_: self.goto(result.next_phase), 0.2)
