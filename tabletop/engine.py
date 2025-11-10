@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 if TYPE_CHECKING:  # pragma: no cover - only for static typing
     from tabletop.logging.events import Events
 
-from tabletop.logging import events_bridge
 from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
@@ -398,7 +397,7 @@ class EventLogger:
                         self._last_queue_log = time.monotonic()
         else:
             self._flush_rows([row])
-        event_data = {
+        return {
             "session_id": session_id,
             "round_idx": round_idx,
             "phase": phase.name,
@@ -409,8 +408,6 @@ class EventLogger:
             "t_mono_ns": t_mono_ns,
             "event_id": event_id,
         }
-        events_bridge.push_async(event_data)
-        return event_data
 
     def close(self) -> None:
         if self._closed:
