@@ -28,6 +28,7 @@ from kivy.uix.textinput import TextInput
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
 from tabletop.logging import async_bridge
+from tabletop.logging.events_bridge import push_async
 from tabletop.logging.events import Events
 from tabletop.logging.round_csv import (
     close_round_log,
@@ -1812,6 +1813,7 @@ class TabletopRoot(FloatLayout):
         )
         write_round_log(self, actor, action, payload, player)
         bridge_payload = {
+            "event_id": payload.get("event_id") if isinstance(payload, dict) else None,
             "actor": actor,
             "game_player": player,
             "phase": self.current_engine_phase(),
@@ -1822,6 +1824,7 @@ class TabletopRoot(FloatLayout):
             role_value = self.player_roles.get(player)
             if role_value is not None:
                 bridge_payload["player_role"] = role_value
+        push_async(bridge_payload)
         if self.marker_bridge and action != 'round_start':
             # non-blocking: moved bridge send to async enqueue
             self.marker_bridge.enqueue(f"action.{action}", bridge_payload)
