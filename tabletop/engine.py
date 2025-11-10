@@ -17,6 +17,7 @@ import pathlib
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 if TYPE_CHECKING:  # pragma: no cover - only for static typing
     from tabletop.logging.events import Events
 
+from tabletop.logging import events_bridge
 from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
@@ -355,6 +357,7 @@ class EventLogger:
     ) -> Dict[str, Any]:
         t_mono_ns = time.perf_counter_ns()
         t_utc_iso = datetime.now(timezone.utc).isoformat()
+        event_id = str(uuid.uuid4())
         row = (
             session_id,
             round_idx,
@@ -395,7 +398,7 @@ class EventLogger:
                         self._last_queue_log = time.monotonic()
         else:
             self._flush_rows([row])
-        return {
+        event_data = {
             "session_id": session_id,
             "round_idx": round_idx,
             "phase": phase.name,
@@ -403,7 +406,11 @@ class EventLogger:
             "action": action,
             "payload": payload,
             "t_utc_iso": t_utc_iso,
+            "t_mono_ns": t_mono_ns,
+            "event_id": event_id,
         }
+        events_bridge.push_async(event_data)
+        return event_data
 
     def close(self) -> None:
         if self._closed:
