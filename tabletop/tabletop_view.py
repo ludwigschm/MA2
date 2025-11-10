@@ -1273,9 +1273,12 @@ class TabletopRoot(FloatLayout):
             widget = self.card_widget_for_player(who, which)
             if widget is None:
                 return
+            # 1) Log zuerst (lokal + async Pupylabs), um Latenz im Lab zu minimieren
             if result.log_action:
                 self.log_event(who, result.log_action, result.log_payload or {})
+            # 2) Danach visuelle Änderung (Flip)
             widget.flip()
+            # 3) Dann lokale Aktionshistorie
             if result.record_text:
                 self.record_action(who, result.record_text)
             if result.next_phase:
@@ -1299,8 +1302,10 @@ class TabletopRoot(FloatLayout):
             )
             if not result.accepted:
                 return
+            # 1) Log zuerst
             if result.log_payload:
                 self.log_event(player, 'signal_choice', result.log_payload)
+            # 2) Danach UI-Update
             for lvl, btn_id in self.signal_buttons.get(player, {}).items():
                 btn = self.wid_safe(btn_id)
                 if btn is None:
@@ -1310,6 +1315,7 @@ class TabletopRoot(FloatLayout):
                 else:
                     btn.set_live(False)
                     btn.disabled = True
+            # 3) Aktionslog in der UI
             self.record_action(player, f'Signal gewählt: {self.describe_level(level)}')
             self.update_user_displays()
             if result.next_phase:
