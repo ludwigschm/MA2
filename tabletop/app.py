@@ -31,6 +31,7 @@ from kivy.core.window import Window
 from kivy.lang import Builder
 
 from tabletop.data.config import ARUCO_OVERLAY_PATH
+from tabletop.logging.events_bridge import init_client
 from tabletop.logging.round_csv import close_round_log, flush_round_log
 from tabletop.overlay.process import (
     OverlayProcess,
@@ -828,6 +829,13 @@ def main(
     """Run the tabletop Kivy application with optional Pupil bridge integration."""
 
     logging_listener, logging_queue = _configure_async_logging()
+
+    init_client(
+        base_url=os.environ.get("PUPYLABS_BASE_URL", "https://cloud.pupylabs.example"),
+        api_key=os.environ.get("PUPYLABS_API_KEY", ""),
+        timeout_s=2.0,
+        max_retries=3,
+    )
 
     bridge = PupilBridge()
     try:
