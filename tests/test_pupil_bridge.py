@@ -6,6 +6,7 @@ from typing import Tuple
 import pytest
 
 from tabletop.pupil_bridge import NeonDeviceConfig, PupilBridge
+from tabletop.utils.http_client import ApiNotFound
 
 
 class _FakeDevice:
@@ -76,3 +77,58 @@ def test_time_sync_manager_used_for_offsets(bridge):
     # subsequent call should not error even if samples exhausted
     offset2 = pupil_bridge.estimate_time_offset("VP1")
     assert math.isclose(offset2, offset, rel_tol=1e-6)
+
+
+def test_refine_endpoint_discovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tabletop.pupil_bridge.requests", None)
+    monkeypatch.setenv("LOW_LATENCY_DISABLED", "1")
+
+    class _StubHttpClient:
+        def __init__(self) -> None:
+            self.post_calls: list[str] = []
+            self.discovery_count = 0
+
+        def close(self) -> None:  # pragma: no cover - no-op
+            pass
+
+        def health_check(self, paths, **_) -> str:
+            return paths[0]
+
+        def discover_path(self, method, paths, **_) -> str:
+            self.discovery_count += 1
+            if self.discovery_count == 1:
+                return paths[0]
+            return "/v1/annotations/refine"
+
+        def post(self, path, **_) -> object:
+            self.post_calls.append(path)
+            if path.endswith("/annotations/refine") and not path.startswith("/v1/"):
+                raise ApiNotFound("not found")
+
+            class _Response:
+                status_code = 204
+
+                def json(self) -> dict:
+                    return {}
+
+            return _Response()
+
+    stub = _StubHttpClient()
+
+    def factory(base_url: str, player: str) -> _StubHttpClient:
+        return stub
+
+    config_path = tmp_path / "devices.txt"
+    config_path.write_text("VP1_IP=127.0.0.1\nVP1_PORT=8080\n", encoding="utf-8")
+    bridge = PupilBridge(device_mapping={}, config_path=config_path, http_client_factory=factory)
+    device = _FakeDevice()
+    cfg = NeonDeviceConfig(player="VP1", ip="127.0.0.1", port=8080)
+    bridge._device_by_player["VP1"] = device  # type: ignore[attr-defined]
+    bridge._on_device_connected("VP1", device, cfg, "dev-1")  # type: ignore[attr-defined]
+
+    bridge.refine_event("VP1", "evt-1", 1234, confidence=0.9, mapping_version=1)
+
+    assert stub.post_calls == ["/api/annotations/refine", "/v1/annotations/refine"]
+    assert not device.events
+
+    bridge.close()

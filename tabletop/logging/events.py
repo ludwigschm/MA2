@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+from core.config import CLOUD_API_SETTINGS, CLOUD_BASE_URL
 from tabletop.engine import EventLogger, Phase as EnginePhase
 from tabletop.logging import events_bridge
 
@@ -17,35 +18,16 @@ _PUPYLABS_CLIENT_INITIALISED = False
 _PUPYLABS_INCOMPLETE_WARNED = False
 
 
-def _coerce_float(value: Optional[str], default: float) -> float:
-    if not value:
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        _log.warning("Invalid Pupylabs timeout value: %r", value)
-        return default
-
-
-def _coerce_int(value: Optional[str], default: int) -> int:
-    if not value:
-        return default
-    try:
-        parsed = int(value)
-    except ValueError:
-        _log.warning("Invalid Pupylabs retry value: %r", value)
-        return default
-    return max(0, parsed)
-
-
 def _maybe_init_pupylabs() -> None:
     global _PUPYLABS_CLIENT_INITIALISED, _PUPYLABS_INCOMPLETE_WARNED
 
     if _PUPYLABS_CLIENT_INITIALISED:
         return
 
-    base_url = os.environ.get("PUPYLABS_CLOUD_BASE_URL") or os.environ.get(
-        "PUPYLABS_BASE_URL"
+    base_url = (
+        os.environ.get("PUPYLABS_CLOUD_BASE_URL")
+        or os.environ.get("PUPYLABS_BASE_URL")
+        or CLOUD_BASE_URL
     )
     api_key = os.environ.get("PUPYLABS_CLOUD_API_KEY") or os.environ.get(
         "PUPYLABS_API_KEY"
@@ -57,18 +39,31 @@ def _maybe_init_pupylabs() -> None:
             _PUPYLABS_INCOMPLETE_WARNED = True
         return
 
-    timeout = _coerce_float(
-        os.environ.get("PUPYLABS_TIMEOUT_S")
-        or os.environ.get("PUPYLABS_CLOUD_TIMEOUT_S"),
-        2.0,
+    timeout = os.environ.get("PUPYLABS_TIMEOUT_S") or os.environ.get(
+        "PUPYLABS_CLOUD_TIMEOUT_S"
     )
-    retries = _coerce_int(
-        os.environ.get("PUPYLABS_MAX_RETRIES")
-        or os.environ.get("PUPYLABS_CLOUD_MAX_RETRIES"),
-        3,
+    retries = os.environ.get("PUPYLABS_MAX_RETRIES") or os.environ.get(
+        "PUPYLABS_CLOUD_MAX_RETRIES"
     )
 
-    events_bridge.init_client(base_url, api_key, timeout_s=timeout, max_retries=retries)
+    settings = CLOUD_API_SETTINGS
+    try:
+        timeout_value = float(timeout) if timeout else settings.timeout_s
+    except ValueError:
+        _log.warning("Invalid Pupylabs timeout value: %r", timeout)
+        timeout_value = settings.timeout_s
+    try:
+        retries_value = int(retries) if retries else settings.retry_max
+    except ValueError:
+        _log.warning("Invalid Pupylabs retry value: %r", retries)
+        retries_value = settings.retry_max
+
+    events_bridge.init_client(
+        base_url,
+        api_key,
+        timeout_s=timeout_value,
+        max_retries=max(retries_value, 0),
+    )
     if getattr(events_bridge, "_client", None) is None:
         _PUPYLABS_CLIENT_INITIALISED = True
         _log.warning("Pupylabs cloud logging unavailable; requests module missing")
