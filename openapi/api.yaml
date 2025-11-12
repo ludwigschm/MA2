@@ -1,0 +1,144 @@
+openapi: 3.0.3
+info:
+  title: MA2 Bridge API
+  version: 1.0.0
+  description: |
+    API contract between the MA2 tabletop bridge, edge devices and the
+    Pupylabs cloud ingest service.
+servers:
+  - url: http://192.168.137.83:8080
+    description: Edge device VP1
+  - url: http://192.168.137.92:8080
+    description: Edge device VP2
+  - url: https://cloud.pupylabs.local
+    description: Pupylabs cloud ingest
+paths:
+  /health:
+    get:
+      summary: Report service health
+      responses:
+        '200':
+          description: Service ready
+        '204':
+          description: Service ready (no body)
+  /api/health:
+    get:
+      summary: Alternate health endpoint
+      responses:
+        '200':
+          description: Service ready
+  /v1/health:
+    get:
+      summary: Versioned health endpoint
+      responses:
+        '200':
+          description: Service ready
+  /api/annotations/refine:
+    post:
+      summary: Refine an existing annotation on the edge device
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefineRequest'
+      responses:
+        '200':
+          description: Refinement accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefineResponse'
+        '204':
+          description: Refinement accepted without body
+        '400':
+          description: Invalid payload
+        '404':
+          description: Endpoint not available
+  /v1/annotations/refine:
+    post:
+      summary: Versioned refine endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefineRequest'
+      responses:
+        '200':
+          description: Refinement accepted
+  /annotations/refine:
+    post:
+      summary: Legacy refine endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefineRequest'
+      responses:
+        '200':
+          description: Refinement accepted
+  /v1/events/ingest:
+    post:
+      summary: Submit events to the Pupylabs cloud ingest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventEnvelope'
+      responses:
+        '202':
+          description: Event accepted for processing
+        '400':
+          description: Invalid event payload
+components:
+  schemas:
+    RefineRequest:
+      type: object
+      required:
+        - event_id
+        - t_ref_ns
+        - confidence
+        - mapping_version
+      properties:
+        event_id:
+          type: string
+          description: Stable identifier of the event to refine
+        t_ref_ns:
+          type: integer
+          format: int64
+          description: Refined timestamp in nanoseconds
+        confidence:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+        mapping_version:
+          type: integer
+          description: Mapping version used during refinement
+        refined:
+          type: boolean
+          default: true
+        provisional:
+          type: boolean
+          default: false
+        origin_device:
+          type: string
+    RefineResponse:
+      type: object
+      properties:
+        result:
+          type: object
+          properties:
+            accepted:
+              type: boolean
+    EventEnvelope:
+      type: object
+      description: Serialized event as produced by the tabletop UI
+      required:
+        - event_id
+        - actor
+        - action
+      additionalProperties: true

@@ -12,9 +12,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Literal, Optional, Union
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Union
 
 from core.capabilities import CapabilityRegistry, DeviceCapabilities
+from core.config import API_HEALTH_PATHS, EDGE_API_SETTINGS, EDGE_REFINE_PATHS
 from core.device_registry import DeviceRegistry
 from core.event_router import EventRouter, UIEvent
 from core.recording import DeviceClient, RecordingController, RecordingHttpError
@@ -30,6 +31,13 @@ try:  # pragma: no cover - optional dependency
     import requests
 except Exception:  # pragma: no cover - optional dependency
     requests = None  # type: ignore[assignment]
+
+from tabletop.utils.http_client import (
+    ApiError,
+    ApiNotFound,
+    ApiTimeout,
+    HttpClient,
+)
 
 log = logging.getLogger(__name__)
 
@@ -244,6 +252,9 @@ class PupilBridge:
         connect_timeout: float = 10.0,
         *,
         config_path: Optional[Path] = None,
+        http_client_factory: Optional[
+            Callable[[str, str], HttpClient]
+        ] = None,
     ) -> None:
         config_file = config_path or CONFIG_PATH
         _ensure_config_file(config_file)
@@ -259,6 +270,11 @@ class PupilBridge:
         self._recording_metadata: Dict[str, Dict[str, Any]] = {}
         self._auto_session: Optional[int] = None
         self._auto_block: Optional[int] = None
+        self._http_client_factory = http_client_factory
+        self._http_clients: Dict[str, HttpClient] = {}
+        self._edge_health_paths: Dict[str, str] = {}
+        self._edge_path_overrides: Dict[tuple[str, str], str] = {}
+        self._refine_paths: Dict[str, str] = {}
         self._auto_players: set[str] = set()
         self._low_latency_disabled = is_low_latency_disabled()
         self._perf_logging = is_perf_logging_enabled()
@@ -547,6 +563,94 @@ class PupilBridge:
             player, device, cfg
         )
         self._probe_capabilities(player, cfg, device_id)
+        self._register_http_client(player, cfg)
+
+    def _default_http_client_factory(self, base_url: str, player: str) -> HttpClient:
+        if requests is None:  # pragma: no cover - optional dependency
+            raise RuntimeError("requests unavailable")
+        return HttpClient(
+            base_url,
+            settings=EDGE_API_SETTINGS,
+            session_factory=requests.Session,
+            name=f"edge.{player.lower()}",
+        )
+
+    def _build_http_client(
+        self, player: str, cfg: NeonDeviceConfig
+    ) -> Optional[HttpClient]:
+        if not cfg.ip or cfg.port is None:
+            return None
+        base_url = f"http://{cfg.ip}:{cfg.port}"
+        factory = self._http_client_factory or self._default_http_client_factory
+        if self._http_client_factory is None and requests is None:
+            return None
+        try:
+            return factory(base_url, player)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.warning("HTTP client setup failed for %s: %s", player, exc)
+            return None
+
+    def _register_http_client(self, player: str, cfg: NeonDeviceConfig) -> None:
+        client = self._build_http_client(player, cfg)
+        if client is None:
+            return
+        previous = self._http_clients.get(player)
+        if previous is not None:
+            try:
+                previous.close()
+            except Exception:
+                pass
+        self._http_clients[player] = client
+        self._edge_health_paths.pop(player, None)
+        self._refine_paths.pop(player, None)
+        for key in list(self._edge_path_overrides):
+            if key[0] == player:
+                self._edge_path_overrides.pop(key, None)
+
+    def _ensure_edge_health(self, player: str) -> bool:
+        if player in self._edge_health_paths:
+            return True
+        client = self._http_clients.get(player)
+        if client is None:
+            return False
+        try:
+            path = client.health_check(API_HEALTH_PATHS)
+        except ApiError as exc:
+            log.debug("Health check failed for %s: %s", player, exc, exc_info=True)
+            return False
+        if path:
+            self._edge_health_paths[player] = path
+            return True
+        return False
+
+    def _resolve_refine_path(self, player: str) -> str:
+        cached = self._refine_paths.get(player)
+        if cached:
+            return cached
+        client = self._http_clients.get(player)
+        if client is None:
+            path = EDGE_REFINE_PATHS[0]
+        else:
+            try:
+                path = client.discover_path(
+                    "POST",
+                    EDGE_REFINE_PATHS,
+                    json={"probe": True},
+                    allow_statuses={200, 201, 202, 204, 400, 401, 422},
+                )
+            except ApiError as exc:
+                log.debug("Refine discovery failed for %s: %s", player, exc, exc_info=True)
+                path = None
+            if not path:
+                path = EDGE_REFINE_PATHS[0]
+        self._refine_paths[player] = path
+        return path
+
+    def _override_path(self, player: str, path: str, resolved: str) -> None:
+        if resolved == path:
+            self._edge_path_overrides.pop((player, path), None)
+        else:
+            self._edge_path_overrides[(player, path)] = resolved
 
     def _setup_time_sync(self, player: str, device_id: str, device: Any) -> None:
         async def measure(samples: int, timeout: float) -> list[TimeSyncMeasurement]:
@@ -1052,6 +1156,15 @@ class PupilBridge:
         for player in list(self._active_recording):
             self._active_recording[player] = False
         self._recording_metadata.clear()
+        for client in list(self._http_clients.values()):
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._http_clients.clear()
+        self._edge_health_paths.clear()
+        self._edge_path_overrides.clear()
+        self._refine_paths.clear()
 
     # ------------------------------------------------------------------
     # Recording helpers
@@ -1270,23 +1383,20 @@ class PupilBridge:
         return False, None
 
     def _start_recording_via_rest(self, player: str) -> tuple[Optional[Union[str, bool]], Optional[Any]]:
-        if requests is None:
-            log.debug("requests not available – cannot start recording via REST (%s)", player)
-            return False, None
-        cfg = self._device_config.get(player)
-        if cfg is None or not cfg.ip or cfg.port is None:
-            log.debug("REST recording start skipped (%s: no IP/port)", player)
-            return False, None
+        response, error = self._post_device_api(
+            player,
+            "/api/recording",
+            {"action": "START"},
+            expected_statuses={200, 201, 202, 204, 400, 401, 422},
+        )
 
-        url = f"http://{cfg.ip}:{cfg.port}/api/recording"
-        try:
-            response = requests.post(
-                url,
-                json={"action": "START"},
-                timeout=self._http_timeout,
-            )
-        except Exception as exc:  # pragma: no cover - network dependent
-            log.error("REST recording start failed for %s: %s", player, exc)
+        if response is None:
+            if error is not None:
+                log.error("REST recording start failed for %s: %s", player, error)
+            else:
+                log.debug(
+                    "REST recording start skipped (%s: no HTTP client)", player
+                )
             return False, None
 
         if response.status_code == 200:
@@ -1335,7 +1445,7 @@ class PupilBridge:
                 )
 
         if not stopped:
-            response = self._post_device_api(
+            response, error = self._post_device_api(
                 player,
                 "/api/recording",
                 {"action": "STOP"},
@@ -1348,6 +1458,12 @@ class PupilBridge:
                     "REST recording STOP for %s failed (%s)",
                     player,
                     response.status_code,
+                )
+            elif error is not None:
+                log.debug(
+                    "recording STOP for %s failed: %s",
+                    player,
+                    error,
                 )
 
         if not stopped:
@@ -1366,53 +1482,52 @@ class PupilBridge:
         *,
         timeout: Optional[float] = None,
         warn: bool = True,
-    ) -> Optional[Any]:
-        if requests is None:
+        expected_statuses: Optional[set[int]] = None,
+    ) -> tuple[Optional[Any], Optional[ApiError]]:
+        client = self._http_clients.get(player)
+        if client is None:
             if warn:
-                log.warning(
-                    "requests not available – cannot contact %s for %s",
-                    path,
-                    player,
-                )
-            return None
+                log.warning("HTTP client not available for %s", player)
+            return None, None
 
-        cfg = self._device_config.get(player)
-        if cfg is None or not cfg.ip or cfg.port is None:
+        resolved = self._edge_path_overrides.get((player, path), path)
+        try:
+            response = client.post(
+                resolved,
+                json=payload,
+                timeout=timeout or self._http_timeout,
+                allow_statuses=expected_statuses
+                or {200, 201, 202, 204, 400, 401, 422},
+            )
+            return response, None
+        except ApiNotFound as exc:
             if warn:
-                log.warning(
-                    "REST endpoint %s not configured for %s",
-                    path,
+                log.warning("Endpoint %s not found for %s", resolved, player)
+            self._override_path(player, path, path)
+            return None, exc
+        except ApiTimeout as exc:
+            if warn:
+                log.warning("HTTP timeout for %s (%s)", resolved, player)
+            else:
+                log.debug(
+                    "HTTP timeout for %s (%s)",
+                    resolved,
                     player,
+                    exc_info=True,
                 )
-            return None
-
-        url = f"http://{cfg.ip}:{cfg.port}{path}"
-        effective_timeout = timeout or self._http_timeout
-        delay = 0.05
-        attempts = 3
-        for attempt in range(attempts):
-            try:
-                return requests.post(
-                    url,
-                    json=payload,
-                    timeout=effective_timeout,
+            return None, exc
+        except ApiError as exc:
+            if warn:
+                log.warning("HTTP POST %s failed for %s: %s", resolved, player, exc)
+            else:
+                log.debug(
+                    "HTTP POST %s failed for %s: %s",
+                    resolved,
+                    player,
+                    exc,
+                    exc_info=True,
                 )
-            except Exception as exc:  # pragma: no cover - network dependent
-                if attempt == attempts - 1:
-                    if warn:
-                        log.warning("HTTP POST %s failed for %s: %s", url, player, exc)
-                    else:
-                        log.debug(
-                            "HTTP POST %s failed for %s: %s",
-                            url,
-                            player,
-                            exc,
-                            exc_info=True,
-                        )
-                else:
-                    time.sleep(delay)
-                    delay *= 2
-        return None
+            return None, exc
 
     def _apply_recording_label(
         self,
@@ -1429,7 +1544,7 @@ class PupilBridge:
         identifier = self._player_device_id.get(player, "") or player
         caps = self._capabilities.get(identifier)
         if caps.frame_name_supported:
-            response = self._post_device_api(
+            response, error = self._post_device_api(
                 player,
                 "/api/frame_name",
                 {"frame_name": label},
@@ -1443,6 +1558,8 @@ class PupilBridge:
                     player,
                     response.status_code,
                 )
+            elif error is not None:
+                log.debug("frame_name request error for %s: %s", player, error)
         else:
             log.debug("frame_name skipped (unsupported) device=%s", player)
 
@@ -1794,16 +1911,30 @@ class PupilBridge:
         if extra:
             payload.update(extra)
 
-        response = None
-        try:
-            response = self._post_device_api(
-                player,
-                "/api/annotations/refine",
-                payload,
-                warn=False,
-            )
-        except Exception:  # pragma: no cover - network dependent
-            log.debug("Refinement REST call failed for %s", player, exc_info=True)
+        self._ensure_edge_health(player)
+        canonical_path = EDGE_REFINE_PATHS[0]
+        resolved_path = self._resolve_refine_path(player)
+        self._override_path(player, canonical_path, resolved_path)
+
+        response, error = self._post_device_api(
+            player,
+            canonical_path,
+            payload,
+            warn=False,
+            expected_statuses={200, 201, 202, 204, 400, 401, 422},
+        )
+        if isinstance(error, ApiNotFound):
+            self._refine_paths.pop(player, None)
+            alternate = self._resolve_refine_path(player)
+            if alternate != resolved_path:
+                self._override_path(player, canonical_path, alternate)
+                response, error = self._post_device_api(
+                    player,
+                    canonical_path,
+                    payload,
+                    warn=False,
+                    expected_statuses={200, 201, 202, 204, 400, 401, 422},
+                )
 
         if response is not None and getattr(response, "status_code", None) in {200, 204}:
             log.debug(
@@ -1813,6 +1944,13 @@ class PupilBridge:
                 mapping_version,
             )
             return
+
+        if error is not None:
+            log.debug(
+                "Refinement REST call failed for %s: %s",
+                player,
+                error,
+            )
 
         log.debug(
             "Falling back to realtime refine event for %s (event %s, v%s)",

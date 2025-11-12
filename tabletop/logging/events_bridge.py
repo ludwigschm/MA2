@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Optional
 
 try:  # pragma: no cover - optional dependency
@@ -8,16 +9,13 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - optional dependency
     requests = None  # type: ignore[assignment]
 
+from core.config import CLOUD_API_SETTINGS, CLOUD_BASE_URL
 from tabletop.logging.async_bridge import enqueue
 from tabletop.logging.pupylabs_cloud import PupylabsCloudLogger
+from tabletop.utils.http_client import HttpClient
 
 _log = logging.getLogger(__name__)
 
-_session: Optional["requests.Session"]
-if requests is not None:
-    _session = requests.Session()
-else:  # pragma: no cover - optional dependency
-    _session = None
 _client: Optional[PupylabsCloudLogger] = None
 
 
@@ -30,13 +28,39 @@ def init_client(
     """Initialise the shared Pupylabs cloud client."""
 
     global _client
-    if requests is None or _session is None:
+    if requests is None:
         _log.warning(
             "Requests not available; cannot initialise Pupylabs cloud client"
         )
         _client = None
         return
-    _client = PupylabsCloudLogger(_session, base_url, api_key, timeout_s, max_retries)
+
+    target_base = base_url or CLOUD_BASE_URL or ""
+    if not target_base:
+        _log.info("No cloud base URL configured; cloud ingest disabled")
+        _client = None
+        return
+
+    settings = CLOUD_API_SETTINGS
+    if timeout_s:
+        settings = replace(
+            settings,
+            timeout_s=timeout_s,
+            retry_max=max_retries,
+        )
+    try:
+        http_client = HttpClient(
+            target_base,
+            settings=settings,
+            session_factory=requests.Session,
+            name="cloud",
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("Unable to create cloud HTTP client: %s", exc)
+        _client = None
+        return
+
+    _client = PupylabsCloudLogger(http_client, api_key)
 
 
 def push_async(event: dict) -> None:
