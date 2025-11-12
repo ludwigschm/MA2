@@ -18,7 +18,7 @@ from core.capabilities import CapabilityRegistry, DeviceCapabilities
 from core.device_registry import DeviceRegistry
 from core.event_router import EventRouter, UIEvent
 from core.recording import DeviceClient, RecordingController, RecordingHttpError
-from core.time_sync import TimeSyncManager
+from core.time_sync import TimeSyncManager, TimeSyncMeasurement, TimeSyncSampleError
 
 try:  # pragma: no cover - optional dependency
     from pupil_labs.realtime_api.simple import Device, discover_devices
@@ -549,31 +549,49 @@ class PupilBridge:
         self._probe_capabilities(player, cfg, device_id)
 
     def _setup_time_sync(self, player: str, device_id: str, device: Any) -> None:
-        async def measure(samples: int, timeout: float) -> list[float]:
-            estimator = getattr(device, "estimate_time_offset", None)
-            if not callable(estimator):
+        async def measure(samples: int, timeout: float) -> list[TimeSyncMeasurement]:
+            measurement_fn = getattr(device, "time_sync_measurement", None)
+            legacy_fn = getattr(device, "estimate_time_offset", None)
+            if not callable(measurement_fn) and not callable(legacy_fn):
                 return []
-            offsets: list[float] = []
-            for _ in range(samples):
+
+            measurements: list[TimeSyncMeasurement] = []
+            limit = samples
+            if not callable(measurement_fn):
+                limit = max(3, min(samples, 20))
+            for _ in range(limit):
+                host_send_ns = time.monotonic_ns()
                 try:
-                    value = await asyncio.wait_for(
-                        asyncio.to_thread(estimator), timeout
-                    )
+                    if callable(measurement_fn):
+                        payload = await asyncio.wait_for(
+                            asyncio.to_thread(measurement_fn), timeout
+                        )
+                    else:
+                        payload = await asyncio.wait_for(
+                            asyncio.to_thread(legacy_fn), timeout
+                        )
                 except asyncio.TimeoutError:
                     break
                 except Exception:
+                    log.debug("time_sync measurement failed for %s", player, exc_info=True)
                     break
                 else:
+                    host_recv_ns = time.monotonic_ns()
                     try:
-                        offsets.append(float(value))
-                    except Exception:
+                        measurement = TimeSyncMeasurement.from_payload(
+                            payload,
+                            host_send_ns=host_send_ns,
+                            host_recv_ns=host_recv_ns,
+                        )
+                    except TimeSyncSampleError:
                         continue
-            return offsets
+                    measurements.append(measurement)
+            return measurements
 
         manager = TimeSyncManager(
             device_id=device_id or player,
             measure_fn=measure,
-            max_samples=20,
+            window_size=32,
             sample_timeout=0.25,
         )
         try:

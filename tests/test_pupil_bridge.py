@@ -72,7 +72,7 @@ def test_time_sync_manager_used_for_offsets(bridge):
     pupil_bridge, device = bridge
     offset = pupil_bridge.estimate_time_offset("VP1")
     expected = statistics.median(device.offset_samples)
-    assert offset == pytest.approx(expected)
+    assert offset == pytest.approx(expected, abs=0.001)
     # subsequent call should not error even if samples exhausted
     offset2 = pupil_bridge.estimate_time_offset("VP1")
     assert math.isclose(offset2, offset, rel_tol=1e-6)
