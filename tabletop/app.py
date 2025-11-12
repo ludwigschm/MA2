@@ -46,6 +46,7 @@ from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
+from core.clock import now_ns
 
 log = logging.getLogger(__name__)
 
@@ -793,7 +794,7 @@ def run_demo(*, duration: float = 8.0, heartbeat_interval: float = 2.0) -> None:
         next_marker = start
         counter = 0
         while time.perf_counter() - start < duration:
-            t_local_ns = time.perf_counter_ns()
+            t_local_ns = now_ns()
             event_id = f"demo-{counter:04d}"
             payload = {
                 "event_id": event_id,
@@ -808,7 +809,7 @@ def run_demo(*, duration: float = 8.0, heartbeat_interval: float = 2.0) -> None:
             counter += 1
             now = time.perf_counter()
             if now >= next_marker:
-                marker_ns = time.perf_counter_ns()
+                marker_ns = now_ns()
                 print(f"[demo] heartbeat marker emitted at {marker_ns}")
                 reconciler.submit_marker("demo.heartbeat", marker_ns)
                 next_marker = now + max(0.5, heartbeat_interval)
