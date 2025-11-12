@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
+import random
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -13,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
+from core.time_sync import TimeSyncConfig, TimeSyncManager, TimeSyncMeasurement
 from tabletop.engine import EventLogger
 from tabletop.sync.reconciler import TimeReconciler
 
@@ -22,12 +26,22 @@ class _FakeBridge:
         self._players = list(players)
         self.offsets_ns: Dict[str, int] = {player: 0 for player in self._players}
         self.refinements: List[Dict[str, object]] = []
+        self.managers: Dict[str, object] = {}
 
     def connected_players(self) -> List[str]:
         return list(self._players)
 
     def estimate_time_offset(self, player: str) -> Optional[float]:
+        manager = self.managers.get(player)
+        if manager is not None:
+            return manager.get_offset_s()  # type: ignore[attr-defined]
         return self.offsets_ns.get(player, 0) / 1_000_000_000.0
+
+    def map_monotonic_ns(self, player: str, host_ns: int) -> Optional[int]:
+        manager = self.managers.get(player)
+        if manager is None:
+            return None
+        return manager.map_monotonic_ns(host_ns)  # type: ignore[attr-defined]
 
     def refine_event(
         self,
@@ -91,6 +105,59 @@ def _inject_marker(
         offset_ns = int(device_ns - t_local_ns)
         bridge.offsets_ns[player] = offset_ns
     reconciler._process_marker("hb", t_local_ns)
+
+
+def _build_time_sync_manager(
+    player: str,
+    intercept_ns: float,
+    slope: float,
+    *,
+    window_size: int,
+) -> TimeSyncManager:
+    config = TimeSyncConfig(window_size=window_size)
+    rtt_ns = 650_000
+    jitter = 40_000
+    windows: List[List[TimeSyncMeasurement]] = []
+    base_ns = 1_500_000_000
+    for idx in range(4):
+        start = base_ns + idx * 40_000_000
+        window: List[TimeSyncMeasurement] = []
+        for sample in range(window_size + 4):
+            host_send = start + sample * (rtt_ns + 10_000)
+            jitter_ns = (-jitter + (sample % 4) * (jitter / 2.0))
+            rtt = rtt_ns + jitter_ns
+            host_recv = int(host_send + rtt)
+            midpoint = host_send + rtt / 2.0
+            device_time = intercept_ns + slope * midpoint + 15_000 * math.sin(sample)
+            window.append(
+                TimeSyncMeasurement(
+                    host_send_ns=int(host_send),
+                    host_recv_ns=int(host_recv),
+                    device_time_ns=int(device_time),
+                )
+            )
+        windows.append(window)
+
+    windows_iter = iter(windows)
+
+    async def measure(samples: int, timeout: float) -> List[TimeSyncMeasurement]:
+        try:
+            return list(next(windows_iter))
+        except StopIteration:
+            return []
+
+    manager = TimeSyncManager(
+        player,
+        measure,
+        window_size=window_size,
+        sample_timeout=0.05,
+        resync_interval_s=1.0,
+        config=config,
+    )
+    asyncio.run(manager.initial_sync())
+    for _ in range(2):
+        asyncio.run(manager.maybe_resync())
+    return manager
 
 
 def test_reconciler_builds_per_player_models_and_refines(caplog: pytest.LogCaptureFixture) -> None:
@@ -219,6 +286,52 @@ def test_reconciler_pairs_host_mirror_samples() -> None:
     expected_intercept = model["VP1"][0]
     assert abs(state.intercept_ns - expected_intercept) < 5_000_000
     assert state.confidence >= TimeReconciler.CONF_MIN
+
+
+def test_time_sync_managers_keep_refined_order() -> None:
+    players = ["VP1", "VP2"]
+    intercepts = {"VP1": 18_000_000.0, "VP2": -7_000_000.0}
+    slopes = {"VP1": 1.0 + 8e-6, "VP2": 1.0 - 6e-6}
+    bridge = _FakeBridge(players)
+    logger = _FakeLogger()
+    reconciler = TimeReconciler(bridge, logger, window_size=30)
+
+    for player in players:
+        manager = _build_time_sync_manager(
+            player,
+            intercept_ns=intercepts[player],
+            slope=slopes[player],
+            window_size=34,
+        )
+        bridge.managers[player] = manager
+
+    start_ns = 2_500_000_000
+    for index in range(80):
+        t_local_ns = start_ns + index * 35_000_000
+        for player in players:
+            mapped = bridge.map_monotonic_ns(player, t_local_ns)
+            assert mapped is not None
+            bridge.offsets_ns[player] = int(mapped - t_local_ns)
+        reconciler._process_marker("hb", t_local_ns)
+
+    event_ids = [f"sync_evt_{idx}" for idx in range(12)]
+    for idx, event_id in enumerate(event_ids):
+        t_local_ns = start_ns + 15_000_000 + idx * 45_000_000
+        reconciler._process_event(event_id, t_local_ns)
+
+    orders: Dict[str, List[str]] = {}
+    for player in players:
+        refs = [item for item in bridge.refinements if item["player"] == player]
+        assert refs, f"No refinements for {player}"
+        refs_sorted = sorted(refs, key=lambda r: (r["t_ref_ns"], r["event_id"]))
+        orders[player] = [item["event_id"] for item in refs_sorted]
+        state = reconciler._player_states[player]
+        assert state.confidence >= 0.8
+        assert abs(state.slope - slopes[player]) < 1e-5
+
+    reference_order = orders[players[0]]
+    for player in players[1:]:
+        assert orders[player] == reference_order
 
 
 def test_event_logger_supports_per_player_refinements(tmp_path: Path) -> None:
