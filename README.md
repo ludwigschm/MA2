@@ -47,3 +47,50 @@ Der Demo-Lauf simuliert Button-Events sowie Heartbeats, zeigt den Übergang von
 „provisional“ → „refined“ mit `event_id`, aktueller `mapping_version`,
 Konfidenz und Queue-Last direkt in der Konsole und erzeugt eine Demo-Datenbank
 (`logs/demo_refinement.sqlite3`).
+
+## E2E-Smoketest (Edge & Cloud)
+
+Für einen integrierten Happy-Path-Check steht `tools/e2e_smoke.py` bereit. Das
+Script wärmt die TimeSync-Schätzung auf, ruft die Edge-Health-API ab, sendet
+einige Refine-Events und prüft optional den Cloud-Ingest inklusive Offline-Queue.
+
+```bash
+make e2e
+```
+
+Über `ARGS` lassen sich zusätzliche Parameter übergeben, z. B. alternative Edge-
+URLs oder die Simulation eines Cloud-DNS-Fehlers:
+
+```bash
+make e2e ARGS='--edge-url http://192.168.137.83:8080 --simulate-cloud-dns-fail'
+```
+
+### Konfiguration
+
+* Edge-Basis-URLs werden standardmäßig aus `core/config.py` übernommen. Mit
+  `--edge-url` können beliebige Endpunkte angegeben werden (mehrfach möglich).
+* Für den Cloud-Schritt liest das Script `PUPYLABS_CLOUD_BASE_URL` bzw.
+  `PUPYLABS_BASE_URL` sowie `PUPYLABS_CLOUD_API_KEY`/`PUPYLABS_API_KEY`. Die
+  Option `--cloud-url`/`--cloud-api-key` überschreibt diese Werte.
+* Die Offline-Queue liegt per Default unter `logs/e2e_cloud_queue.ndjson` und
+  kann mit `--cloud-queue` umgelenkt werden.
+
+### Exit-Codes & typische Fehlerbilder
+
+| Exit-Code | Bedeutung | Hinweise |
+|-----------|-----------|----------|
+| `0` | Alle Checks erfolgreich oder Cloud-DNS-Fehler durch Queue abgefedert | Konsolenausgabe zeigt Offset/Drift, HTTP-Status und ggf. Queue-Pfad. |
+| `1` | TimeSync instabil | Prüfen, ob `/api/time/sync` erreichbar ist und ob genügend Messwerte zurückkommen. Optional `--timesync-samples` erhöhen. |
+| `2` | Edge-Health oder Refine fehlgeschlagen | Sicherstellen, dass die Edge-Instanz läuft und `EDGE_REFINE_PATHS` unterstützt. Log-Ausgabe nennt den fehlerhaften Schritt. |
+| `3` | Cloud-Fehler ohne Offline-Queue | Pfad aus `--cloud-queue` kontrollieren und Schreibrechte prüfen. Bei DNS-Tests sicherstellen, dass `--simulate-cloud-dns-fail` gesetzt ist. |
+
+### Troubleshooting & Queue-Flush
+
+* Bei `--simulate-cloud-dns-fail` wird der Cloud-Host gezielt auf einen
+  ungültigen Namen umgebogen. Das Script bestätigt anschließend, dass Ereignisse
+  in der Offline-Queue landen. Sobald DNS wieder funktioniert, `make e2e`
+  ohne diese Option erneut ausführen oder die Tabletop-App starten – die Queue
+  wird automatisch leergezogen.
+* Bleibt die TimeSync-Konfidenz niedrig, hilft oft ein Neustart der Brille bzw.
+  ein Abgleich der lokalen Uhrzeit. Der Parameter `--timesync-timeout` erlaubt
+  längere Antwortzeiten.
