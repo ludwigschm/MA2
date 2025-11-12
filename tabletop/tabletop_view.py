@@ -60,6 +60,7 @@ from tabletop.ui.assets import (
     resolve_background_texture,
 )
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
+from core.clock import now_ns
 
 Window.multitouch_on_demand = True
 
@@ -569,7 +570,7 @@ class TabletopRoot(FloatLayout):
         if not players:
             return
         event_id = str(uuid.uuid4())
-        t_local_ns = time.perf_counter_ns()
+        t_local_ns = now_ns()
         priority = "high" if name.startswith(("sync.", "fix.")) else "normal"
         mapping_version = self._current_ab_version
         payload_copy: Dict[str, Any] = {}

@@ -30,6 +30,7 @@ from tabletop.utils.runtime import (
     is_low_latency_disabled,
     is_perf_logging_enabled,
 )
+from core.clock import now_mono_ns, now_ns
 
 __all__ = [
     "Phase",
@@ -201,7 +202,7 @@ class EventLogger:
                 """
         CREATE TABLE IF NOT EXISTS events(
           session_id TEXT, round_idx INT, phase TEXT, actor TEXT, action TEXT,
-          payload TEXT, t_mono_ns INTEGER, t_utc_iso TEXT
+          payload TEXT, t_host_ns INTEGER, t_mono_ns INTEGER, t_utc_iso TEXT
         )"""
             )
             self.conn.execute(
@@ -218,6 +219,7 @@ class EventLogger:
         )"""
             )
             self._ensure_refinement_schema()
+            self._ensure_event_schema()
             self.conn.commit()
         self._csv_path: Optional[pathlib.Path] = None
         self._closed = False
@@ -233,7 +235,7 @@ class EventLogger:
         self._last_queue_log = 0.0
         self._queue_sentinel: object = object()
         self._event_queue: Optional[
-            "queue.Queue[Tuple[str, int, str, str, str, str, int, str]]"
+            "queue.Queue[Tuple[str, int, str, str, str, str, int, int, str]]"
         ] = None
         self._writer_thread: Optional[threading.Thread] = None
         if self._use_async:
@@ -299,7 +301,7 @@ class EventLogger:
 
     def _writer_loop(self) -> None:
         assert self._event_queue is not None
-        pending: List[Tuple[str, int, str, str, str, str, int, str]] = []
+        pending: List[Tuple[str, int, str, str, str, str, int, int, str]] = []
         last_flush = time.monotonic()
         while True:
             timeout = max(0.0, self._flush_interval - (time.monotonic() - last_flush))
@@ -328,14 +330,22 @@ class EventLogger:
             self._flush_rows(pending)
 
     def _flush_rows(
-        self, rows: List[Tuple[str, int, str, str, str, str, int, str]]
+        self, rows: List[Tuple[str, int, str, str, str, str, int, int, str]]
     ) -> None:
         if not rows:
             return
         start = time.perf_counter()
         with self._db_lock:
             cur = self.conn.cursor()
-            cur.executemany("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)", rows)
+            cur.executemany(
+                """
+                INSERT INTO events(
+                    session_id, round_idx, phase, actor, action,
+                    payload, t_host_ns, t_mono_ns, t_utc_iso
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                rows,
+            )
             self.conn.commit()
         if self._csv_path is not None:
             with open(self._csv_path, "a", encoding="utf-8", newline="") as fp:
@@ -354,7 +364,8 @@ class EventLogger:
         action: str,
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        t_mono_ns = time.perf_counter_ns()
+        t_host_ns = now_ns()
+        t_mono_ns = now_mono_ns()
         t_utc_iso = datetime.now(timezone.utc).isoformat()
         event_id = str(uuid.uuid4())
         row = (
@@ -364,6 +375,7 @@ class EventLogger:
             actor,
             action,
             json.dumps(payload, ensure_ascii=False),
+            t_host_ns,
             t_mono_ns,
             t_utc_iso,
         )
@@ -405,6 +417,7 @@ class EventLogger:
             "action": action,
             "payload": payload,
             "t_utc_iso": t_utc_iso,
+            "t_host_ns": t_host_ns,
             "t_mono_ns": t_mono_ns,
             "event_id": event_id,
         }
@@ -471,7 +484,7 @@ class EventLogger:
             cur = self.conn.cursor()
             cur.execute(
                 """
-        SELECT session_id, round_idx, phase, actor, action, payload, t_mono_ns, t_utc_iso
+        SELECT session_id, round_idx, phase, actor, action, payload, t_host_ns, t_mono_ns, t_utc_iso
         FROM events
         WHERE payload LIKE ?
         """,
@@ -493,11 +506,32 @@ class EventLogger:
                     "actor": row[3],
                     "action": row[4],
                     "payload": payload_obj,
-                    "t_mono_ns": row[6],
-                    "t_utc_iso": row[7],
+                    "t_host_ns": row[6],
+                    "t_mono_ns": row[7],
+                    "t_utc_iso": row[8],
                 }
             )
         return result
+
+    def _ensure_event_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA table_info(events)")
+        columns = {row[1] for row in cur.fetchall()}
+        altered = False
+        if "t_host_ns" not in columns:
+            log.info("Migrating events table to include t_host_ns column")
+            self.conn.execute(
+                "ALTER TABLE events ADD COLUMN t_host_ns INTEGER"
+            )
+            altered = True
+        if "t_mono_ns" not in columns:
+            log.info("Ensuring t_mono_ns column exists in events table")
+            self.conn.execute(
+                "ALTER TABLE events ADD COLUMN t_mono_ns INTEGER"
+            )
+            altered = True
+        if altered:
+            log.info("Events table schema updated")
 
 
 # -------------- Engine --------------
